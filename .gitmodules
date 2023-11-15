@@ -1,0 +1,3 @@
+[submodule "wormdatamodel"]
+	path = wormdatamodel
+	url = https://github.com/leiferlab/wormdatamodel
