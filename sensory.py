@@ -31,11 +31,6 @@ class ASH(PyroModule):
         dX = I_1 + I_2 - (self.X-self.Xe) / tau
         self.X = self.X+dX
 
-# https://elifesciences.org/articles/21629
-class AWB(PyroModule):
-    def __init__
-
-
 # We mainly focuses on odor, 
 class sensoryModel(PyroModule):
     def __init__

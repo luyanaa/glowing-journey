@@ -1,0 +1,5 @@
+./exported_data_full is imported from https://osf.io/34m5v.
+
+exported_data_full.tar.gz contains the files readable by our Python libraries (github.com/leiferlab/pumpprobe, github.com/leiferlab/wormdatamodel,github.com/leiferlab/wormbrain), including all the fits and the high-level analysis. See note below when using this version of the data.
+
+When using exported_data_full.tar.gz: After installing the libraries, extract the archive, and then run the script pumpprobe/scripts/adjust_paths.py, following the instruction inside that script. This will adjust some paths stored inside the files to the location on your computer.
