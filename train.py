@@ -1,7 +1,6 @@
 import pyro
 import pyro.distributions as dist
-from pyro.infer import SMCFilter
-from pyro.infer import MCMC, NUTS
+from pyro.infer import SMCFilter, MCMC, NUTS
 import torch
 
 

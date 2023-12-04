@@ -1,9 +1,9 @@
 [submodule "wormdatamodel"]
 	path = wormdatamodel
-	url = https://github.com/leiferlab/wormdatamodel
+	url = git@github.com:luyanaa/wormdatamodel.git
 [submodule "pumpprobe"]
 	path = pumpprobe
-	url = https://github.com/leiferlab/pumpprobe
+	url = git@github.com:luyanaa/pumpprobe.git
 [submodule "wormbrain"]
 	path = wormbrain
-	url = https://github.com/leiferlab/wormbrain
+	url = git@github.com:luyanaa/wormbrain.git
