@@ -7,3 +7,12 @@
 [submodule "wormbrain"]
 	path = wormbrain
 	url = git@github.com:luyanaa/wormbrain.git
+[submodule "wormfunconn"]
+	path = wormfunconn
+	url = git@github.com:luyanaa/worm-functional-connectivity.git
+[submodule "mistofrutta"]
+	path = mistofrutta
+	url = git@github.com:francescorandi/mistofrutta.git
+[submodule "savitzkygolay"]
+	path = savitzkygolay
+	url = git@github.com:leiferlab/savitzkygolay.git
