@@ -79,15 +79,14 @@ class conductanceModel (PyroModule):
         return v
 
 class neuronLayer(PyroModule):
-    def __init__(self, neuronSize, neuronList, SensoryMask):
+    def __init__(self, neuronSize, neuronList):
         super().__init__()
         self._neuron_List = neuronList
         self.neuronSize = neuronSize
-        self.SensoryMask = SensoryMask
     def forward(self, inputSignal, externalInput):
         output = []
         for i in range(self.neuronSize):
-            if self.SensoryMask[i]:
+            if inputSignal[i]!=0.0:
                 output.append(self._neuron_List[i](inputSignal[i], externalInput[i]))
             else:
                 output.append(self._neuron_List[i](inputSignal))
@@ -181,12 +180,11 @@ class synapseLayer(PyroModule):
 class NematodeForStep(PyroModule):
     # Work for Single-Step Inference for MCMC/Sequential MC and Bayesian Filter.
 #    def __init__ (self, InputSize, SensoryNeuronList, ConnectomeSize, OutputSize):
-    def __init__ (self, NeuronList, synapseList, SensoryMask):
+    def __init__ (self, NeuronList, synapseList):
         super().__init__()
-        self.SensoryMask = SensoryMask
         
         # Neuron
-        self.Neuron = neuronLayer(len(NeuronList), NeuronList, SensoryMask)
+        self.Neuron = neuronLayer(len(NeuronList), NeuronList)
         self.NeuronSize = len(NeuronList)
         self.synapse = synapseLayer(synapseList)
         self.synapseSize = len(synapseList)
@@ -197,15 +195,15 @@ class NematodeForStep(PyroModule):
         # Motor Output
         # self.OutputLayer = nn.Linear(OutputSize)
         
-    def forward(self, Prev, ExternalInput=None, VoltageClamp=None, Label=None): 
-        #  SensoryOutput, ConnectomeOutput, MotorOutput = Prev
+    def forward(self, Prev, ExternalInput=None, VoltageClamp=None): 
         CurrentInput = self.synapse(Prev)
         if ExternalInput is None:
             ExternalInput = torch.zeros(self.NeuronSize)
         ConnectomeOutput = self.Neuron(CurrentInput, ExternalInput)
-        if VoltageClamp != None and Label != None:
+        for Label in range(len(VoltageClamp)):
+            if VoltageClamp[Label] != 0:  
             # Force Voltage Clamp First
-            ConnectomeOutput[Label] = VoltageClamp
+                ConnectomeOutput[Label] = VoltageClamp[Label]
         # Deal with Sensory Neuron with non-current input
         return ConnectomeOutput
 
@@ -220,7 +218,41 @@ class NematodeForStep(PyroModule):
         )
         return state["z"], y
 
-# self.expected_input_dim = 2 if batch_sizes is not None else 3
+class RecurrentNematode(PyroModule):
+    def __init__(self, NeuronList, synapseList, batch_sizes=None):
+        super().__init__()
+        self.model = NematodeForStep(NeuronList, synapseList)
+        self.expected_input_dim = 2 if batch_sizes is not None else 3
+
+    def forward(self, input, ExternalInput=None, VoltageClamp=None):
+        if torch.Size(input) != self.expected_input_dim :
+            Exception("Shape Unmatched")
+        ConnectomeOutput = torch.zeros((torch.Size(input)))
+        if self.expected_input_dim == 2:
+            for i in range(torch.Size(input)[0]): # Iterate in Time 
+                if ExternalInput:
+                    _ExternalInput = ExternalInput[i]
+                else:
+                    _ExternalInput = None
+                if VoltageClamp:
+                    _VoltageClamp = VoltageClamp[i]
+                else:
+                    _VoltageClamp = None
+
+                ConnectomeOutput[i] = self.model(ConnectomeOutput[i-1], _ExternalInput, _VoltageClamp)
+        else :
+            for i in range(torch.Size(input)[0]): # Iterate in Batch
+                for time in range(torch.Size(input)[1]):
+                    if ExternalInput:
+                        _ExternalInput = ExternalInput[i][time]
+                    else:
+                        _ExternalInput = None
+                    if VoltageClamp:
+                        _VoltageClamp = VoltageClamp[i][time]
+                    else:
+                        _VoltageClamp = None
+                    ConnectomeOutput[i][time] = self.model(ConnectomeOutput[i][time-1], _ExternalInput, _VoltageClamp)
+        return ConnectomeOutput
 
 SensoryList = {"ASHL": ASH, "ASHR": ASH}
 
@@ -245,7 +277,6 @@ def readConnectome(path):
                 NeuronList.append(FallbackSensory())
             SensoryMask.append(1)
         else:
-            # Interneuron, default as conductance model. 
 #            if NeuronName[i][0:3] == "RMD": TODO: Build a spiking model, need case-by-case approach.
 #                NeuronList.append(SpikingModel())
             NeuronList.append(conductanceModel())
@@ -301,5 +332,5 @@ def readConnectome(path):
     synapseList.append(GeneralSynapse(Gap_Junction_SRC, Gap_Junction_DST, Gap_Junction_Weight))
     synapseList.append(WicksSynapse(Wicks_SRC, Wicks_DST, Wicks_Weight))
 #    synapseList.append(RecurrentSynapse(Generic_SRC, Generic_DST, Generic_Weight))
-    model = NematodeForStep( NeuronList, synapseList, SensoryMask)
+    model = NematodeForStep( NeuronList, synapseList)
     return model

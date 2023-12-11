@@ -9,3 +9,5 @@ pyro-ppl
 torch 
 torchvision 
 torchaudio
+
+snntorch

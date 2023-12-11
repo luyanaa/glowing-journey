@@ -2,6 +2,7 @@ import wormfunconn as wfc
 from torch.utils.data import Dataset
 import torch, numpy
 import os
+import joblib
 
 timeStep = 0.01
 
@@ -31,22 +32,20 @@ class responseGenerator:
         y = []
         NeuronName=numpy.loadtxt("./pumpprobe/pumpprobe/aconnectome_ids.txt", dtype=object)[:, 1]
 
-        for i in self.stimList:
-            _stim, _resp, _labels= self.step(i, self.respList, 5000)
-            #_stim = torch.Tensor(_stim)
-            #_resp = torch.Tensor(_resp)
+        def func(i):
+            _stim, _resp, _labels= self.step(self.stimList[i], self.respList, 5000)
             stim = numpy.zeros((300, 5000))
             resp = numpy.zeros((300, 5000))
             stim[numpy.where(NeuronName == i)] = _stim
             for index in range(len(_labels)):
                 resp[numpy.where(NeuronName == _labels[index])] = _resp[index]
             resp[numpy.where(NeuronName == i)] = _stim
-            x.append(stim)
-            y.append(resp)
-        x = numpy.array(x)
-        y = numpy.array(y)
-        x = torch.Tensor(x)
-        y = torch.Tensor(y)
+            return (stim, resp)
+        result = joblib.Parallel(n_jobs=-1)(joblib.delayed(func)(i) for i in range(len(self.stimList)))
+        result = numpy.array(result)
+
+        x = torch.Tensor(result[:,0,:,:])
+        y = torch.Tensor(result[:,1,:,:])
 
         return x,y
 

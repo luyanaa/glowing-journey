@@ -21,8 +21,8 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
     args = parser.parse_args()
 
-    local_rank = int(os.environ["LOCAL_RANK"])
-    global_rank = int(os.environ["RANK"])
+    # local_rank = int(os.environ["LOCAL_RANK"])
+    # global_rank = int(os.environ["RANK"])
     
     # init_process_group(backend="gloo")
     model = c302.readConnectome("./data/CElegansNeuronTables.xls")
