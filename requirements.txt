@@ -1,8 +1,7 @@
-numpy
-
-# ./wormdatamodel
-# ./wormbrain
-# ./pumpprobe
+./wormbrain
+./wormfunconn
+./pumpprobe
+./wormfunconn
 pyro-ppl 
 
 # Assuming CPU cluster
@@ -10,4 +9,3 @@ pyro-ppl
 torch 
 torchvision 
 torchaudio
-
