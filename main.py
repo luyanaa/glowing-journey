@@ -53,11 +53,5 @@ if __name__ == "__main__":
         print(f"Epoch {epoch} | Batchsize: {args.batch_size} | Steps: {len(train_data)}")
         # train_data.sampler.set_epoch(epoch)
         for x_train, y_train in train_data:
-            print("step")
-        # svi.step(x_train, y_train)
-            svi.step(x_train)
-
-
-
-#self.model = DDP(self.model, device_ids=[self.local_rank])
-#destroy_process_group()
+            loss = svi.step(x_train, y_train)
+            print("loss: %.4f" % loss / len(x_train))

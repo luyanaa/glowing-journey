@@ -195,21 +195,13 @@ class synapseLayer(PyroModule):
 
 class NematodeForStep(PyroModule):
     # Work for Single-Step Inference for MCMC/Sequential MC and Bayesian Filter.
-#    def __init__ (self, InputSize, SensoryNeuronList, ConnectomeSize, OutputSize):
     def __init__ (self, neuronSize, NeuronList, synapseList):
         super().__init__()
-        
         # Neuron
         self.Neuron = neuronLayer(neuronSize, NeuronList)
         self.NeuronSize = len(NeuronList)
         self.synapse = synapseLayer(synapseList)
         self.synapseSize = len(synapseList)
-        # From Interneuron to Motor Neuron
-        # self.InterneuronToMotor = synapseLayer(ConnectomeSize, OutputSize) 
-        # Motor neuron
-        # self.MotorNeuron = neuronLayer(OutputSize)
-        # Motor Output
-        # self.OutputLayer = nn.Linear(OutputSize)
         
     def forward(self, Prev, ExternalInput=None, VoltageClamp=None): 
         CurrentInput = self.synapse(Prev)
@@ -217,23 +209,7 @@ class NematodeForStep(PyroModule):
             ExternalInput = torch.zeros_like(Prev)
         ConnectomeOutput = self.Neuron(CurrentInput, ExternalInput)
         ConnectomeOutput[VoltageClamp != 0.0] = VoltageClamp[VoltageClamp != 0.0]
-        # for Label in range(len(VoltageClamp)):
-        #     if VoltageClamp[Label] != 0.0:  
-            # Force Voltage Clamp First
-        #        ConnectomeOutput[Label] = VoltageClamp[Label]
-        # Deal with Sensory Neuron with non-current input
         return ConnectomeOutput
-
-    def step(self, state, mask, y=None):
-        self.t += 1
-        state["z"] = pyro.sample(
-            "z_{}".format(self.t),
-            dist.Normal(self.forward(state["z"]), self.SNR).to_event(300),
-        )
-        y = pyro.sample(
-            "y_{}".format(self.t), dist.Normal(state["z"][mask], self.sigma), obs=y
-        )
-        return state["z"], y
 
 class RecurrentNematode(PyroModule):
     def __init__(self, model, batch_sizes=1):
@@ -254,10 +230,9 @@ class RecurrentNematode(PyroModule):
         else :
             for time in range(input.size()[1]):
                 ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :])
-            # for i in range(input.size()[0]): # Iterate in Batch
-            #     for time in range(input.size()[1]):
-            #         ConnectomeOutput[i][time] = self.model(ConnectomeOutput[i][time-1], ExternalInput[i][time], VoltageClamp[i][time])
-
+        sigma = pyro.sample("sigma", dist.Gamma(.5, 1))
+        with pyro.plate("data", input.shape[0]):
+            obs = pyro.sample("obs", dist.Normal(ConnectomeOutput, sigma * sigma), obs=y)        
         return ConnectomeOutput
 
 SensoryList = {"ASHL": ASH, "ASHR": ASH}
