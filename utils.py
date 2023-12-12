@@ -44,11 +44,19 @@ class responseGenerator:
         result = joblib.Parallel(n_jobs=-1)(joblib.delayed(func)(i) for i in range(len(self.stimList)))
         result = numpy.array(result)
 
-        x = torch.Tensor(result[:,0,:,:])
-        y = torch.Tensor(result[:,1,:,:])
+        x = torch.Tensor(result[:,0,:,:]).swapaxes(1,2)
+        y = torch.Tensor(result[:,1,:,:]).swapaxes(1,2)
 
         return x,y
-
+class PsuedoDataset(Dataset):
+    def __init__(self,x,y) -> None:
+        super().__init__()
+        self.x = x
+        self.y = y
+    def __len__(self):
+        return len(self.x)
+    def __getitem__(self, index):
+        return self.x[index], self.y[index]
 # Feed Raw Response
 # Problem: We dont known half of labels
 class AtlasLoader(Dataset):

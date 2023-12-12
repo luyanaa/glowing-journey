@@ -19,25 +19,6 @@ def _save_snapshot(snapshot_path, model, epoch):
     torch.save(snapshot, snapshot_path)
     print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
 
-
-class Guide:
-    def __init__(self, model):
-            self.model = model
-
-    def init(self, state, initial):
-        self.t = 0
-        pyro.sample("z_init", dist.Delta(initial, self.event_dim))
-
-    def step(self, state, y=None):
-        self.t += 1
-            # Proposal distribution
-        pyro.sample(
-                "z_{}".format(self.t),
-                dist.Normal(
-                    self.model(state["z"]), torch.tensor([1.0, 1.0])
-                ).to_event(self.event_dim),
-            )
-
 # Particle Filter can be realized with Pyro Sequential MC
 def ParticleFilter(model, y_train, num_particles=114, seed=19260817):
     pyro.set_rng_seed(seed)
@@ -51,18 +32,6 @@ def ParticleFilter(model, y_train, num_particles=114, seed=19260817):
 
     for y in y_train[1:]:
         smc.step(y)
-
-def SVIRunner(model, max_epochs):
-    svi = SVI(model, Guide, pyro.optim.RMSprop(), Trace_ELBO())
-    for epoch in range(epochs_run, max_epochs):
-        print(f"[GPU{self.global_rank}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
-        train_data.sampler.set_epoch(epoch)
-        for x_train in train_data:
-            x_train = x_train.to(local_rank)
-            svi.step(x_train)
-
-        if local_rank == 0 and epoch % save_every == 0:
-            _save_snapshot(epoch)
 
 # Using Monte Carlo Markov Chain
 def train_MCMC(model, x_train, y_train):
