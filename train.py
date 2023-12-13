@@ -76,7 +76,7 @@ if __name__ == "__main__":
             print(f"Epoch {epoch} | Batchsize: {args.batch_size} | Steps: {len(train_data)}")
             # train_data.sampler.set_epoch(epoch)
             for x_train, y_train in train_data:
-                loss = svi.step(x_train, y_train)
+                loss = svi.step(x_train, y=y_train)
                 print("loss: %.4f" % loss / len(x_train))
             if epoch % args.save_every == 0:
                 num_samples = 5000

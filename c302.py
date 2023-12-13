@@ -69,17 +69,17 @@ class ASH(PyroModule):
 class conductanceLayer (PyroModule):
     def __init__(self, input_size):
         super().__init__()
-        self.V = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
+        # self.V = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
         self.E = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
         self.G = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
         self.C = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
     # Input Current, Output Voltage
-    def forward(self, inputSignal):
-        current = self.G*(self.V - self.E) 
+    def forward(self, Prev, inputSignal):
+        current = self.G*(Prev - self.E) 
         dv = (inputSignal - current) 
         dv = self.C
-        self.V = self.V + dv * timeStep
-        return self.V
+        Output = Prev + dv * timeStep
+        return Output
 
 class neuronLayer(PyroModule):
     def __init__(self, neuronSize, neuronList):
@@ -87,8 +87,8 @@ class neuronLayer(PyroModule):
         self._neuron_List = neuronList
         self.neuronSize = neuronSize
         self.conductance = conductanceLayer(input_size=neuronSize)
-    def forward(self, inputSignal, externalInput):
-        output = self.conductance(inputSignal)
+    def forward(self, Prev, inputSignal, externalInput):
+        output = self.conductance(Prev, inputSignal)
         if inputSignal.dim() == 1:
             for i in self._neuron_List:
                 if inputSignal[i]!=0.0:
@@ -226,10 +226,10 @@ class NematodeForStep(PyroModule):
         CurrentInput = self.synapse(Prev)
         if ExternalInput is None:
             ExternalInput = torch.zeros_like(Prev)
-        ConnectomeOutput = self.Neuron(CurrentInput, ExternalInput)
+        ConnectomeOutput = self.Neuron(Prev, CurrentInput, ExternalInput)
         ConnectomeOutput[VoltageClamp != 0.0] = VoltageClamp[VoltageClamp != 0.0]
         # Add noise to single inference.  
-        sigma = pyro.sample("sigma", dist.Uniform(70.71, 223.61))
+        sigma = pyro.sample("sigma_%d" % self.t, dist.Uniform(70.71, 223.61))
         if mask is None:  
             ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)), obs=y)  
         if mask is not None:
