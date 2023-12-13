@@ -57,6 +57,7 @@ class PsuedoDataset(Dataset):
         return len(self.x)
     def __getitem__(self, index):
         return self.x[index], self.y[index]
+
 # Feed Raw Response
 # Problem: We dont known half of labels
 class AtlasLoader(Dataset):
@@ -102,5 +103,3 @@ class AtlasLoader(Dataset):
 
     def __getitem__(self, idx):
         return self.x[idx], self.y[idx]
-
-# Feed Original Raw
