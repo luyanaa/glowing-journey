@@ -29,23 +29,14 @@ def _save_snapshot(snapshot_path, model, epoch):
             "EPOCHS_RUN": epoch,
         }
     torch.save(snapshot, snapshot_path)
-    print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
-
-def CacheModel(model, snapshot_path):
-    if os.path.exists(snapshot_path):
-        print("Loading snapshot")
-        loc = f"cpu:{local_rank}"
-        snapshot = torch.load(snapshot_path, map_location=loc)
-        model.load_state_dict(snapshot["MODEL_STATE"])
-        epochs_run = snapshot["EPOCHS_RUN"]
-        print(f"Resuming training from snapshot at Epoch {epochs_run}")        
+    print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")   
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='simple distributed training job')
     parser.add_argument('total_epochs', type=int, help='Total epochs to train the model')
     parser.add_argument('save_every', type=int, help='How often to save a snapshot')
-    parser.add_argument('--batch_size', default=16, type=int, help='Input batch size on each device (default: 32)')
+    parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
     args = parser.parse_args()
 
     # local_rank = int(os.environ["LOCAL_RANK"])
@@ -76,20 +67,17 @@ if __name__ == "__main__":
             print(f"Epoch {epoch} | Batchsize: {args.batch_size} | Steps: {len(train_data)}")
             # train_data.sampler.set_epoch(epoch)
             for x_train, y_train in train_data:
-                loss = svi.step(x_train, y=y_train)
-                print("loss: %.4f" % loss / len(x_train))
-            if epoch % args.save_every == 0:
-                num_samples = 5000
-                predictive = Predictive(model, guide=Guide, num_samples=num_samples)
-                preds = predictive(x_test)
+                loss = svi.step(x_train, torch.zeros_like(x_train), y=y_train)
+                print("loss: %.4f" % loss )
 
 
     elif False:
+        model = c302.RecurrentNematode(model)
         nuts_kernel = NUTS(model, jit_compile=False)
-        mcmc = MCMC(nuts_kernel, num_samples=50)
-        mcmc.run(x_train, y_train)
-        predictive = Predictive(model=model, posterior_samples=mcmc.get_samples())
-        preds = predictive(x_test)
+        mcmc = MCMC(nuts_kernel, num_samples=500)
+        mcmc.run(x_train, torch.zeros_like(x_train), y=y_train)
+        # predictive = Predictive(model=model, posterior_samples=mcmc.get_samples())
+        # preds = predictive(x_test)
 
 
     else:

@@ -15,8 +15,6 @@ import snntorch
 # Neuron Type: Conductance Model (Done), Sensory, Motor (Need case-by-case solution)
 # Synapse Type: Gap Junction, Chemical Synapse (A variety of), extrasynaptic 
 
-# Voltage for mV, Current for mA. 
-
 class GRUModel(PyroModule):
     def __init__(self, hidden_size=8, num_layers=2):
         super().__init__()
@@ -69,10 +67,9 @@ class ASH(PyroModule):
 class conductanceLayer (PyroModule):
     def __init__(self, input_size):
         super().__init__()
-        # self.V = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
         self.E = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
-        self.G = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
-        self.C = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
+        self.G = PyroSample(dist.Normal(1., 1.).expand([input_size]).to_event(1))
+        self.C = PyroSample(dist.Normal(0.05, .025).expand([input_size]).to_event(1))
     # Input Current, Output Voltage
     def forward(self, Prev, inputSignal):
         current = self.G*(Prev - self.E) 
@@ -146,8 +143,8 @@ class WicksSynapse(PyroModule):
             self.synapseOutput = torch.Tensor(numpy.array(synapseOutput, dtype=numpy.int64)).to(torch.int64).squeeze()
             self.synapseWeight = torch.Tensor(numpy.array(synapseWeight)).squeeze()
             self.g_max = PyroSample(dist.Normal(0.6, 1.).expand([self.inputSize]).to_event(1))
-            self.V_rest = PyroSample(dist.Normal(15, 1.).expand([self.inputSize]).to_event(1))
-            self.V_slope = PyroSample(dist.Normal(-76, 1.).expand([self.inputSize]).to_event(1))
+            self.V_rest = PyroSample(dist.Normal(0.015, 0.01).expand([self.inputSize]).to_event(1))
+            self.V_slope = PyroSample(dist.Normal(-0.076, 0.1).expand([self.inputSize]).to_event(1))
         else:
             self.g_max = g_max
             self.V_rest = V_rest
@@ -219,21 +216,20 @@ class NematodeForStep(PyroModule):
         self.NeuronSize = len(NeuronList)
         self.synapse = synapseLayer(synapseList)
         self.synapseSize = len(synapseList)
-        self.t = 0
         
-    def forward(self, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None): 
-        self.t = self.t + 1
+    def forward(self, time, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None): 
         CurrentInput = self.synapse(Prev)
         if ExternalInput is None:
             ExternalInput = torch.zeros_like(Prev)
         ConnectomeOutput = self.Neuron(Prev, CurrentInput, ExternalInput)
         ConnectomeOutput[VoltageClamp != 0.0] = VoltageClamp[VoltageClamp != 0.0]
         # Add noise to single inference.  
+        self.t = time
         sigma = pyro.sample("sigma_%d" % self.t, dist.Uniform(70.71, 223.61))
         if mask is None:  
-            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)), obs=y)  
+            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2), obs=y)  
         if mask is not None:
-            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)))
+            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2))
             obs = pyro.sample("obs_%d" % self.t, ConnectomeOutput[mask], obs=y)
         return ConnectomeOutput
 
@@ -243,25 +239,22 @@ class RecurrentNematode(PyroModule):
         self.model = model
         self.expected_input_dim = 2 if batch_sizes is None else 3
 
-    def forward(self, input, y=None):
-        # VoltageClamp, ExternalInput = input
-        VoltageClamp = input
-        ExternalInput = torch.zeros_like(VoltageClamp)
+    def forward(self, VoltageClamp, ExternalInput, y=None):
         if VoltageClamp.dim() != self.expected_input_dim :
             Exception("Shape Unmatched")
         ConnectomeOutput = torch.zeros_like(VoltageClamp)
         if self.expected_input_dim == 2:
-            for i in range(input.size()[0]): # Iterate in Time 
+            for i in range(VoltageClamp.size()[0]): # Iterate in Time 
                 if y is None:
-                    ConnectomeOutput[i] = self.model(ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i])
+                    ConnectomeOutput[i] = self.model(i. ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i])
                 else:
-                    ConnectomeOutput[i] = self.model(ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i], y[i])
+                    ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i], y[i])
         else :
-            for time in range(input.size()[1]):
+            for time in range(VoltageClamp.size()[1]):
                 if y is None: 
-                    ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :])       
+                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :])       
                 else : 
-                    ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :], y[:, time, :])       
+                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :], y[:, time, :])       
         return ConnectomeOutput
 
 SensoryList = {"ASHL": ASH, "ASHR": ASH}
