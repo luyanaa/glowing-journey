@@ -50,6 +50,9 @@ class ASH(PyroModule):
         self.Xe = PyroSample(Normal(0.9800, 0.0511)) 
         self.k1 = PyroParam(torch.tensor(1.),) 
         self.k2 = PyroParam(torch.tensor(1.),)
+        if torch.cuda.is_available():
+            self.k1 = self.k1.cuda()
+            self.k2 = self.k2.cuda()
         
     def forward(self, inputCurrent, input):
         I_1 = - self.k1 * (input-self.pastInput) / timeStep
@@ -70,6 +73,11 @@ class conductanceLayer (PyroModule):
         self.E = PyroSample(dist.Normal(0., 1.).expand([input_size]).to_event(1))
         self.G = PyroSample(dist.Normal(1., 1.).expand([input_size]).to_event(1))
         self.C = PyroSample(dist.Normal(0.05, .025).expand([input_size]).to_event(1))
+        
+        if torch.cuda.is_available():
+                self.E = self.E.cuda()
+                self.G = self.G.cuda()
+                self.C = self.C.cuda()
     # Input Current, Output Voltage
     def forward(self, Prev, inputSignal):
         current = self.G*(Prev - self.E) 
@@ -114,6 +122,11 @@ class GeneralSynapse(PyroModule):
         self.synapseOutput = torch.Tensor(numpy.array(synapseOutput, dtype=numpy.int64)).to(torch.int64).squeeze()
         self.synapseWeight = torch.Tensor(numpy.array(synapseWeight)).squeeze()
         self.g_syn = PyroSample(dist.Normal(0., 1.).expand([len(synapseInput)]).to_event(1))
+        if torch.cuda.is_available():
+            self.synapseInput = self.synapseInput.cuda()
+            self.synapseOutput = self.synapseOutput.cuda()
+            self.synapseWeight = self.synapseWeight.cuda()
+            self.g_syn = self.g_syn.cuda()
     def forward(self, inputSignal):
         output = torch.zeros_like(inputSignal)
         if inputSignal.dim() == 1: # Unbatched
@@ -145,10 +158,13 @@ class WicksSynapse(PyroModule):
             self.g_max = PyroSample(dist.Normal(0.6, 1.).expand([self.inputSize]).to_event(1))
             self.V_rest = PyroSample(dist.Normal(0.015, 0.01).expand([self.inputSize]).to_event(1))
             self.V_slope = PyroSample(dist.Normal(-0.076, 0.1).expand([self.inputSize]).to_event(1))
-        else:
-            self.g_max = g_max
-            self.V_rest = V_rest
-            self.V_slope = V_slope
+            if torch.cuda.is_available():
+                self.synapseInput = self.synapseInput.cuda()
+                self.synapseOutput = self.synapseOutput.cuda()
+                self.synapseWeight = self.synapseWeight.cuda()
+                self.g_max = self.g_max.cuda()
+                self.V_rest = self.V_rest.cuda()
+                self.V_slope = self.V_slope.cuda()
     def forward(self, inputSignal):
         output = torch.zeros_like(inputSignal)
         if inputSignal.dim() == 1: # Unbatched
@@ -157,8 +173,8 @@ class WicksSynapse(PyroModule):
         elif inputSignal.dim() == 2: # Batched, selected on neuron
             preVoltage = torch.index_select(inputSignal, 1, self.synapseInput)
             postVoltage = torch.index_select(inputSignal, 1, self.synapseOutput)
-        current = self.g_max * 1 / (1+torch.exp((preVoltage-self.V_rest) / self.V_slope)) * (postVoltage)
-        current = current * self.synapseWeight
+        current = self.g_max * 1 / (1+torch.exp((preVoltage-self.V_rest) / self.V_slope)) 
+        current = current * self.synapseWeight * (postVoltage)
         if inputSignal.dim() == 1: # Unbatched
             output[self.synapseOutput] = current
         elif inputSignal.dim() == 2:
@@ -216,8 +232,12 @@ class NematodeForStep(PyroModule):
         self.NeuronSize = len(NeuronList)
         self.synapse = synapseLayer(synapseList)
         self.synapseSize = len(synapseList)
-        
+    
+    def init(self, state, initial):
+        state["z"] = pyro.sample("z_init", dist.Delta(initial, event_dim=1))
+
     def forward(self, time, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None): 
+        print(Prev.shape)
         CurrentInput = self.synapse(Prev)
         if ExternalInput is None:
             ExternalInput = torch.zeros_like(Prev)
@@ -232,6 +252,9 @@ class NematodeForStep(PyroModule):
             ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2))
             obs = pyro.sample("obs_%d" % self.t, ConnectomeOutput[mask], obs=y)
         return ConnectomeOutput
+    def step(self, state, time, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None):
+        state["z"] = self.forward(time, Prev, ExternalInput, VoltageClamp, y, mask)
+        return state["z"], y
 
 class RecurrentNematode(PyroModule):
     def __init__(self, model, batch_sizes=1):
@@ -243,6 +266,8 @@ class RecurrentNematode(PyroModule):
         if VoltageClamp.dim() != self.expected_input_dim :
             Exception("Shape Unmatched")
         ConnectomeOutput = torch.zeros_like(VoltageClamp)
+        if torch.cuda.is_available():
+            ConnectomeOutput = ConnectomeOutput.cuda()
         if self.expected_input_dim == 2:
             for i in range(VoltageClamp.size()[0]): # Iterate in Time 
                 if y is None:

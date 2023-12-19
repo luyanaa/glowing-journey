@@ -4,10 +4,4 @@
 ./wormfunconn
 pyro-ppl 
 
-# Assuming CPU cluster
---extra-index-url https://download.pytorch.org/whl/cpu
-torch 
-torchvision 
-torchaudio
-
 snntorch

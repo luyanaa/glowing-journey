@@ -3,10 +3,12 @@ from torch.utils.data import DataLoader, random_split
 import torch.nn.functional as F
 
 import os
+import time
 import pyro, pyro.optim
-from pyro.infer import SMCFilter, MCMC, NUTS, SVI, Trace_ELBO, Predictive
+from pyro.infer import MCMC, NUTS, SVI, Trace_ELBO, Predictive, SMCFilter
 from pyro.infer.autoguide import AutoDiagonalNormal
 from pyro.distributions import Empirical
+import pyro.distributions as dist
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -58,8 +60,11 @@ if __name__ == "__main__":
     model = c302.readConnectome("./data/CElegansNeuronTables.xls")
     summary(model)
 
-    if True:    
+    if False:    
         model = c302.RecurrentNematode(model)
+        if torch.cuda.is_available():
+            torch.set_default_tensor_type("torch.cuda.DoubleTensor")
+            model = model.to("cuda")
         Guide = AutoDiagonalNormal(model)
         optim = pyro.optim.AdagradRMSProp({})
         svi = SVI(model, Guide, optim, Trace_ELBO())
@@ -67,25 +72,43 @@ if __name__ == "__main__":
             print(f"Epoch {epoch} | Batchsize: {args.batch_size} | Steps: {len(train_data)}")
             # train_data.sampler.set_epoch(epoch)
             for x_train, y_train in train_data:
-                loss = svi.step(x_train, torch.zeros_like(x_train), y=y_train)
+                VoltageClamp, ExternalInput = x_train, torch.zeros_like(x_train)
+                if torch.cuda.is_available():
+                    VoltageClamp, ExternalInput, y_train = VoltageClamp.cuda(), ExternalInput.cuda(), y_train.cuda() 
+                loss = svi.step(VoltageClamp, ExternalInput, y=y_train)
                 print("loss: %.4f" % loss )
 
-
-    elif False:
-        model = c302.RecurrentNematode(model)
-        nuts_kernel = NUTS(model, jit_compile=False)
-        mcmc = MCMC(nuts_kernel, num_samples=500)
-        mcmc.run(x_train, torch.zeros_like(x_train), y=y_train)
-        # predictive = Predictive(model=model, posterior_samples=mcmc.get_samples())
-        # preds = predictive(x_test)
-
-
     else:
-        num_particles = 50
-        pyro.set_rng_seed()
-        Guide = AutoDiagonalNormal(model)
-        # y_train = Empirical(y_train, torch.ones(y_train.shape[:-1]), validate_args=None)
-        smc = SMCFilter(model, Guide, num_particles=num_particles, max_plate_nesting=0)
-        smc.init(initial=torch.zeros(300)) 
-        for y in y_train[1:]:
-            smc.step(y)
+        num_particles = 300
+        pyro.set_rng_seed(time.time())
+        if torch.cuda.is_available():
+            torch.set_default_tensor_type("torch.cuda.DoubleTensor")
+            model = model.to("cuda")
+
+        class Guide:
+            def init(self, state, initial):
+                self.t = 0
+                pyro.sample("z_init", dist.Delta(initial, event_dim=1))
+
+            def step(self, state, time, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None ):
+                self.t = time
+                print(self.t)
+                sigma = pyro.sample("sigma_%d" % self.t, dist.Uniform(70.71, 223.61))
+                # Proposal distribution
+                pyro.sample(
+                    "z_{}".format(self.t),
+                    dist.Normal(
+                        y,  1 / (sigma * sigma)
+                    ).to_event(2),
+                )
+        guide = Guide
+        state = {}
+
+
+        smc = SMCFilter(model, guide, num_particles=num_particles, max_plate_nesting=0)
+        model.init(state=state, initial=torch.zeros(300))
+        smc.init(state=state, initial=torch.zeros(300)) 
+        print(x_train[:, 1-1, :].shape)
+        which = 1
+        for index in range(1, x_train.shape[1]):sm
+            smc.step(time=index, Prev=x_train[:, index-1, :].cuda(), ExternalInput=torch.zeros_like(x_train[:, index, :]).cuda(), VoltageClamp=x_train[:, index, :].cuda(), y=y_train[:, index, :].cuda())
