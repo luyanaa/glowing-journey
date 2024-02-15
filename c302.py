@@ -5,7 +5,7 @@ import pandas
 import pyro.distributions as dist
 from pyro.nn import PyroModule, PyroSample, PyroParam
 from pyro.distributions import Normal
-from utils import timeStep
+from utils import timeStep, scale
 import numpy
 import snntorch 
 
@@ -18,23 +18,25 @@ import snntorch
 class GRUModel(PyroModule):
     def __init__(self, hidden_size=8, num_layers=2):
         super().__init__()
-        self.model=(PyroModule[nn.Sequential](PyroModule[nn.GRU](1, hidden_size, num_layers=num_layers, bidirectional=False), \
+        self.value = PyroSample(Normal(0.0, 1.0))
+        self.model=(PyroModule[nn.Sequential](PyroModule[nn.GRU](2, hidden_size, num_layers=num_layers, bidirectional=False), \
                                           PyroModule[nn.Linear](hidden_size, 1)))
     def forward(self, inputSignal):
-        return self.model(inputSignal)
+        self.value = self.value + self.model(self.value, inputSignal) * timeStep * scale
+        return self.value
 
 class FallbackSensory(PyroModule):
     def __init__(self, hidden_size=8, num_layers=2):
         super().__init__()
-        self.model=(PyroModule[nn.Sequential](PyroModule[nn.GRU](2, hidden_size, num_layers=num_layers, bidirectional=False), \
+        self.model=(PyroModule[nn.Sequential](PyroModule[nn.GRU](3, hidden_size, num_layers=num_layers, bidirectional=False), \
                                           PyroModule[nn.Linear](hidden_size, 1)))
     def forward(self, inputSignal, ExternalInput):
-        return self.model(inputSignal, ExternalInput)
-
+        self.value = self.value + self.model(self.value, inputSignal, ExternalInput) * timeStep * scale
+        return self.value
 class SpikingModel(PyroModule):
     def __init__(self, ):
         pass
-    def forward(): 
+    def forward():
         pass
 
 # https://www.sciencedirect.com/science/article/pii/S0168010223000068
@@ -47,13 +49,12 @@ class ASH(PyroModule):
 
         self.delta_b = PyroParam(torch.zeros(1)) # Unknown Parameter
         # Original Model is b1-b2 one, hard to implement, choose arthimetic average. 
-        self.Xe = PyroSample(Normal(0.9800, 0.0511)) 
-        self.k1 = PyroParam(torch.tensor(1.),) 
+        self.Xe = PyroSample(Normal(0.9800, 0.0511))
+        self.k1 = PyroParam(torch.tensor(1.),)
         self.k2 = PyroParam(torch.tensor(1.),)
         if torch.cuda.is_available():
             self.k1 = self.k1.cuda()
             self.k2 = self.k2.cuda()
-        
     def forward(self, inputCurrent, input):
         I_1 = - self.k1 * (input-self.pastInput) / timeStep
         I_2 = - self.k2 * ((input-self.pastInput) / timeStep-(self.pastInput-self.pastpastInput)/timeStep) / timeStep
@@ -182,6 +183,7 @@ class WicksSynapse(PyroModule):
         return output
 
 # Using GRU for Synapse Simulation for Synapse Plasticity
+# Do not need timeStep as current is mainly calculated with pre/post voltage 
 class RecurrentSynapse(PyroModule):
     hidden_size = 8
     num_layers = 2
@@ -237,7 +239,6 @@ class NematodeForStep(PyroModule):
         state["z"] = pyro.sample("z_init", dist.Delta(initial, event_dim=1))
 
     def forward(self, time, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None): 
-        print(Prev.shape)
         CurrentInput = self.synapse(Prev)
         if ExternalInput is None:
             ExternalInput = torch.zeros_like(Prev)
@@ -252,23 +253,27 @@ class NematodeForStep(PyroModule):
             ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2))
             obs = pyro.sample("obs_%d" % self.t, ConnectomeOutput[mask], obs=y)
         return ConnectomeOutput
-    def step(self, state, time, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None):
-        state["z"] = self.forward(time, Prev, ExternalInput, VoltageClamp, y, mask)
-        return state["z"], y
 
+# TODO: Small Step for Simulation, Big Step for Sampling.
 class RecurrentNematode(PyroModule):
     def __init__(self, model, batch_sizes=1):
         super().__init__()
         self.model = model
-        self.expected_input_dim = 2 if batch_sizes is None else 3
+#        self.expected_input_dim = 2 if batch_sizes is None else 3
 
     def forward(self, VoltageClamp, ExternalInput, y=None):
-        if VoltageClamp.dim() != self.expected_input_dim :
+        if VoltageClamp is None and ExternalInput is not None: 
+            VoltageClamp = torch.zeros_like(ExternalInput)
+        elif ExternalInput is None and VoltageClamp is not None:
+            ExternalInput = torch.zeros_like(VoltageClamp)
+        else: 
+            Exception("Input dimension cannot be infered from two NoneType. ")
+        if VoltageClamp.ndim != ExternalInput.ndim :
             Exception("Shape Unmatched")
         ConnectomeOutput = torch.zeros_like(VoltageClamp)
         if torch.cuda.is_available():
             ConnectomeOutput = ConnectomeOutput.cuda()
-        if self.expected_input_dim == 2:
+        if ExternalInput.ndim == 2:
             for i in range(VoltageClamp.size()[0]): # Iterate in Time 
                 if y is None:
                     ConnectomeOutput[i] = self.model(i. ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i])
@@ -276,7 +281,7 @@ class RecurrentNematode(PyroModule):
                     ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i], y[i])
         else :
             for time in range(VoltageClamp.size()[1]):
-                if y is None: 
+                if y is None:  
                     ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :])       
                 else : 
                     ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :], y[:, time, :])       
