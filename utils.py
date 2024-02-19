@@ -3,9 +3,7 @@ from torch.utils.data import Dataset
 import torch, numpy
 import os
 import joblib
-
-timeStep = 0.01
-scale = 200
+from c302 import timeStep
 
 # Get the responses
 # stim_neu_id = "AWBL"

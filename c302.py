@@ -5,9 +5,12 @@ import pandas
 import pyro.distributions as dist
 from pyro.nn import PyroModule, PyroSample, PyroParam
 from pyro.distributions import Normal
-from utils import timeStep, scale
 import numpy
 import snntorch 
+
+timeStep = 0.01
+value_scale = 200
+
 
 # For Neuron: Input Current, Output Voltage (Easy to log, easy to calculate Vpre-Vpost)
 # For Synapse: Input Voltage, Output Current. 
@@ -22,7 +25,7 @@ class GRUModel(PyroModule):
         self.model=(PyroModule[nn.Sequential](PyroModule[nn.GRU](2, hidden_size, num_layers=num_layers, bidirectional=False), \
                                           PyroModule[nn.Linear](hidden_size, 1)))
     def forward(self, inputSignal):
-        self.value = self.value + self.model(self.value, inputSignal) * timeStep * scale
+        self.value = self.value + self.model(self.value, inputSignal) * timeStep * value_scale
         return self.value
 
 class FallbackSensory(PyroModule):
@@ -31,7 +34,7 @@ class FallbackSensory(PyroModule):
         self.model=(PyroModule[nn.Sequential](PyroModule[nn.GRU](3, hidden_size, num_layers=num_layers, bidirectional=False), \
                                           PyroModule[nn.Linear](hidden_size, 1)))
     def forward(self, inputSignal, ExternalInput):
-        self.value = self.value + self.model(self.value, inputSignal, ExternalInput) * timeStep * scale
+        self.value = self.value + self.model(self.value, inputSignal, ExternalInput) * timeStep * value_scale
         return self.value
 class SpikingModel(PyroModule):
     def __init__(self, ):
@@ -248,7 +251,7 @@ class NematodeForStep(PyroModule):
         self.t = time
         sigma = pyro.sample("sigma_%d" % self.t, dist.Uniform(70.71, 223.61))
         if mask is None:  
-            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2), obs=y)  
+            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2))  
         if mask is not None:
             ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2))
             obs = pyro.sample("obs_%d" % self.t, ConnectomeOutput[mask], obs=y)
@@ -256,12 +259,15 @@ class NematodeForStep(PyroModule):
 
 # TODO: Small Step for Simulation, Big Step for Sampling.
 class RecurrentNematode(PyroModule):
-    def __init__(self, model, batch_sizes=1):
+    def __init__(self, model, scale = 5):
         super().__init__()
         self.model = model
-#        self.expected_input_dim = 2 if batch_sizes is None else 3
+        self.scale = scale
+        global timeStep
+        timeStep = timeStep / scale
 
     def forward(self, VoltageClamp, ExternalInput, y=None):
+        scale = self.scale
         if VoltageClamp is None and ExternalInput is not None: 
             VoltageClamp = torch.zeros_like(ExternalInput)
         elif ExternalInput is None and VoltageClamp is not None:
@@ -270,21 +276,29 @@ class RecurrentNematode(PyroModule):
             Exception("Input dimension cannot be infered from two NoneType. ")
         if VoltageClamp.ndim != ExternalInput.ndim :
             Exception("Shape Unmatched")
-        ConnectomeOutput = torch.zeros_like(VoltageClamp)
+
+        # Doing interpolation in scale. 
+        if VoltageClamp.ndim == 2:
+            ConnectomeOutput = torch.zeros((VoltageClamp.shape[0] * scale, VoltageClamp.shape[1]))
+        if VoltageClamp.ndim == 3:
+            ConnectomeOutput = torch.zeros((VoltageClamp.shape[0] , VoltageClamp.shape[1] * scale, VoltageClamp.shape[2]))
         if torch.cuda.is_available():
             ConnectomeOutput = ConnectomeOutput.cuda()
+        print("ConnectomeOutput.shape", ConnectomeOutput.shape)
+        print("VoltageClamp.shape", VoltageClamp.shape)
+        print("ExternalInput.shape", ExternalInput.shape)
         if ExternalInput.ndim == 2:
-            for i in range(VoltageClamp.size()[0]): # Iterate in Time 
-                if y is None:
-                    ConnectomeOutput[i] = self.model(i. ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i])
-                else:
-                    ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[i], VoltageClamp[i], y[i])
+            for i in range(VoltageClamp.size()[0] *scale ): # Iterate in Time 
+                if y is None or i % 10 == 0: # In inference mode or with interpolation
+                    ConnectomeOutput[i] = self.model(i. ConnectomeOutput[i-1], ExternalInput[(i // scale)], VoltageClamp[(i // scale)])
+                else: 
+                    ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[(i // scale)], VoltageClamp[(i // scale)], y[i // scale])
         else :
-            for time in range(VoltageClamp.size()[1]):
+            for time in range(VoltageClamp.size()[1] * scale) :
                 if y is None:  
-                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :])       
+                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])       
                 else : 
-                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time, :], VoltageClamp[:, time, :], y[:, time, :])       
+                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :], y[:, time // scale, :])       
         return ConnectomeOutput
 
 SensoryList = {"ASHL": ASH, "ASHR": ASH}

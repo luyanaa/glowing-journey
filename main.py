@@ -2,6 +2,8 @@ import torch
 from torch.utils.data import DataLoader, random_split
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import LearningRateFinder
+from pytorch_lightning.tuner import Tuner
 
 import os
 import time
@@ -61,7 +63,17 @@ class PyroLightningModule(pl.LightningModule):
         """Configure an optimizer."""
         return torch.optim.Adam(self.loss_fn.parameters(), lr=self.lr)
 
+class FineTuneLearningRateFinder(LearningRateFinder):
+    def __init__(self, milestones, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.milestones = milestones
 
+    def on_fit_start(self, *args, **kwargs):
+        return
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        if trainer.current_epoch in self.milestones or trainer.current_epoch == 0:
+            self.lr_find(trainer, pl_module)
 
 if __name__ == "__main__":
     import argparse
@@ -90,8 +102,9 @@ if __name__ == "__main__":
         dataset,
         batch_size=args.batch_size,
         pin_memory=True,
-        shuffle=False
-        # sampler=DistributedSampler(dataset)
+        shuffle=True, 
+        num_workers = os.cpu_count()-1, 
+        drop_last=True
     )
 
     model = c302.readConnectome("./data/CElegansNeuronTables.xls")
@@ -109,8 +122,12 @@ if __name__ == "__main__":
         strategy=args.strategy,
         devices=args.devices,
         max_epochs=args.total_epochs,
-        auto_lr_find=True
+        log_every_n_steps = args.save_every, 
+        callbacks=[FineTuneLearningRateFinder(milestones=(5, 10))]
     )
-    trainer.tune(training_plan)
+    tuner = Tuner(trainer)
+    tuner.scale_batch_size(training_plan, mode="power")
+
+
     trainer.fit(training_plan, train_dataloaders=train_data)
 
