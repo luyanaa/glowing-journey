@@ -30,7 +30,7 @@ from numba import cuda
 import math
 
 # ----------------------------------------------------------------------------------------------------------------------
-@cuda.jiipt
+@cuda.jit
 def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R):
     """
     :param seq_len: The length of the sequence (both inputs are assumed to be of the same size)

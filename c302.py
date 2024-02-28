@@ -6,7 +6,6 @@ import pyro.distributions as dist
 from pyro.nn import PyroModule, PyroSample, PyroParam
 from pyro.distributions import Normal
 import numpy
-import snntorch 
 
 timeStep = 0.01
 value_scale = 200
@@ -257,9 +256,8 @@ class NematodeForStep(PyroModule):
             obs = pyro.sample("obs_%d" % self.t, ConnectomeOutput[mask], obs=y)
         return ConnectomeOutput
 
-# TODO: Small Step for Simulation, Big Step for Sampling.
 class RecurrentNematode(PyroModule):
-    def __init__(self, model, scale = 5):
+    def __init__(self, model, scale = 2):
         super().__init__()
         self.model = model
         self.scale = scale
@@ -284,13 +282,10 @@ class RecurrentNematode(PyroModule):
             ConnectomeOutput = torch.zeros((VoltageClamp.shape[0] , VoltageClamp.shape[1] * scale, VoltageClamp.shape[2]))
         if torch.cuda.is_available():
             ConnectomeOutput = ConnectomeOutput.cuda()
-        print("ConnectomeOutput.shape", ConnectomeOutput.shape)
-        print("VoltageClamp.shape", VoltageClamp.shape)
-        print("ExternalInput.shape", ExternalInput.shape)
         if ExternalInput.ndim == 2:
             for i in range(VoltageClamp.size()[0] *scale ): # Iterate in Time 
                 if y is None or i % 10 == 0: # In inference mode or with interpolation
-                    ConnectomeOutput[i] = self.model(i. ConnectomeOutput[i-1], ExternalInput[(i // scale)], VoltageClamp[(i // scale)])
+                    ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[(i // scale)], VoltageClamp[(i // scale)])
                 else: 
                     ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[(i // scale)], VoltageClamp[(i // scale)], y[i // scale])
         else :

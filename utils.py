@@ -48,14 +48,15 @@ class responseGenerator:
 
         return x,y
 class PsuedoDataset(Dataset):
-    def __init__(self,x,y) -> None:
+    def __init__(self,x1,x2,y) -> None:
         super().__init__()
-        self.x = x
+        self.x1 = x1
+        self.x2 = x2
         self.y = y
     def __len__(self):
-        return len(self.x)
+        return len(self.x1)
     def __getitem__(self, index):
-        return self.x[index], self.y[index]
+        return self.x1[index], self.x2[index], self.y[index]
 
 # Feed Raw Response
 # Problem: We dont known half of labels

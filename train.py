@@ -46,19 +46,25 @@ if __name__ == "__main__":
 
     x_train, y_train = responseGenerator(folder="./wormfunconn/atlas/", strain="unc-31").Dataset()
     x_train, x_test, y_train, y_test = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
-    dataset = PsuedoDataset(x_train, y_train)
     train_data = DataLoader(
-        dataset,
+        PsuedoDataset(x_train, torch.zeros_like(x_train), y_train),
         batch_size=args.batch_size,
         pin_memory=True,
-        shuffle=False
-        # sampler=DistributedSampler(dataset)
+        shuffle=True,
+        drop_last=True,
+        num_workers = os.cpu_count()-1, 
     )
+    test_data = DataLoader(
+            PsuedoDataset(x_test, torch.zeros_like(x_test), y_test),
+            pin_memory=True,
+            shuffle=True, 
+            num_workers = os.cpu_count()-1, 
+        )
 
     model = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    model = c302.RecurrentNematode(model)
     summary(model)
 
-    model = c302.RecurrentNematode(model)
     if torch.cuda.is_available():
         torch.set_default_tensor_type("torch.cuda.DoubleTensor")
         model = model.to("cuda")
@@ -67,18 +73,17 @@ if __name__ == "__main__":
     svi = SVI(model, Guide, optim, Trace_ELBO())
     for epoch in range(0, args.total_epochs):
         print(f"Epoch {epoch} | Batchsize: {args.batch_size} | Steps: {len(train_data)}")
-        # train_data.sampler.set_epoch(epoch)
-        for x_train, y_train in train_data:
-            VoltageClamp, ExternalInput = x_train, torch.zeros_like(x_train)
+        loss = 0.0
+        for VoltageClamp, ExternalInput, y_train in train_data:
             if torch.cuda.is_available():
                 VoltageClamp, ExternalInput, y_train = VoltageClamp.cuda(), ExternalInput.cuda(), y_train.cuda() 
-            loss = svi.step(VoltageClamp, ExternalInput, y=y_train)
-            print("loss: %.4f" % loss )
+            loss += svi.step(VoltageClamp, ExternalInput, y=y_train)
+        print(f"loss: {loss}")
 
         if epoch % 5 == 0:    
             for X_ in x_test:
                 print(X_.shape)
-                predictive_svi = Predictive(model, guide=Guide, num_samples=500)(X_, None, None)
+                predictive_svi = Predictive(model, guide=Guide, num_samples=1)(X_, None, None)
                 for k, v in predictive_svi.items():
                     print(f"{k}: {tuple(v.shape)}")
                 
