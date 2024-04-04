@@ -158,9 +158,18 @@ class WicksSynapse(PyroModule):
             self.synapseInput = torch.Tensor(numpy.array(synapseInput, dtype=numpy.int64)).to(torch.int64).squeeze()
             self.synapseOutput = torch.Tensor(numpy.array(synapseOutput, dtype=numpy.int64)).to(torch.int64).squeeze()
             self.synapseWeight = torch.Tensor(numpy.array(synapseWeight)).squeeze()
-            self.g_max = PyroSample(dist.Normal(0.6, 1.).expand([self.inputSize]).to_event(1))
-            self.V_rest = PyroSample(dist.Normal(0.015, 0.01).expand([self.inputSize]).to_event(1))
-            self.V_slope = PyroSample(dist.Normal(-0.076, 0.1).expand([self.inputSize]).to_event(1))
+            if g_max is None:
+                self.g_max = PyroSample(dist.Normal(0.6, 1.).expand([self.inputSize]).to_event(1))
+            else: 
+                self.g_max = g_max
+            if V_rest is None:
+                self.V_rest = PyroSample(dist.Normal(0.015, 0.01).expand([self.inputSize]).to_event(1))
+            else:
+                self.V_rest = V_rest
+            if V_slope is None:
+                self.V_slope = PyroSample(dist.Normal(-0.076, 0.1).expand([self.inputSize]).to_event(1))
+            else:
+                self.V_slope = V_slope
             if torch.cuda.is_available():
                 self.synapseInput = self.synapseInput.cuda()
                 self.synapseOutput = self.synapseOutput.cuda()
@@ -211,13 +220,13 @@ class RecurrentSynapse(PyroModule):
 class synapseLayer(PyroModule):
     def __init__(self, synapseList):
         super().__init__()
-        Wicks_SRC, Wicks_DST, Wicks_Weight = synapseList["Wicks"]
-        Gap_Junction_SRC, Gap_Junction_DST, Gap_Junction_Weight = synapseList["General"]
+        self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight = synapseList["Wicks"]
+        self.Gap_Junction_SRC, self.Gap_Junction_DST, self.Gap_Junction_Weight = synapseList["General"]
         Generic_SRC, Generic_DST, Generic_Weight = synapseList["Generic"] 
 
         # self.generic = RecurrentSynapse(Generic_SRC, Generic_DST, Generic_Weight)
-        self.wicks = WicksSynapse(Wicks_SRC, Wicks_DST, Wicks_Weight)    
-        self.general = GeneralSynapse(Gap_Junction_SRC, Gap_Junction_DST, Gap_Junction_Weight)
+        self.wicks = WicksSynapse(self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight)    
+        self.general = GeneralSynapse(self.Gap_Junction_SRC, self.Gap_Junction_DST, self.Gap_Junction_Weight)
     def forward(self, inputSignal):
         output = self.wicks(inputSignal)
         output = output + self.general(inputSignal)
@@ -233,9 +242,7 @@ class NematodeForStep(PyroModule):
     def __init__ (self, neuronSize, NeuronList, synapseList):
         super().__init__()
         self.Neuron = neuronLayer(neuronSize, NeuronList)
-        self.NeuronSize = len(NeuronList)
         self.synapse = synapseLayer(synapseList)
-        self.synapseSize = len(synapseList)
     
     def init(self, state, initial):
         state["z"] = pyro.sample("z_init", dist.Delta(initial, event_dim=1))

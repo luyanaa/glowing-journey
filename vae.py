@@ -10,16 +10,47 @@ import numpy
 from c302 import *
 from tcn import TemporalConvNet
 
-class Encoder(PyroModule):
-    def __init__(self, input_size, hidden_dim, neuron_dim, synapse_dim):
-        super().__init__()
-        self.input_size = input_size
-        # setup the three linear transformations used
-        levels = 4
-        nhid = 150
-        n_channels = [nhid] * levels
+class TCN(PyroModule):
 
-        self.fc1 = nn.Sequential(TemporalConvNet(input_size, num_channels=n_channels), nn.Linear(n_channels[-1], hidden_dim))
+    n_channels = [150] * 4
+    kernel_size = 5
+    dropout = 0.25
+
+    def __init__(self, input_size, output_size, num_channels=None, kernel_size = None, dropout = None):
+        super(TCN, self).__init__()
+        if dropout is not None: 
+            self.dropout = dropout
+        if kernel_size is not None: 
+            self.kernel_size = kernel_size
+        if num_channels is not None: 
+            self.n_channels = num_channels
+        self.tcn = TemporalConvNet(input_size, self.n_channels, self.kernel_size, dropout=self.dropout)
+        self.linear = nn.Linear(num_channels[-1], output_size)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        # x needs to have dimension (N, C, L) in order to be passed into CNN
+        output = self.tcn(x.transpose(1, 2)).transpose(1, 2)
+        output = self.linear(output).double()
+        return self.sig(output)
+
+class Encoder(PyroModule):
+    def __init__(self, neuron_dim, wicks_dim, gap_dim):
+        super().__init__()
+        neuron_dim = 300
+        self.neuron_dim = neuron_dim
+        self.wicks_dim = wicks_dim
+        self.gap_dim = gap_dim
+        # We know from PySINDy that time deviant is important. 
+        self.neuron_loc = TCN(input_size=neuron_dim, output_size=neuron_dim*3)
+        self.neuron_scale = TCN(input_size=neuron_dim, output_size=neuron_dim*3)
+
+        self.wick_loc = TCN(input_size=neuron_dim, output_size=wicks_dim *3)
+        self.wick_scale = TCN(input_size=neuron_dim, output_size=wicks_dim *3)
+
+        self.gap_loc = TCN(input_size=neuron_dim, output_size=gap_dim)
+        self.gap_scale = TCN(input_size=neuron_dim, output_size=gap_dim)
+        
 
         # setup the non-linearities
         self.softplus = nn.Softplus()
@@ -29,34 +60,60 @@ class Encoder(PyroModule):
         # first shape the mini-batch to have pixels in the rightmost dimension
         x = x.reshape(-1, self.input_size)
         # then compute the hidden units
-        hidden = self.softplus(self.fc1(x))
+        neuron_loc = self.neuron_loc(x)
+        neuron_loc = neuron_loc.reshape((3, self.neuron_dim, neuron_loc.shape[1] ))
+        neuron_scale = self.neuron_scale(x)
+        neuron_scale = neuron_scale.reshape((3, self.neuron_dim, neuron_loc.shape[1] ))
+
+        wicks_loc = self.wick_loc(x)
+        wicks_loc = wicks_loc.reshape((3, self.wicks_dim, wicks_loc.shape[1] ))
+
+        wicks_scale = self.wick_scale(x)
+        wicks_scale = wicks_scale.reshape((3, self.wicks_dim, wicks_scale.shape[1] ))
+
+        gap_loc, gap_scale = self.gap_loc(x), self.gap_scale(x)
         # then return a mean vector and a (positive) square root covariance
         # each of size batch_size x z_dim
-        return z_loc, z_scale
+        return neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale
+
+
+def assign(self, neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale):  
+    self.model.model.Neuron.conductance.E = PyroSample(dist.Normal(neuron_loc[0], neuron_scale[0]).to_event(1))
+    self.model.model.Neuron.conductance.G = PyroSample(dist.Normal(neuron_loc[1], neuron_scale[1]).to_event(1))
+    self.model.model.Neuron.conductance.C = PyroSample(dist.Normal(neuron_loc[2], neuron_scale[2]).to_event(1))
+
+    self.model.model.synapse.wicks = WicksSynapse(self.model.model.synapse.Wicks_SRC, self.model.model.synapse.Wicks_DST, self.model.model.synapse.Wicks_Weight, \
+                                                  g_max = PyroSample(dist.Normal(wicks_loc[0], wicks_scale[0])),
+                                                  V_rest= PyroSample(dist.Normal(wicks_loc[1], wicks_scale[1])), 
+                                                V_slope= PyroSample(dist.Normal(wicks_loc[2], wicks_scale[2])))
+    self.model.model.synapse.general = GeneralSynapse(self.model.model.synapse.Gap_Junction_SRC, self.model.model.synapse.Gap_Junction_DST, self.model.model.synapse.Gap_Junction_Weight, \
+                                                      g_syn = PyroSample(dist.Normal(gap_loc, gap_scale)))    
 
 class VAElegans(PyroModule):
-    def __init__(self, model: RecurrentNematode, hidden_dim):
+    def __init__(self, model: RecurrentNematode, neuron_dim, wicks_dim, gap_dim):
+        Encoder.assign = assign
+        self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim)
         self.decoder = model
-        self.encoder = Encoder(hidden_dim, self.decoder.model.NeuronSize, self.decoder.model.synapseSize)
 
         # define a helper function for reconstructing images
     def reconstruct_img(self, x):
         # encode image x
         z_loc, z_scale = self.encoder(x)
         # decode the image (note we don't sample in image space)
-        res = self.decoder()
-        return res
+        self.decoder.assign(z_loc, z_scale )
+        result = self.decoder()
+        return result
     def forward(self, x):
         with pyro.plate("data", x.shape[0]):
             # setup hyperparameters for prior p(z)
             z_loc = x.new_zeros(torch.Size((x.shape[0], self.z_dim)))
             z_scale = x.new_ones(torch.Size((x.shape[0], self.z_dim)))
             # TODO: Assigning z_loc and z_scale
-            self.decoder.assign()
+            self.decoder.assign(z_loc, z_scale)
             result = self.decoder()
 
             # score against actual images
-            pyro.sample("obs", dist.Bernoulli(res).to_event(1), obs=x.reshape(-1, 784))
+            pyro.sample("obs", dist.Bernoulli(result).to_event(1), obs=x.reshape(-1, 784))
 
     # define the guide (i.e. variational distribution) q(z|x)
     def guide(self, x):
