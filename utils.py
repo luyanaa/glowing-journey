@@ -19,6 +19,7 @@ class responseGenerator:
         self.stimList = self._funatlas.get_neuron_ids(stim=True)
         self.dt = timeStep
         self.stim_type= stim_type
+        self.size = 1000
 
     def step(self, stim_neu_id, resp_neu_ids, points):
         # Generate the stimulus array
@@ -32,9 +33,9 @@ class responseGenerator:
         NeuronName=numpy.loadtxt("./pumpprobe/pumpprobe/aconnectome_ids.txt", dtype=object)[:, 1]
 
         def func(i):
-            _stim, _resp, _labels= self.step(self.stimList[i], self.respList, 5000)
-            stim = numpy.zeros((300, 5000))
-            resp = numpy.zeros((300, 5000))
+            _stim, _resp, _labels= self.step(self.stimList[i], self.respList, self.size)
+            stim = numpy.zeros((300, self.size))
+            resp = numpy.zeros((300, self.size))
             stim[numpy.where(NeuronName == i)] = _stim
             for index in range(len(_labels)):
                 resp[numpy.where(NeuronName == _labels[index])] = _resp[index]
@@ -42,11 +43,10 @@ class responseGenerator:
             return (stim, resp)
         result = joblib.Parallel(n_jobs=-1)(joblib.delayed(func)(i) for i in range(len(self.stimList)))
         result = numpy.array(result)
-
         x = torch.Tensor(result[:,0,:,:]).swapaxes(1,2)
         y = torch.Tensor(result[:,1,:,:]).swapaxes(1,2)
-
         return x,y
+
 class PsuedoDataset(Dataset):
     def __init__(self,x1,x2,y) -> None:
         super().__init__()

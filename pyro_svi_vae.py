@@ -48,23 +48,23 @@ if __name__ == "__main__":
     x_train, y_train = responseGenerator(folder="./wormfunconn/atlas/", strain="unc-31").Dataset()
     x_train, x_test, y_train, y_test = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
     train_data = DataLoader(
-        PsuedoDataset(x_train, torch.zeros_like(x_train), y_train),
-        batch_size=args.batch_size,
-        pin_memory=True,
-        shuffle=True,
-        drop_last=True,
-        num_workers = os.cpu_count()-1, 
+       PsuedoDataset(x_train, torch.zeros_like(x_train), y_train),
+       batch_size=args.batch_size,
+       pin_memory=True,
+       shuffle=True,
+       drop_last=True,
+       num_workers = os.cpu_count()-1, 
     )
-    test_data = DataLoader(
-            PsuedoDataset(x_test, torch.zeros_like(x_test), y_test),
-            pin_memory=True,
-            shuffle=True, 
-            num_workers = os.cpu_count()-1, 
-        )
+    #test_data = DataLoader(
+    #        PsuedoDataset(x_test, torch.zeros_like(x_test), y_test),
+    #        pin_memory=True,
+    #        shuffle=True, 
+    #        num_workers = os.cpu_count()-1, 
+    #    )
 
     model = c302.readConnectome("./data/CElegansNeuronTables.xls")
     model = c302.RecurrentNematode(model)
-    model = vae.VAElegans(model, model.model.neuronLayer.neuronSize, len(model.model.synapseLayer.Wicks_SRC), len(model.model.synapseLayer.Gap_Junction_SRC)) 
+    model = vae.VAElegans(model, model.model.Neuron.neuronSize, len(model.model.synapse.Wicks_SRC), len(model.model.synapse.Gap_Junction_SRC)) 
     summary(model)
 
     if torch.cuda.is_available():

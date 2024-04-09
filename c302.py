@@ -7,7 +7,7 @@ from pyro.nn import PyroModule, PyroSample, PyroParam
 from pyro.distributions import Normal
 import numpy
 
-timeStep = 0.01
+timeStep = 0.05
 value_scale = 200
 
 

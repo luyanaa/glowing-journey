@@ -12,8 +12,8 @@ from tcn import TemporalConvNet
 
 class TCN(PyroModule):
 
-    n_channels = [150] * 4
-    kernel_size = 5
+    n_channels = [25] * 4
+    kernel_size = 3
     dropout = 0.25
 
     def __init__(self, input_size, output_size, num_channels=None, kernel_size = None, dropout = None):
@@ -25,7 +25,7 @@ class TCN(PyroModule):
         if num_channels is not None: 
             self.n_channels = num_channels
         self.tcn = TemporalConvNet(input_size, self.n_channels, self.kernel_size, dropout=self.dropout)
-        self.linear = nn.Linear(num_channels[-1], output_size)
+        self.linear = nn.Linear(self.n_channels[-1], output_size)
         self.sig = nn.Sigmoid()
 
     def forward(self, x):
@@ -41,37 +41,29 @@ class Encoder(PyroModule):
         self.neuron_dim = neuron_dim
         self.wicks_dim = wicks_dim
         self.gap_dim = gap_dim
-        # We know from PySINDy that time deviant is important. 
-        self.neuron_loc = TCN(input_size=neuron_dim, output_size=neuron_dim*3)
-        self.neuron_scale = TCN(input_size=neuron_dim, output_size=neuron_dim*3)
-
-        self.wick_loc = TCN(input_size=neuron_dim, output_size=wicks_dim *3)
-        self.wick_scale = TCN(input_size=neuron_dim, output_size=wicks_dim *3)
-
-        self.gap_loc = TCN(input_size=neuron_dim, output_size=gap_dim)
-        self.gap_scale = TCN(input_size=neuron_dim, output_size=gap_dim)
-        
-
-        # setup the non-linearities
-        self.softplus = nn.Softplus()
+        self.neuron = TCN(input_size=neuron_dim, output_size=neuron_dim*6)
+        self.wick = TCN(input_size=neuron_dim, output_size=wicks_dim *6)
+        self.gap = TCN(input_size=neuron_dim, output_size=gap_dim*2)
 
     def forward(self, x):
         # define the forward computation on the image x
         # first shape the mini-batch to have pixels in the rightmost dimension
         x = x.reshape(-1, self.input_size)
         # then compute the hidden units
-        neuron_loc = self.neuron_loc(x)
-        neuron_loc = neuron_loc.reshape((3, self.neuron_dim, neuron_loc.shape[1] ))
-        neuron_scale = self.neuron_scale(x)
-        neuron_scale = neuron_scale.reshape((3, self.neuron_dim, neuron_loc.shape[1] ))
+        neuron = self.neuron(x)
+        neuron = neuron.reshape((6, self.neuron_dim, neuron.shape[1] ))
+        neuron_loc = neuron[0:3]
+        neuron_scale = neuron[3:6]
 
-        wicks_loc = self.wick_loc(x)
-        wicks_loc = wicks_loc.reshape((3, self.wicks_dim, wicks_loc.shape[1] ))
+        wick = self.wick(x)
+        wick = wick.reshape((6, self.wicks_dim, wick.shape[1] ))
+        wicks_loc = wick[0:3]
+        wicks_scale = wick[3:6]
 
-        wicks_scale = self.wick_scale(x)
-        wicks_scale = wicks_scale.reshape((3, self.wicks_dim, wicks_scale.shape[1] ))
+        gap = self.gap(x)
+        gap = gap.reshape((6, self.wicks_dim, wick.shape[1] ))
+        gap_loc, gap_scale = gap[0:3], gap[3:6]
 
-        gap_loc, gap_scale = self.gap_loc(x), self.gap_scale(x)
         # then return a mean vector and a (positive) square root covariance
         # each of size batch_size x z_dim
         return neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale
@@ -91,6 +83,7 @@ def assign(self, neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_
 
 class VAElegans(PyroModule):
     def __init__(self, model: RecurrentNematode, neuron_dim, wicks_dim, gap_dim):
+        super().__init__()
         Encoder.assign = assign
         self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim)
         self.decoder = model
