@@ -30,8 +30,11 @@ class TCN(PyroModule):
 
     def forward(self, x):
         # x needs to have dimension (N, C, L) in order to be passed into CNN
+        print("TCN.x", x.shape)
         output = self.tcn(x.transpose(1, 2)).transpose(1, 2)
+        print("TCN.tcn", output.shape)
         output = self.linear(output).double()
+        print("TCN.linear", output.shape)
         return self.sig(output)
 
 class Encoder(PyroModule):
@@ -54,6 +57,7 @@ class Encoder(PyroModule):
         neuron = neuron.reshape((6, self.neuron_dim, neuron.shape[1] ))
         neuron_loc = neuron[0:3]
         neuron_scale = neuron[3:6]
+        print(neuron_loc.shape, neuron_scale.shape)
 
         wick = self.wick(x)
         wick = wick.reshape((6, self.wicks_dim, wick.shape[1] ))
@@ -61,57 +65,51 @@ class Encoder(PyroModule):
         wicks_scale = wick[3:6]
 
         gap = self.gap(x)
-        gap = gap.reshape((6, self.wicks_dim, wick.shape[1] ))
+        gap = gap.reshape((6, self.gap_dim, wick.shape[1] ))
         gap_loc, gap_scale = gap[0:3], gap[3:6]
-
         # then return a mean vector and a (positive) square root covariance
         # each of size batch_size x z_dim
         return neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale
 
-
-def assign(self, neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale):  
-    self.model.model.Neuron.conductance.E = PyroSample(dist.Normal(neuron_loc[0], neuron_scale[0]).to_event(1))
-    self.model.model.Neuron.conductance.G = PyroSample(dist.Normal(neuron_loc[1], neuron_scale[1]).to_event(1))
-    self.model.model.Neuron.conductance.C = PyroSample(dist.Normal(neuron_loc[2], neuron_scale[2]).to_event(1))
-
-    self.model.model.synapse.wicks = WicksSynapse(self.model.model.synapse.Wicks_SRC, self.model.model.synapse.Wicks_DST, self.model.model.synapse.Wicks_Weight, \
-                                                  g_max = PyroSample(dist.Normal(wicks_loc[0], wicks_scale[0])),
-                                                  V_rest= PyroSample(dist.Normal(wicks_loc[1], wicks_scale[1])), 
-                                                V_slope= PyroSample(dist.Normal(wicks_loc[2], wicks_scale[2])))
-    self.model.model.synapse.general = GeneralSynapse(self.model.model.synapse.Gap_Junction_SRC, self.model.model.synapse.Gap_Junction_DST, self.model.model.synapse.Gap_Junction_Weight, \
-                                                      g_syn = PyroSample(dist.Normal(gap_loc, gap_scale)))    
-
 class VAElegans(PyroModule):
     def __init__(self, model: RecurrentNematode, neuron_dim, wicks_dim, gap_dim):
         super().__init__()
-        Encoder.assign = assign
         self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim)
         self.decoder = model
 
         # define a helper function for reconstructing images
     def reconstruct_img(self, x):
         # encode image x
-        z_loc, z_scale = self.encoder(x)
+        neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale = self.encoder(x)
+        print("neuron_loc", neuron_loc.shape)
         # decode the image (note we don't sample in image space)
-        self.decoder.assign(z_loc, z_scale )
+        self.decoder.assign(neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale )
         result = self.decoder()
         return result
     def forward(self, x):
-        with pyro.plate("data", x.shape[0]):
             # setup hyperparameters for prior p(z)
-            z_loc = x.new_zeros(torch.Size((x.shape[0], self.z_dim)))
-            z_scale = x.new_ones(torch.Size((x.shape[0], self.z_dim)))
+            neuron_loc = torch.zeros(( 3, self.encoder.neuron_dim))
+            neuron_scale = torch.ones((  3, self.encoder.neuron_dim))
+            wicks_loc = torch.zeros((  3, self.encoder.wicks_dim))
+            wicks_scale = torch.ones((  3, self.encoder.wicks_dim))
+            gap_loc = torch.zeros((  self.encoder.gap_dim))
+            gap_scale =  torch.ones((  self.encoder.gap_dim))
             # TODO: Assigning z_loc and z_scale
-            self.decoder.assign(z_loc, z_scale)
-            result = self.decoder()
+            self.decoder.assign(neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale )
+            result = self.decoder( y=x)
 
             # score against actual images
-            pyro.sample("obs", dist.Bernoulli(result).to_event(1), obs=x.reshape(-1, 784))
+            # pyro.sample("obs", dist.Bernoulli(result).to_event(1), obs=x)
 
     # define the guide (i.e. variational distribution) q(z|x)
     def guide(self, x):
         with pyro.plate("data", x.shape[0]):
             # use the encoder to get the parameters used to define q(z|x)
-            z_loc, z_scale = self.encoder(x)
+            neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale = self.encoder(x)
             # sample the latent code z
-            pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
+            pyro.sample("neuron_latent", dist.Normal(neuron_loc, neuron_scale).to_event(1))
+            pyro.sample("gap_latent", dist.Normal(gap_loc, gap_scale).to_event(1))
+            pyro.sample("wick_latent_0", dist.Normal(wicks_loc[0], wicks_scale[0]).to_event(1))
+            pyro.sample("wick_latent_1", dist.Normal(wicks_loc[1], wicks_scale[1]).to_event(1))
+            pyro.sample("wick_latent_0", dist.Normal(wicks_loc[2], wicks_scale[2]).to_event(1))
+

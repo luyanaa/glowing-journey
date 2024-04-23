@@ -119,12 +119,15 @@ class neuronLayer(PyroModule):
 # Serotonin: https://cell.com/cell/pdf/S0092-8674(23)00419-1.pdf , looks like a current input
 # Dealt as a basic conductance model
 class GeneralSynapse(PyroModule):
-    def __init__(self, synapseInput, synapseOutput, synapseWeight):
+    def __init__(self, synapseInput, synapseOutput, synapseWeight, g_syn=None):
         super().__init__()
         self.synapseInput = torch.Tensor(numpy.array(synapseInput, dtype=numpy.int64)).to(torch.int64).squeeze()
         self.synapseOutput = torch.Tensor(numpy.array(synapseOutput, dtype=numpy.int64)).to(torch.int64).squeeze()
         self.synapseWeight = torch.Tensor(numpy.array(synapseWeight)).squeeze()
-        self.g_syn = PyroSample(dist.Normal(0., 1.).expand([len(synapseInput)]).to_event(1))
+        if g_syn is None:
+            self.g_syn = PyroSample(dist.Normal(0., 1.).expand([len(synapseInput)]).to_event(1))
+        else:
+            self.g_syn = g_syn
         if torch.cuda.is_available():
             self.synapseInput = self.synapseInput.cuda()
             self.synapseOutput = self.synapseOutput.cuda()
@@ -151,32 +154,31 @@ class GeneralSynapse(PyroModule):
 class WicksSynapse(PyroModule):
     def __init__(self, synapseInput, synapseOutput, synapseWeight, g_max=None, V_rest=None, V_slope=None):
         super().__init__()
-        if V_rest is None or V_slope is None:
             # Assign
             # In the following, we set Vslope = 15 mV, gsyn = 0.6 nS and Vrest = −76 mV (Wicks et al., 1996).
-            self.inputSize = len(synapseInput)
-            self.synapseInput = torch.Tensor(numpy.array(synapseInput, dtype=numpy.int64)).to(torch.int64).squeeze()
-            self.synapseOutput = torch.Tensor(numpy.array(synapseOutput, dtype=numpy.int64)).to(torch.int64).squeeze()
-            self.synapseWeight = torch.Tensor(numpy.array(synapseWeight)).squeeze()
-            if g_max is None:
-                self.g_max = PyroSample(dist.Normal(0.6, 1.).expand([self.inputSize]).to_event(1))
-            else: 
-                self.g_max = g_max
-            if V_rest is None:
-                self.V_rest = PyroSample(dist.Normal(0.015, 0.01).expand([self.inputSize]).to_event(1))
-            else:
-                self.V_rest = V_rest
-            if V_slope is None:
-                self.V_slope = PyroSample(dist.Normal(-0.076, 0.1).expand([self.inputSize]).to_event(1))
-            else:
-                self.V_slope = V_slope
-            if torch.cuda.is_available():
-                self.synapseInput = self.synapseInput.cuda()
-                self.synapseOutput = self.synapseOutput.cuda()
-                self.synapseWeight = self.synapseWeight.cuda()
-                self.g_max = self.g_max.cuda()
-                self.V_rest = self.V_rest.cuda()
-                self.V_slope = self.V_slope.cuda()
+        self.inputSize = len(synapseInput)
+        self.synapseInput = torch.Tensor(numpy.array(synapseInput, dtype=numpy.int64)).to(torch.int64).squeeze()
+        self.synapseOutput = torch.Tensor(numpy.array(synapseOutput, dtype=numpy.int64)).to(torch.int64).squeeze()
+        self.synapseWeight = torch.Tensor(numpy.array(synapseWeight)).squeeze()
+        if g_max is None:
+            self.g_max = PyroSample(dist.Normal(0.6, 1.).expand([self.inputSize]).to_event(1))
+        else: 
+            self.g_max = g_max
+        if V_rest is None:
+            self.V_rest = PyroSample(dist.Normal(0.015, 0.01).expand([self.inputSize]).to_event(1))
+        else:
+            self.V_rest = V_rest
+        if V_slope is None:
+            self.V_slope = PyroSample(dist.Normal(-0.076, 0.1).expand([self.inputSize]).to_event(1))
+        else:
+            self.V_slope = V_slope
+        if torch.cuda.is_available():
+            self.synapseInput = self.synapseInput.cuda()
+            self.synapseOutput = self.synapseOutput.cuda()
+            self.synapseWeight = self.synapseWeight.cuda()
+            self.g_max = self.g_max.cuda()
+            self.V_rest = self.V_rest.cuda()
+            self.V_slope = self.V_slope.cuda()
     def forward(self, inputSignal):
         output = torch.zeros_like(inputSignal)
         if inputSignal.dim() == 1: # Unbatched
@@ -217,6 +219,10 @@ class RecurrentSynapse(PyroModule):
                 output[:, self.synapseOutput[i]] += self.RNN[i]((inputSignal[:, self.synapseInput[i]], inputSignal[:, self.synapseOutput[i]])) * self.synapseWeight[i]
         return output
 
+# https://journals.physiology.org/doi/full/10.1152/jn.01176.2003
+# SNR about 1000-10000 in crab in 5-7mm, C. elegans in less than 1mm. 
+# Assuming Distance * SNR = Constant, 5000-50000, selecting 27500. 
+# SNR = mu^2 / sigma^2 , let mu = 1, approximately sigma = 0.006
 class synapseLayer(PyroModule):
     def __init__(self, synapseList):
         super().__init__()
@@ -233,34 +239,19 @@ class synapseLayer(PyroModule):
         # output = output + self.generic(inputSignal)
         return output
 
-# https://journals.physiology.org/doi/full/10.1152/jn.01176.2003
-# SNR about 1000-10000 in crab in 5-7mm, C. elegans in less than 1mm. 
-# Assuming Distance * SNR = Constant, 5000-50000, selecting 27500. 
-# SNR = mu^2 / sigma^2 , let mu = 1, approximately sigma = 0.006
-
+# Making the single-step model as Deep-Markov as possible. 
+from math import sqrt
 class NematodeForStep(PyroModule):
     def __init__ (self, neuronSize, NeuronList, synapseList):
         super().__init__()
         self.Neuron = neuronLayer(neuronSize, NeuronList)
         self.synapse = synapseLayer(synapseList)
-    
-    def init(self, state, initial):
-        state["z"] = pyro.sample("z_init", dist.Delta(initial, event_dim=1))
-
-    def forward(self, time, Prev, ExternalInput=None, VoltageClamp=None, y=None, mask=None): 
+    def forward(self, Prev, ExternalInput=None, VoltageClamp=None): 
         CurrentInput = self.synapse(Prev)
         if ExternalInput is None:
             ExternalInput = torch.zeros_like(Prev)
         ConnectomeOutput = self.Neuron(Prev, CurrentInput, ExternalInput)
         ConnectomeOutput[VoltageClamp != 0.0] = VoltageClamp[VoltageClamp != 0.0]
-        # Add noise to single inference.  
-        self.t = time
-        sigma = pyro.sample("sigma_%d" % self.t, dist.Uniform(70.71, 223.61))
-        if mask is None:  
-            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2))  
-        if mask is not None:
-            ConnectomeOutput = pyro.sample("z_%d" % self.t, dist.Normal(ConnectomeOutput,  1 / (sigma * sigma)).to_event(2))
-            obs = pyro.sample("obs_%d" % self.t, ConnectomeOutput[mask], obs=y)
         return ConnectomeOutput
 
 class RecurrentNematode(PyroModule):
@@ -270,16 +261,23 @@ class RecurrentNematode(PyroModule):
         self.scale = scale
         global timeStep
         timeStep = timeStep / scale
+        self.sigma = pyro.sample("sigma" , dist.Uniform(70.71, 223.61).expand([300]).to_event(1))
 
-    def forward(self, VoltageClamp, ExternalInput, y=None):
+
+    def forward(self, VoltageClamp=None, ExternalInput=None, mask=None, y=None):
         scale = self.scale
         if VoltageClamp is None and ExternalInput is not None: 
             VoltageClamp = torch.zeros_like(ExternalInput)
         elif ExternalInput is None and VoltageClamp is not None:
             ExternalInput = torch.zeros_like(VoltageClamp)
-        else: 
-            Exception("Input dimension cannot be infered from two NoneType. ")
-        if VoltageClamp.ndim != ExternalInput.ndim :
+        elif VoltageClamp is None and ExternalInput is None and y is not None: 
+            if y.dim == 2:
+                VoltageClamp = torch.zeros((y.shape[0], 300))
+                ExternalInput = VoltageClamp
+            else: 
+                VoltageClamp = torch.zeros((y.shape[0], y.shape[1], 300))
+                ExternalInput = VoltageClamp
+        if VoltageClamp is not None and ExternalInput is not None and VoltageClamp.ndim != ExternalInput.ndim :
             Exception("Shape Unmatched")
 
         # Doing interpolation in scale. 
@@ -290,18 +288,31 @@ class RecurrentNematode(PyroModule):
         if torch.cuda.is_available():
             ConnectomeOutput = ConnectomeOutput.cuda()
         if ExternalInput.ndim == 2:
-            for i in range(VoltageClamp.size()[0] *scale ): # Iterate in Time 
-                if y is None or i % 10 == 0: # In inference mode or with interpolation
-                    ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[(i // scale)], VoltageClamp[(i // scale)])
-                else: 
-                    ConnectomeOutput[i] = self.model(i, ConnectomeOutput[i-1], ExternalInput[(i // scale)], VoltageClamp[(i // scale)], y[i // scale])
+            for time in range(VoltageClamp.size()[0] *scale ): # Iterate in Time 
+                if y is None or time % scale != 0: # In inference mode or with interpolation
+                    ConnectomeOutput[time] = self.model(ConnectomeOutput[time-1], ExternalInput[(time // scale)], VoltageClamp[(time // scale)])
+                    ConnectomeOutput[time] = pyro.sample("z_%d" % time, dist.Normal(ConnectomeOutput[time],  1 / (self.sigma * self.sigma)).to_event(1), obs= y[time // scale], obs_mask=mask)  
+
         else :
             for time in range(VoltageClamp.size()[1] * scale) :
-                if y is None:  
-                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])       
+                if y is None or time % scale != 0: # In inference mode or with interpolation
+                    ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])       
                 else : 
-                    ConnectomeOutput[:, time, :] = self.model(time, ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :], y[:, time // scale, :])       
+                    ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])     
+                    ConnectomeOutput[:, time, :] = pyro.sample("z_%d" % time,dist.Normal(ConnectomeOutput[:, time-1, :],  1 / (self.sigma * self.sigma)).to_event(2), obs= y[:, time // scale, :], obs_mask=mask)  
         return ConnectomeOutput
+        
+    def assign(self, neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale):  
+        self.model.Neuron.conductance.E = PyroSample(dist.Normal(neuron_loc[0], neuron_scale[0]).to_event(1))
+        self.model.Neuron.conductance.G = PyroSample(dist.Normal(neuron_loc[1], neuron_scale[1]).to_event(1))
+        self.model.Neuron.conductance.C = PyroSample(dist.Normal(neuron_loc[2], neuron_scale[2]).to_event(1))
+
+        self.model.synapse.wicks = WicksSynapse(self.model.synapse.Wicks_SRC, self.model.synapse.Wicks_DST, self.model.synapse.Wicks_Weight, \
+                                                    g_max = PyroSample(dist.Normal(wicks_loc[0], wicks_scale[0]).to_event(1)),
+                                                    V_rest= PyroSample(dist.Normal(wicks_loc[1], wicks_scale[1]).to_event(1)), 
+                                                    V_slope= PyroSample(dist.Normal(wicks_loc[2], wicks_scale[2]).to_event(1)))
+        self.model.synapse.general = GeneralSynapse(self.model.synapse.Gap_Junction_SRC, self.model.synapse.Gap_Junction_DST, self.model.synapse.Gap_Junction_Weight, \
+                                                        g_syn = PyroSample(dist.Normal(gap_loc, gap_scale).to_event(1)))    
 
 SensoryList = {"ASHL": ASH, "ASHR": ASH}
 
