@@ -291,6 +291,8 @@ class RecurrentNematode(PyroModule):
             for time in range(VoltageClamp.size()[0] *scale ): # Iterate in Time 
                 if y is None or time % scale != 0: # In inference mode or with interpolation
                     ConnectomeOutput[time] = self.model(ConnectomeOutput[time-1], ExternalInput[(time // scale)], VoltageClamp[(time // scale)])
+                else: 
+                    ConnectomeOutput[time] = self.model(ConnectomeOutput[time-1], ExternalInput[(time // scale)], VoltageClamp[(time // scale)])
                     ConnectomeOutput[time] = pyro.sample("z_%d" % time, dist.Normal(ConnectomeOutput[time],  1 / (self.sigma * self.sigma)).to_event(1), obs= y[time // scale], obs_mask=mask)  
 
         else :
