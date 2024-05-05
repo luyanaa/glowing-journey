@@ -39,24 +39,19 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
     args = parser.parse_args()
 
-    # local_rank = int(os.environ["LOCAL_RANK"])
-    # global_rank = int(os.environ["RANK"])
-    
-    # init_process_group(backend="gloo")
-
     x_train, y_train = responseGenerator(folder="./wormfunconn/atlas/", strain="unc-31").Dataset()
     x_train, x_test, y_train, y_test = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
     train_data = DataLoader(
         PsuedoDataset(x_train, torch.zeros_like(x_train), y_train),
         batch_size=args.batch_size,
-        pin_memory=True,
+        pin_memory=not torch.cuda.is_available(),
         shuffle=True,
         drop_last=True,
         num_workers = os.cpu_count()-1, 
     )
     test_data = DataLoader(
             PsuedoDataset(x_test, torch.zeros_like(x_test), y_test),
-            pin_memory=True,
+            pin_memory=not torch.cuda.is_available(),
             shuffle=True, 
             num_workers = os.cpu_count()-1, 
         )
