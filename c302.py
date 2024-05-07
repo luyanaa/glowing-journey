@@ -251,7 +251,20 @@ class NematodeForStep(PyroModule):
         if ExternalInput is None:
             ExternalInput = torch.zeros_like(Prev)
         ConnectomeOutput = self.Neuron(Prev, CurrentInput, ExternalInput)
-        ConnectomeOutput[VoltageClamp != 0.0] = VoltageClamp[VoltageClamp != 0.0]
+        if VoltageClamp is not None: 
+            ConnectomeOutput[VoltageClamp != 0.0] = VoltageClamp[VoltageClamp != 0.0]
+        return ConnectomeOutput
+
+class RNNematode(PyroModule):
+    def __init__ (self, neuronSize, NeuronList, synapseList):
+        super().__init__()
+        self.Neuron = PyroModule[nn.GRU](input_size=neuronSize, bidirectional=False, hidden_size=neuronSize)
+        self.synapse = PyroModule[nn.GRU](input_size=neuronSize, bidirectional=False, hidden_size=neuronSize)
+    def forward(self, Prev, ExternalInput=None, VoltageClamp=None): 
+        CurrentInput, _ = self.synapse(Prev)
+        ConnectomeOutput, _ = self.Neuron(CurrentInput)
+        if VoltageClamp is not None: 
+            ConnectomeOutput[VoltageClamp != 0.0] = VoltageClamp[VoltageClamp != 0.0]
         return ConnectomeOutput
 
 class RecurrentNematode(PyroModule):
@@ -291,6 +304,9 @@ class RecurrentNematode(PyroModule):
             for time in range(VoltageClamp.size()[0] *scale ): # Iterate in Time 
                 if y is None or time % scale != 0: # In inference mode or with interpolation
                     ConnectomeOutput[time] = self.model(ConnectomeOutput[time-1], ExternalInput[(time // scale)], VoltageClamp[(time // scale)])
+                elif y is not None and time % scale == 1:
+                    # train mode, force teacher.
+                    ConnectomeOutput[time] = self.model(y[time // scale], ExternalInput[(time // scale)], VoltageClamp[(time // scale)])
                 else: 
                     ConnectomeOutput[time] = self.model(ConnectomeOutput[time-1], ExternalInput[(time // scale)], VoltageClamp[(time // scale)])
                     ConnectomeOutput[time] = pyro.sample("z_%d" % time, dist.Normal(ConnectomeOutput[time],  1 / (self.sigma * self.sigma)).to_event(1), obs= y[time // scale], obs_mask=mask)  
@@ -298,7 +314,10 @@ class RecurrentNematode(PyroModule):
         else :
             for time in range(VoltageClamp.size()[1] * scale) :
                 if y is None or time % scale != 0: # In inference mode or with interpolation
-                    ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])       
+                    ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])
+                elif y is not None and time % scale == 1:
+                    # train mode, force teacher. 
+                    ConnectomeOutput[:, time, :] = self.model(y[:, time // scale, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])     
                 else : 
                     ConnectomeOutput[:, time, :] = self.model(ConnectomeOutput[:, time-1, :], ExternalInput[:, time // scale, :], VoltageClamp[:, time // scale, :])     
                     ConnectomeOutput[:, time, :] = pyro.sample("z_%d" % time,dist.Normal(ConnectomeOutput[:, time-1, :],  1 / (self.sigma * self.sigma)).to_event(2), obs= y[:, time // scale, :], obs_mask=mask)  
@@ -318,7 +337,7 @@ class RecurrentNematode(PyroModule):
 
 SensoryList = {"ASHL": ASH, "ASHR": ASH}
 
-def readConnectome(path):
+def readConnectome(path, rnn=False):
     Sensory = pandas.read_excel(path, sheet_name="Sensory")
     # Using Cook et al. (2019)
     Connectome = pandas.read_csv("./data/herm_full_edgelist.csv")
@@ -403,5 +422,8 @@ def readConnectome(path):
     synapseList["General"] = (Gap_Junction_SRC, Gap_Junction_DST, Gap_Junction_Weight)
     synapseList["Wicks"] = (Wicks_SRC, Wicks_DST, Wicks_Weight)
     synapseList["Generic"] = (Generic_SRC, Generic_DST, Generic_Weight)
-    model = NematodeForStep(NeuronName.size, NeuronList, synapseList)
+    if rnn is True:
+        model = RNNematode(NeuronName.size, NeuronList, synapseList)
+    else: 
+        model = NematodeForStep(NeuronName.size, NeuronList, synapseList)
     return model

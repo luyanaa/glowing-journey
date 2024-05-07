@@ -74,12 +74,3 @@ if __name__ == "__main__":
                 VoltageClamp, ExternalInput, y_train = VoltageClamp.cuda(), ExternalInput.cuda(), y_train.cuda() 
             loss += svi.step(VoltageClamp, ExternalInput, y=y_train)
         print(f"loss: {loss}")
-
-        if epoch % 5 == 0:    
-            for X_ in x_test:
-                print(X_.shape)
-                predictive_svi = Predictive(model, guide=Guide, num_samples=1)(X_, None, None)
-                for k, v in predictive_svi.items():
-                    print(f"{k}: {tuple(v.shape)}")
-                
-
