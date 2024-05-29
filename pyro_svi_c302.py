@@ -64,7 +64,7 @@ if __name__ == "__main__":
         torch.set_default_tensor_type("torch.cuda.DoubleTensor")
         model = model.to("cuda")
     Guide = AutoDiagonalNormal(model)
-    optim = pyro.optim.AdagradRMSProp({})
+    optim = pyro.optim.ClippedAdam({})
     svi = SVI(model, Guide, optim, Trace_ELBO())
     for epoch in range(0, args.total_epochs):
         print(f"Epoch {epoch} | Batchsize: {args.batch_size} | Steps: {len(train_data)}")
