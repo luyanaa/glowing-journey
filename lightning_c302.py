@@ -1,45 +1,35 @@
-import torch
-from torch.utils.data import DataLoader, random_split
-import torch.nn.functional as F
+import argparse
+import os
+
+import pyro
+from pyro.infer import Trace_ELBO
+from pyro.infer.autoguide import AutoDiagonalNormal
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateFinder
-from pytorch_lightning.tuner import Tuner
-
-import os
-import time
-import pyro, pyro.optim
-from pyro.infer import MCMC, NUTS, SVI, Trace_ELBO, Predictive, SMCFilter
-from pyro.infer.autoguide import AutoDiagonalNormal
-from pyro.distributions import Empirical
-import pyro.distributions as dist
-
-from torch.nn.parallel import DistributedDataParallel as DDP
-
+from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import DataLoader, Subset
 from torchinfo import summary
 
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
-
-from utils import AtlasLoader, responseGenerator, PsuedoDataset
 import c302
+from pyro_svi_c302 import DEFAULT_DATA_PATH, _TupleDataset
 from soft_dtw_cuda import SoftDTW
+from utils import AtlasLoader, responseGenerator
 
-# Stochastic Variational Inference, Monte Carlo Markov Chain and Sequential Monte Carlo Filter.
-epochs_run = 0
 
 def _save_snapshot(snapshot_path, model, epoch):
+    target = model.module if hasattr(model, "module") else model
     snapshot = {
-            "MODEL_STATE": model.module.state_dict(),
-            "EPOCHS_RUN": epoch,
-        }
+        "MODEL_STATE": target.state_dict(),
+        "EPOCHS_RUN": epoch,
+    }
     torch.save(snapshot, snapshot_path)
-    print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")   
+    print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")
 
 
-# We define an ELBO loss, a PyTorch optimizer, and a training step in our PyroLightningModule.
-# Note that we are using a PyTorch optimizer instead of a Pyro optimizer and
-# we are using ``training_step`` instead of Pyro's SVI machinery.
 class PyroLightningModule(pl.LightningModule):
+    """PyTorch Lightning wrapper driving Pyro ELBO optimization on GCaMP trials."""
+
     def __init__(self, loss_fn: pyro.infer.elbo.ELBOModule, lr: float):
         super().__init__()
         self.loss_fn = loss_fn
@@ -47,44 +37,37 @@ class PyroLightningModule(pl.LightningModule):
         self.guide = loss_fn.guide
         self.lr = lr
         self.predictive = pyro.infer.Predictive(
-            self.model, guide=self.guide, num_samples=1
+            self.model, guide=self.guide, num_samples=1, return_sites=("_RETURN",)
         )
-        self.acc = SoftDTW(False)
+        self.acc = SoftDTW(torch.cuda.is_available())
 
-    def forward(self, *args):
-        return self.predictive(*args)
+    def forward(self, stim, noise_scale=None):
+        return self.predictive(ExternalInput=stim, mask=None, y=None, noise_scale=noise_scale)["_RETURN"].squeeze(0)
+
+    def _shared_step(self, batch, stage: str):
+        stim, y, mask, noise = batch
+        loss = self.loss_fn(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+        with torch.no_grad():
+            y_hat = self.model(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
+            masked_hat = y_hat * mask.float()
+            masked_y = y * mask.float()
+            acc = self.acc(masked_hat, masked_y).mean()
+        self.log(f"{stage}_loss", loss, prog_bar=True)
+        self.log(f"{stage}_dtw", acc, prog_bar=False)
+        return loss
 
     def training_step(self, batch, batch_idx):
-        """Training step for Pyro training."""
-        loss = self.loss_fn(*batch)
-        external_train, voltage_clamp, y = batch
-        y_hat = self.model(external_train, voltage_clamp)
-        acc = self.acc(y_hat, y)
-        metrics = {"train_acc": acc, "train_loss": loss}
-        self.log_dict(metrics)
-        return metrics
-    
+        return self._shared_step(batch, "train")
+
     def validation_step(self, batch, batch_idx):
-        loss = self.loss_fn(*batch)
-        x, y = batch
-        y_hat = self.model(x)
-        acc = self.acc(y_hat, y)
-        metrics = {"val_acc": acc, "val_loss": loss}
-        self.log_dict(metrics)
-        return metrics
+        return self._shared_step(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        loss = self.loss_fn(*batch)
-        x, y = batch
-        y_hat = self.model(x)
-        acc = self.acc(y_hat, y)
-        metrics = {"test_acc": acc, "test_loss": loss}
-        self.log_dict(metrics)
-        return metrics
+        return self._shared_step(batch, "test")
 
     def configure_optimizers(self):
-        """Configure an optimizer."""
         return torch.optim.Adam(self.loss_fn.parameters(), lr=self.lr)
+
 
 class FineTuneLearningRateFinder(LearningRateFinder):
     def __init__(self, milestones, *args, **kwargs):
@@ -98,61 +81,82 @@ class FineTuneLearningRateFinder(LearningRateFinder):
         if trainer.current_epoch in self.milestones or trainer.current_epoch == 0:
             self.lr_find(trainer, pl_module)
 
+
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description='simple distributed training job')
-    parser.add_argument('total_epochs', type=int, help='Total epochs to train the model')
-    parser.add_argument('save_every', type=int, help='How often to save a snapshot')
-    parser.add_argument('--batch_size', default=16, type=int, help='Input batch size on each device (default: 32)')
-    parser.add_argument("--size", default=1000000, type=int)
-    parser.add_argument("--learning_rate", default=0.01, type=float)
-    parser.add_argument("--seed", default=20200723, type=int)
-    # pl.Trainer arguments.
+    parser = argparse.ArgumentParser(description="Lightning Pyro training job")
+    parser.add_argument("total_epochs", nargs="?", type=int, default=10)
+    parser.add_argument("save_every", nargs="?", type=int, default=5)
+    parser.add_argument("--batch_size", "--batch-size", default=16, type=int)
+    parser.add_argument("--source", choices=["randi", "synthetic"], default="randi")
+    parser.add_argument("--data-path", default=DEFAULT_DATA_PATH, type=str)
+    parser.add_argument("--strain", default="wild-type", type=str)
+    parser.add_argument("--norm-mode", choices=["dff_safe", "dff_strict", "robust_z"], default="dff_safe")
+    parser.add_argument("--max-recordings", default=None, type=int)
+    parser.add_argument("--learning_rate", default=5e-3, type=float)
+    parser.add_argument("--substeps", default=4, type=int)
+    parser.add_argument("--dt-obs", default=0.5, type=float)
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--strategy", default="auto")
     parser.add_argument("--devices", default="auto")
     args = parser.parse_args()
 
-    # local_rank = int(os.environ["LOCAL_RANK"])
-    # global_rank = int(os.environ["RANK"])
-    
-    # init_process_group(backend="gloo")
+    pl.seed_everything(args.seed)
+    pyro.clear_param_store()
 
-    x_train, y_train = responseGenerator(folder="./wormfunconn/atlas/", strain="unc-31").Dataset()
-    x_train, x_test, y_train, y_test = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
+    if args.source == "randi":
+        dataset = AtlasLoader(
+            path=args.data_path,
+            strain=args.strain,
+            norm_mode=args.norm_mode,
+            max_recordings=args.max_recordings,
+        ).build_trial_dataset()
+        idx = list(range(len(dataset)))
+        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=args.seed)
+        train_ds = Subset(dataset, train_idx)
+        test_ds = Subset(dataset, test_idx)
+    else:
+        x_all, y_all, m_all = responseGenerator(
+            folder="./wormfunconn/atlas/", strain=args.strain, size=100, dt=args.dt_obs
+        ).Dataset(return_mask=True)
+        noise_all = torch.full((x_all.shape[0], x_all.shape[2]), 0.05, dtype=torch.float32)
+        idx = list(range(len(x_all)))
+        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=args.seed)
+        train_ds = _TupleDataset(x_all[train_idx], y_all[train_idx], m_all[train_idx], noise_all[train_idx])
+        test_ds = _TupleDataset(x_all[test_idx], y_all[test_idx], m_all[test_idx], noise_all[test_idx])
+
+    pin = torch.cuda.is_available()
     train_data = DataLoader(
-        PsuedoDataset(x_train, torch.zeros_like(x_train), y_train),
-        batch_size=args.batch_size,
-        pin_memory=True,
-        shuffle=True, 
-        num_workers = os.cpu_count()-1, 
-        drop_last=True
+        train_ds,
+        batch_size=min(args.batch_size, len(train_ds)),
+        pin_memory=pin,
+        shuffle=True,
+        drop_last=len(train_ds) >= args.batch_size,
     )
-
     test_data = DataLoader(
-        PsuedoDataset(x_test, torch.zeros_like(x_test), y_test),
-        pin_memory=True,
-        shuffle=True, 
-        num_workers = os.cpu_count()-1, 
-        drop_last=True
+        test_ds,
+        batch_size=min(args.batch_size, len(test_ds)),
+        pin_memory=pin,
+        shuffle=False,
     )
 
-    model = c302.readConnectome("./data/CElegansNeuronTables.xls")
-    model = c302.RecurrentNematode(model)
+    step_model = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    model = c302.RecurrentNematode(step_model, dt_obs=args.dt_obs, substeps=args.substeps)
     summary(model)
-    Guide = AutoDiagonalNormal(model)
-    loss_fn = Trace_ELBO()(model, Guide)
+    guide = AutoDiagonalNormal(model, init_scale=0.02)
+    loss_fn = Trace_ELBO()(model, guide)
     training_plan = PyroLightningModule(loss_fn, args.learning_rate)
-    mini_batch = PsuedoDataset(x_train, torch.zeros_like(x_train), y_train)[: args.batch_size]
-    loss_fn(*mini_batch)
-    # Run stochastic variational inference using PyTorch Lightning Trainer.
+
+    # Materialize Pyro guide parameters before Trainer starts
+    stim_b, y_b, mask_b, noise_b = next(iter(train_data))
+    loss_fn(ExternalInput=stim_b, mask=mask_b, y=y_b, noise_scale=noise_b)
+
     trainer = pl.Trainer(
         accelerator=args.accelerator,
         strategy=args.strategy,
         devices=args.devices,
         max_epochs=args.total_epochs,
-        log_every_n_steps = args.save_every, 
-        callbacks=[FineTuneLearningRateFinder(milestones=(5, 10))]
+        log_every_n_steps=max(1, args.save_every),
     )
-    trainer.fit(training_plan, train_data)
-    trainer.test(training_plan)
+    trainer.fit(training_plan, train_dataloaders=train_data, val_dataloaders=test_data)
+    trainer.test(training_plan, dataloaders=test_data)

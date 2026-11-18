@@ -2,15 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-An implementation of a Deep Markov Model in Pyro based on reference [1].
-This is essentially the DKS variant outlined in the paper. The primary difference
-between this implementation and theirs is that in our version any KL divergence terms
-in the ELBO are estimated via sampling, while they make use of the analytic formulae.
-We also illustrate the use of normalizing flows in the variational distribution (in which
-case analytic formulae for the KL divergences are in any case unavailable).
+Deep Markov Model in Pyro adapted for continuous, stimulus-driven, sparsely
+observed C. elegans GCaMP neural fluorescence time series.
 
 Reference:
-
 [1] Structured Inference Networks for Nonlinear State Space Models [arXiv:1609.09869]
     Rahul G. Krishnan, Uri Shalit, David Sontag
 """
@@ -19,161 +14,132 @@ import argparse
 import logging
 import time
 from os.path import exists
+from typing import Optional, Tuple
 
 import numpy as np
-import torch
-import torch.nn as nn
-
 import pyro
-import pyro.contrib.examples.polyphonic_data_loader as poly
 import pyro.distributions as dist
 import pyro.poutine as poutine
 from pyro.distributions import TransformedDistribution
 from pyro.distributions.transforms import affine_autoregressive
-from pyro.infer import (
-    SVI,
-    JitTrace_ELBO,
-    Trace_ELBO,
-    TraceEnum_ELBO,
-    TraceTMC_ELBO,
-    config_enumerate,
-)
+from pyro.infer import SVI, JitTrace_ELBO, Trace_ELBO
 from pyro.optim import ClippedAdam
-from utils import AtlasLoader, responseGenerator, PsuedoDataset
 from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+
+from pyro_svi_c302 import DEFAULT_DATA_PATH
+from utils import AtlasLoader, RandiTrialDataset, responseGenerator
+
+
+def reverse_sequences_pad(sequences: torch.Tensor, seq_lengths: torch.Tensor) -> torch.Tensor:
+    """Reverse each sequence along time up to its valid length (batch_first=True)."""
+    out = torch.zeros_like(sequences)
+    for i, length in enumerate(seq_lengths.tolist()):
+        l = int(length)
+        if l > 0:
+            out[i, :l] = torch.flip(sequences[i, :l], dims=[0])
+    return out
 
 
 class Emitter(nn.Module):
-    """
-    Parameterizes the bernoulli observation likelihood `p(x_t | z_t)`
-    """
+    """Parameterizes continuous Gaussian observation likelihood p(x_t | z_t)."""
 
-    def __init__(self, input_dim, z_dim, emission_dim):
+    def __init__(self, input_dim: int, z_dim: int, emission_dim: int):
         super().__init__()
-        # initialize the three linear transformations used in the neural network
         self.lin_z_to_hidden = nn.Linear(z_dim, emission_dim)
         self.lin_hidden_to_hidden = nn.Linear(emission_dim, emission_dim)
-        self.lin_hidden_to_input = nn.Linear(emission_dim, input_dim)
-        # initialize the two non-linearities used in the neural network
-        self.relu = nn.ReLU()
-
-    def forward(self, z_t):
-        """
-        Given the latent z at a particular time step t we return the vector of
-        probabilities `ps` that parameterizes the bernoulli distribution `p(x_t|z_t)`
-        """
-        h1 = self.relu(self.lin_z_to_hidden(z_t))
-        h2 = self.relu(self.lin_hidden_to_hidden(h1))
-        ps = torch.sigmoid(self.lin_hidden_to_input(h2))
-        return ps
-
-
-class GatedTransition(nn.Module):
-    """
-    Parameterizes the gaussian latent transition probability `p(z_t | z_{t-1})`
-    See section 5 in the reference for comparison.
-    """
-
-    def __init__(self, z_dim, transition_dim):
-        super().__init__()
-        # initialize the six linear transformations used in the neural network
-        self.lin_gate_z_to_hidden = nn.Linear(z_dim, transition_dim)
-        self.lin_gate_hidden_to_z = nn.Linear(transition_dim, z_dim)
-        self.lin_proposed_mean_z_to_hidden = nn.Linear(z_dim, transition_dim)
-        self.lin_proposed_mean_hidden_to_z = nn.Linear(transition_dim, z_dim)
-        self.lin_sig = nn.Linear(z_dim, z_dim)
-        self.lin_z_to_loc = nn.Linear(z_dim, z_dim)
-        # modify the default initialization of lin_z_to_loc
-        # so that it's starts out as the identity function
-        self.lin_z_to_loc.weight.data = torch.eye(z_dim)
-        self.lin_z_to_loc.bias.data = torch.zeros(z_dim)
-        # initialize the three non-linearities used in the neural network
+        self.lin_hidden_to_loc = nn.Linear(emission_dim, input_dim)
+        self.lin_hidden_to_scale = nn.Linear(emission_dim, input_dim)
         self.relu = nn.ReLU()
         self.softplus = nn.Softplus()
 
-    def forward(self, z_t_1):
-        """
-        Given the latent `z_{t-1}` corresponding to the time step t-1
-        we return the mean and scale vectors that parameterize the
-        (diagonal) gaussian distribution `p(z_t | z_{t-1})`
-        """
-        # compute the gating function
-        _gate = self.relu(self.lin_gate_z_to_hidden(z_t_1))
+    def forward(self, z_t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h1 = self.relu(self.lin_z_to_hidden(z_t))
+        h2 = self.relu(self.lin_hidden_to_hidden(h1))
+        loc = self.lin_hidden_to_loc(h2)
+        scale = self.softplus(self.lin_hidden_to_scale(h2)) + 1e-2
+        return loc, scale
+
+
+class GatedTransition(nn.Module):
+    """Parameterizes stimulus-conditioned Gaussian latent transition p(z_t | z_{t-1}, u_t)."""
+
+    def __init__(self, z_dim: int, transition_dim: int, stim_dim: int = 0):
+        super().__init__()
+        in_dim = z_dim + stim_dim
+        self.lin_gate_z_to_hidden = nn.Linear(in_dim, transition_dim)
+        self.lin_gate_hidden_to_z = nn.Linear(transition_dim, z_dim)
+        self.lin_proposed_mean_z_to_hidden = nn.Linear(in_dim, transition_dim)
+        self.lin_proposed_mean_hidden_to_z = nn.Linear(transition_dim, z_dim)
+        self.lin_sig = nn.Linear(z_dim, z_dim)
+        self.lin_z_to_loc = nn.Linear(z_dim, z_dim)
+        self.lin_z_to_loc.weight.data = torch.eye(z_dim)
+        self.lin_z_to_loc.bias.data = torch.zeros(z_dim)
+        self.relu = nn.ReLU()
+        self.softplus = nn.Softplus()
+
+    def forward(
+        self, z_t_1: torch.Tensor, u_t: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        inp = z_t_1 if u_t is None else torch.cat([z_t_1, u_t], dim=-1)
+        _gate = self.relu(self.lin_gate_z_to_hidden(inp))
         gate = torch.sigmoid(self.lin_gate_hidden_to_z(_gate))
-        # compute the 'proposed mean'
-        _proposed_mean = self.relu(self.lin_proposed_mean_z_to_hidden(z_t_1))
+        _proposed_mean = self.relu(self.lin_proposed_mean_z_to_hidden(inp))
         proposed_mean = self.lin_proposed_mean_hidden_to_z(_proposed_mean)
-        # assemble the actual mean used to sample z_t, which mixes a linear transformation
-        # of z_{t-1} with the proposed mean modulated by the gating function
         loc = (1 - gate) * self.lin_z_to_loc(z_t_1) + gate * proposed_mean
-        # compute the scale used to sample z_t, using the proposed mean from
-        # above as input the softplus ensures that scale is positive
-        scale = self.softplus(self.lin_sig(self.relu(proposed_mean)))
-        # return loc, scale which can be fed into Normal
+        scale = self.softplus(self.lin_sig(self.relu(proposed_mean))) + 1e-3
         return loc, scale
 
 
 class Combiner(nn.Module):
-    """
-    Parameterizes `q(z_t | z_{t-1}, x_{t:T})`, which is the basic building block
-    of the guide (i.e. the variational distribution). The dependence on `x_{t:T}` is
-    through the hidden state of the RNN (see the PyTorch module `rnn` below)
-    """
+    """Parameterizes variational posterior q(z_t | z_{t-1}, x_{t:T}, u_{t:T})."""
 
-    def __init__(self, z_dim, rnn_dim):
+    def __init__(self, z_dim: int, rnn_dim: int):
         super().__init__()
-        # initialize the three linear transformations used in the neural network
         self.lin_z_to_hidden = nn.Linear(z_dim, rnn_dim)
         self.lin_hidden_to_loc = nn.Linear(rnn_dim, z_dim)
         self.lin_hidden_to_scale = nn.Linear(rnn_dim, z_dim)
-        # initialize the two non-linearities used in the neural network
         self.tanh = nn.Tanh()
         self.softplus = nn.Softplus()
 
-    def forward(self, z_t_1, h_rnn):
-        """
-        Given the latent z at at a particular time step t-1 as well as the hidden
-        state of the RNN `h(x_{t:T})` we return the mean and scale vectors that
-        parameterize the (diagonal) gaussian distribution `q(z_t | z_{t-1}, x_{t:T})`
-        """
-        # combine the rnn hidden state with a transformed version of z_t_1
+    def forward(self, z_t_1: torch.Tensor, h_rnn: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h_combined = 0.5 * (self.tanh(self.lin_z_to_hidden(z_t_1)) + h_rnn)
-        # use the combined hidden state to compute the mean used to sample z_t
         loc = self.lin_hidden_to_loc(h_combined)
-        # use the combined hidden state to compute the scale used to sample z_t
-        scale = self.softplus(self.lin_hidden_to_scale(h_combined))
-        # return loc, scale which can be fed into Normal
+        scale = self.softplus(self.lin_hidden_to_scale(h_combined)) + 1e-3
         return loc, scale
 
 
 class DMM(nn.Module):
-    """
-    This PyTorch Module encapsulates the model as well as the
-    variational distribution (the guide) for the Deep Markov Model
-    """
+    """Deep Markov Model with continuous Gaussian emissions and missing-neuron masking."""
 
     def __init__(
         self,
-        input_dim=300,
-        z_dim=100,
-        emission_dim=100,
-        transition_dim=200,
-        rnn_dim=600,
-        num_layers=1,
-        rnn_dropout_rate=0.0,
-        num_iafs=0,
-        iaf_dim=50,
-        use_cuda=False,
+        input_dim: int = 300,
+        z_dim: int = 64,
+        emission_dim: int = 128,
+        transition_dim: int = 128,
+        rnn_dim: int = 256,
+        num_layers: int = 1,
+        rnn_dropout_rate: float = 0.0,
+        num_iafs: int = 0,
+        iaf_dim: int = 64,
+        use_stim: bool = True,
+        use_cuda: bool = False,
     ):
         super().__init__()
-        # instantiate PyTorch modules used in the model and guide below
+        self.input_dim = input_dim
+        self.use_stim = use_stim
+        stim_dim = input_dim if use_stim else 0
+
         self.emitter = Emitter(input_dim, z_dim, emission_dim)
-        self.trans = GatedTransition(z_dim, transition_dim)
+        self.trans = GatedTransition(z_dim, transition_dim, stim_dim=stim_dim)
         self.combiner = Combiner(z_dim, rnn_dim)
-        # dropout just takes effect on inner layers of rnn
+
         rnn_dropout_rate = 0.0 if num_layers == 1 else rnn_dropout_rate
+        rnn_in_dim = input_dim * 2 if use_stim else input_dim
         self.rnn = nn.RNN(
-            input_size=input_dim,
+            input_size=rnn_in_dim,
             hidden_size=rnn_dim,
             nonlinearity="relu",
             batch_first=True,
@@ -182,159 +148,104 @@ class DMM(nn.Module):
             dropout=rnn_dropout_rate,
         )
 
-        # if we're using normalizing flows, instantiate those too
         self.iafs = [
             affine_autoregressive(z_dim, hidden_dims=[iaf_dim]) for _ in range(num_iafs)
         ]
         self.iafs_modules = nn.ModuleList(self.iafs)
 
-        # define a (trainable) parameters z_0 and z_q_0 that help define the probability
-        # distributions p(z_1) and q(z_1)
-        # (since for t = 1 there are no previous latents to condition on)
         self.z_0 = nn.Parameter(torch.zeros(z_dim))
         self.z_q_0 = nn.Parameter(torch.zeros(z_dim))
-        # define a (trainable) parameter for the initial hidden state of the rnn
-        self.h_0 = nn.Parameter(torch.zeros(1, 1, rnn_dim))
+        self.h_0 = nn.Parameter(torch.zeros(num_layers, 1, rnn_dim))
 
         self.use_cuda = use_cuda
-        # if on gpu cuda-ize all PyTorch (sub)modules
         if use_cuda:
             self.cuda()
 
-    # the model p(x_{1:T} | z_{1:T}) p(z_{1:T})
     def model(
         self,
-        mini_batch,
-        mini_batch_reversed,
-        mini_batch_mask,
-        mini_batch_seq_lengths,
-        annealing_factor=1.0,
+        mini_batch: torch.Tensor,
+        mini_batch_reversed: torch.Tensor,
+        mini_batch_mask: torch.Tensor,
+        mini_batch_seq_lengths: torch.Tensor,
+        annealing_factor: float = 1.0,
+        stim_batch: Optional[torch.Tensor] = None,
     ):
-        # this is the number of time steps we need to process in the mini-batch
         T_max = mini_batch.size(1)
-
-        # register all PyTorch (sub)modules with pyro
-        # this needs to happen in both the model and guide
         pyro.module("dmm", self)
-
-        # set z_prev = z_0 to setup the recursive conditioning in p(z_t | z_{t-1})
         z_prev = self.z_0.expand(mini_batch.size(0), self.z_0.size(0))
+        time_mask = mini_batch_mask.any(dim=-1, keepdim=True)  # (B, T, 1)
 
-        # we enclose all the sample statements in the model in a plate.
-        # this marks that each datapoint is conditionally independent of the others
         with pyro.plate("z_minibatch", len(mini_batch)):
-            # sample the latents z and observed x's one time step at a time
-            # we wrap this loop in pyro.markov so that TraceEnum_ELBO can use multiple samples from the guide at each z
             for t in pyro.markov(range(1, T_max + 1)):
-                # the next chunk of code samples z_t ~ p(z_t | z_{t-1})
-                # note that (both here and elsewhere) we use poutine.scale to take care
-                # of KL annealing. we use the mask() method to deal with raggedness
-                # in the observed data (i.e. different sequences in the mini-batch
-                # have different lengths)
-
-                # first compute the parameters of the diagonal gaussian distribution p(z_t | z_{t-1})
-                z_loc, z_scale = self.trans(z_prev)
-
-                # then sample z_t according to dist.Normal(z_loc, z_scale)
-                # note that we use the reshape method so that the univariate Normal distribution
-                # is treated as a multivariate Normal distribution with a diagonal covariance.
+                u_t = None if (not self.use_stim or stim_batch is None) else stim_batch[:, t - 1, :]
+                z_loc, z_scale = self.trans(z_prev, u_t)
                 with poutine.scale(scale=annealing_factor):
                     z_t = pyro.sample(
-                        "z_%d" % t,
-                        dist.Normal(z_loc, z_scale)
-                        .mask(mini_batch_mask[:, t - 1 : t])
-                        .to_event(1),
+                        f"z_{t}",
+                        dist.Normal(z_loc, z_scale).mask(time_mask[:, t - 1, :]).to_event(1),
                     )
-
-                # compute the probabilities that parameterize the bernoulli likelihood
-                emission_probs_t = self.emitter(z_t)
-                # the next statement instructs pyro to observe x_t according to the
-                # bernoulli distribution p(x_t|z_t)
+                obs_loc, obs_scale = self.emitter(z_t)
                 pyro.sample(
-                    "obs_x_%d" % t,
-                    dist.Bernoulli(emission_probs_t)
-                    .mask(mini_batch_mask[:, t - 1 : t])
+                    f"obs_x_{t}",
+                    dist.Normal(obs_loc, obs_scale)
+                    .mask(mini_batch_mask[:, t - 1, :])
                     .to_event(1),
                     obs=mini_batch[:, t - 1, :],
                 )
-                # the latent sampled at this time step will be conditioned upon
-                # in the next time step so keep track of it
                 z_prev = z_t
 
-    # the guide q(z_{1:T} | x_{1:T}) (i.e. the variational distribution)
     def guide(
         self,
-        mini_batch,
-        mini_batch_reversed,
-        mini_batch_mask,
-        mini_batch_seq_lengths,
-        annealing_factor=1.0,
+        mini_batch: torch.Tensor,
+        mini_batch_reversed: torch.Tensor,
+        mini_batch_mask: torch.Tensor,
+        mini_batch_seq_lengths: torch.Tensor,
+        annealing_factor: float = 1.0,
+        stim_batch: Optional[torch.Tensor] = None,
     ):
-        # this is the number of time steps we need to process in the mini-batch
         T_max = mini_batch.size(1)
-        # register all PyTorch (sub)modules with pyro
         pyro.module("dmm", self)
 
-        # if on gpu we need the fully broadcast view of the rnn initial state
-        # to be in contiguous gpu memory
         h_0_contig = self.h_0.expand(
-            1, mini_batch.size(0), self.rnn.hidden_size
+            self.rnn.num_layers, mini_batch.size(0), self.rnn.hidden_size
         ).contiguous()
-        # push the observed x's through the rnn;
-        # rnn_output contains the hidden state at each time step
         rnn_output, _ = self.rnn(mini_batch_reversed, h_0_contig)
-        # reverse the time-ordering in the hidden state and un-pack it
-        rnn_output = poly.pad_and_reverse(rnn_output, mini_batch_seq_lengths)
-        # set z_prev = z_q_0 to setup the recursive conditioning in q(z_t |...)
+        rnn_output = reverse_sequences_pad(rnn_output, mini_batch_seq_lengths)
+
         z_prev = self.z_q_0.expand(mini_batch.size(0), self.z_q_0.size(0))
+        time_mask = mini_batch_mask.any(dim=-1)  # (B, T)
 
-        # we enclose all the sample statements in the guide in a plate.
-        # this marks that each datapoint is conditionally independent of the others.
         with pyro.plate("z_minibatch", len(mini_batch)):
-            # sample the latents z one time step at a time
-            # we wrap this loop in pyro.markov so that TraceEnum_ELBO can use multiple samples from the guide at each z
             for t in pyro.markov(range(1, T_max + 1)):
-                # the next two lines assemble the distribution q(z_t | z_{t-1}, x_{t:T})
                 z_loc, z_scale = self.combiner(z_prev, rnn_output[:, t - 1, :])
-
-                # if we are using normalizing flows, we apply the sequence of transformations
-                # parameterized by self.iafs to the base distribution defined in the previous line
-                # to yield a transformed distribution that we use for q(z_t|...)
                 if len(self.iafs) > 0:
-                    z_dist = TransformedDistribution(
-                        dist.Normal(z_loc, z_scale), self.iafs
-                    )
-                    assert z_dist.event_shape == (self.z_q_0.size(0),)
-                    assert z_dist.batch_shape[-1:] == (len(mini_batch),)
+                    z_dist = TransformedDistribution(dist.Normal(z_loc, z_scale), self.iafs)
                 else:
-                    z_dist = dist.Normal(z_loc, z_scale)
-                    assert z_dist.event_shape == ()
-                    assert z_dist.batch_shape[-2:] == (
-                        len(mini_batch),
-                        self.z_q_0.size(0),
-                    )
-
-                # sample z_t from the distribution z_dist
+                    z_dist = dist.Normal(z_loc, z_scale).to_event(1)
                 with pyro.poutine.scale(scale=annealing_factor):
-                    if len(self.iafs) > 0:
-                        # in output of normalizing flow, all dimensions are correlated (event shape is not empty)
-                        z_t = pyro.sample(
-                            "z_%d" % t, z_dist.mask(mini_batch_mask[:, t - 1])
-                        )
-                    else:
-                        # when no normalizing flow used, ".to_event(1)" indicates latent dimensions are independent
-                        z_t = pyro.sample(
-                            "z_%d" % t,
-                            z_dist.mask(mini_batch_mask[:, t - 1 : t]).to_event(1),
-                        )
-                # the latent sampled at this time step will be conditioned upon in the next time step
-                # so keep track of it
+                    z_t = pyro.sample(f"z_{t}", z_dist.mask(time_mask[:, t - 1]))
                 z_prev = z_t
 
 
-# setup, training, and evaluation
-def main(args):
-    # setup logging
+def _prepare_batch(
+    indices: torch.Tensor,
+    y_all: torch.Tensor,
+    stim_all: torch.Tensor,
+    mask_all: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    use_stim: bool,
+    device: torch.device,
+):
+    mini_batch = y_all[indices].to(device)
+    stim_batch = stim_all[indices].to(device)
+    mini_mask = mask_all[indices].to(device)
+    lens = seq_lengths[indices].to(device)
+    rnn_in = torch.cat([mini_batch, stim_batch], dim=-1) if use_stim else mini_batch
+    mini_rev = reverse_sequences_pad(rnn_in, lens)
+    return mini_batch, mini_rev, mini_mask, lens, stim_batch
+
+
+def main(args) -> None:
     logging.basicConfig(
         level=logging.DEBUG, format="%(message)s", filename=args.log, filemode="w"
     )
@@ -343,232 +254,165 @@ def main(args):
     logging.getLogger("").addHandler(console)
     logging.info(args)
 
+    device = torch.device("cuda" if (args.cuda and torch.cuda.is_available()) else "cpu")
 
-    x_train, y_train = responseGenerator(folder="./wormfunconn/atlas/", strain="unc-31").Dataset()
-    x_train, x_test, y_train, y_test = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
-    training_seq_lengths = [1000] * len(x_train)
-    N_train_data = len(x_train)
-    N_train_time_slices = float(torch.sum(training_seq_lengths))
-    N_mini_batches = int(
-        N_train_data / args.mini_batch_size
-        + int(N_train_data % args.mini_batch_size > 0)
+    if args.source == "randi":
+        if args.dataset_cache and exists(args.dataset_cache):
+            ds = RandiTrialDataset.load(args.dataset_cache)
+        else:
+            ds = AtlasLoader(
+                path=args.data_path,
+                strain=args.strain,
+                norm_mode=args.norm_mode,
+                max_recordings=args.max_recordings,
+            ).build_trial_dataset(pre_vols=args.pre_vols, post_vols=args.post_vols)
+            if args.dataset_cache:
+                ds.save(args.dataset_cache)
+        x_all, y_all, mask_all = ds.stim_inputs, ds.y, ds.obs_mask
+    else:
+        x_all, y_all, mask_all = responseGenerator(
+            folder="./wormfunconn/atlas/", strain=args.strain, size=100
+        ).Dataset(return_mask=True)
+
+    idx = np.arange(len(y_all))
+    train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=42)
+    x_train, y_train, m_train = x_all[train_idx], y_all[train_idx], mask_all[train_idx]
+    x_test, y_test, m_test = x_all[test_idx], y_all[test_idx], mask_all[test_idx]
+
+    N_train_data = len(y_train)
+    T_seq = y_train.shape[1]
+    training_seq_lengths = torch.full((N_train_data,), T_seq, dtype=torch.long)
+    val_seq_lengths = torch.full((len(y_test),), T_seq, dtype=torch.long)
+    N_train_obs = float(m_train.sum().item())
+    N_mini_batches = max(
+        1,
+        int(N_train_data / args.mini_batch_size + int(N_train_data % args.mini_batch_size > 0)),
     )
 
-    val_data_sequences = x_test
     logging.info(
-        "N_train_data: %d     avg. training seq. length: %.2f    N_mini_batches: %d"
-        % (N_train_data, training_seq_lengths.float().mean(), N_mini_batches)
+        "N_train_data: %d  seq_len: %d  N_mini_batches: %d",
+        N_train_data,
+        T_seq,
+        N_mini_batches,
     )
 
-    # how often we do validation/test evaluation during training
-    val_test_frequency = 50
-    # the number of samples we use to do the evaluation
-    n_eval_samples = 1
-
-    # package repeated copies of val/test data for faster evaluation
-    # (i.e. set us up for vectorization)
-    def rep(x):
-        rep_shape = torch.Size([x.size(0) * n_eval_samples]) + x.size()[1:]
-        repeat_dims = [1] * len(x.size())
-        repeat_dims[0] = n_eval_samples
-        return (
-            x.repeat(repeat_dims)
-            .reshape(n_eval_samples, -1)
-            .transpose(1, 0)
-            .reshape(rep_shape)
-        )
-
-    # get the validation/test data ready for the dmm: pack into sequences, etc.
-    val_seq_lengths = rep(val_seq_lengths)
-    (
-        val_batch,
-        val_batch_reversed,
-        val_batch_mask,
-        val_seq_lengths,
-    ) = poly.get_mini_batch(
-        torch.arange(n_eval_samples * val_data_sequences.shape[0]),
-        rep(val_data_sequences),
-        val_seq_lengths,
-        cuda=args.cuda,
+    val_batch, val_batch_reversed, val_batch_mask, val_lengths_dev, val_stim = _prepare_batch(
+        torch.arange(len(y_test)), y_test, x_test, m_test, val_seq_lengths, args.use_stim, device
     )
 
-    # instantiate the dmm
     dmm = DMM(
+        input_dim=y_train.shape[2],
         rnn_dropout_rate=args.rnn_dropout_rate,
         num_iafs=args.num_iafs,
         iaf_dim=args.iaf_dim,
-        use_cuda=args.cuda,
+        use_stim=args.use_stim,
+        use_cuda=(device.type == "cuda"),
     )
 
-    # setup optimizer
-    adam_params = {
-        "lr": args.learning_rate,
-        "betas": (args.beta1, args.beta2),
-        "clip_norm": args.clip_norm,
-        "lrd": args.lr_decay,
-        "weight_decay": args.weight_decay,
-    }
-    adam = ClippedAdam(adam_params)
+    adam = ClippedAdam(
+        {
+            "lr": args.learning_rate,
+            "betas": (args.beta1, args.beta2),
+            "clip_norm": args.clip_norm,
+            "lrd": args.lr_decay,
+            "weight_decay": args.weight_decay,
+        }
+    )
+    elbo = JitTrace_ELBO() if args.jit else Trace_ELBO()
+    svi = SVI(dmm.model, dmm.guide, adam, loss=elbo)
 
-    # setup inference algorithm
-    if args.tmc:
-        if args.jit:
-            raise NotImplementedError("no JIT support yet for TMC")
-        tmc_loss = TraceTMC_ELBO()
-        dmm_guide = config_enumerate(
-            dmm.guide,
-            default="parallel",
-            num_samples=args.tmc_num_samples,
-            expand=False,
-        )
-        svi = SVI(dmm.model, dmm_guide, adam, loss=tmc_loss)
-    elif args.tmcelbo:
-        if args.jit:
-            raise NotImplementedError("no JIT support yet for TMC ELBO")
-        elbo = TraceEnum_ELBO()
-        dmm_guide = config_enumerate(
-            dmm.guide,
-            default="parallel",
-            num_samples=args.tmc_num_samples,
-            expand=False,
-        )
-        svi = SVI(dmm.model, dmm_guide, adam, loss=elbo)
-    else:
-        elbo = JitTrace_ELBO() if args.jit else Trace_ELBO()
-        svi = SVI(dmm.model, dmm.guide, adam, loss=elbo)
-
-    # now we're going to define some functions we need to form the main training loop
-
-    # saves the model and optimizer states to disk
     def save_checkpoint():
-        logging.info("saving model to %s..." % args.save_model)
-        torch.save(dmm.state_dict(), args.save_model)
-        logging.info("saving optimizer states to %s..." % args.save_opt)
-        adam.save(args.save_opt)
-        logging.info("done saving model and optimizer checkpoints to disk.")
+        if args.save_model:
+            torch.save(dmm.state_dict(), args.save_model)
+        if args.save_opt:
+            adam.save(args.save_opt)
 
-    # loads the model and optimizer states from disk
     def load_checkpoint():
-        assert exists(args.load_opt) and exists(
-            args.load_model
-        ), "--load-model and/or --load-opt misspecified"
-        logging.info("loading model from %s..." % args.load_model)
-        dmm.load_state_dict(torch.load(args.load_model))
-        logging.info("loading optimizer states from %s..." % args.load_opt)
+        assert exists(args.load_opt) and exists(args.load_model), "--load-model and/or --load-opt misspecified"
+        dmm.load_state_dict(torch.load(args.load_model, map_location=device))
         adam.load(args.load_opt)
-        logging.info("done loading model and optimizer states.")
 
-    # prepare a mini-batch and take a gradient step to minimize -elbo
     def process_minibatch(epoch, which_mini_batch, shuffled_indices):
         if args.annealing_epochs > 0 and epoch < args.annealing_epochs:
-            # compute the KL annealing factor approriate for the current mini-batch in the current epoch
             min_af = args.minimum_annealing_factor
             annealing_factor = min_af + (1.0 - min_af) * (
                 float(which_mini_batch + epoch * N_mini_batches + 1)
                 / float(args.annealing_epochs * N_mini_batches)
             )
         else:
-            # by default the KL annealing factor is unity
             annealing_factor = 1.0
 
-        # compute which sequences in the training set we should grab
-        mini_batch_start = which_mini_batch * args.mini_batch_size
-        mini_batch_end = np.min(
-            [(which_mini_batch + 1) * args.mini_batch_size, N_train_data]
+        start = which_mini_batch * args.mini_batch_size
+        end = min((which_mini_batch + 1) * args.mini_batch_size, N_train_data)
+        mb_idx = shuffled_indices[start:end]
+        mb, mb_rev, mb_mask, mb_lens, mb_stim = _prepare_batch(
+            mb_idx, y_train, x_train, m_train, training_seq_lengths, args.use_stim, device
         )
-        mini_batch_indices = shuffled_indices[mini_batch_start:mini_batch_end]
-        # grab a fully prepped mini-batch using the helper function in the data loader
-        (
-            mini_batch,
-            mini_batch_reversed,
-            mini_batch_mask,
-            mini_batch_seq_lengths,
-        ) = poly.get_mini_batch(
-            mini_batch_indices,
-            training_data_sequences,
-            training_seq_lengths,
-            cuda=args.cuda,
-        )
-        # do an actual gradient step
-        loss = svi.step(
-            mini_batch,
-            mini_batch_reversed,
-            mini_batch_mask,
-            mini_batch_seq_lengths,
-            annealing_factor,
-        )
-        # keep track of the training loss
-        return loss
+        return svi.step(mb, mb_rev, mb_mask, mb_lens, annealing_factor, mb_stim)
 
-    # helper function for doing evaluation
-    def do_evaluation():
-        # put the RNN into evaluation mode (i.e. turn off drop-out if applicable)
+    def do_evaluation() -> float:
         dmm.rnn.eval()
-
-        # compute the validation and test loss n_samples many times
+        n_val_obs = max(1.0, float(val_batch_mask.sum().item()))
         val_nll = svi.evaluate_loss(
-            val_batch, val_batch_reversed, val_batch_mask, val_seq_lengths
-        ) / float(torch.sum(val_seq_lengths))
-        # put the RNN back into training mode (i.e. turn on drop-out if applicable)
+            val_batch, val_batch_reversed, val_batch_mask, val_lengths_dev, 1.0, val_stim
+        ) / n_val_obs
         dmm.rnn.train()
-        return val_nll
+        return float(val_nll)
 
-    # if checkpoint files provided, load model and optimizer states from disk before we start training
-    if args.load_opt != "" and args.load_model != "":
+    if args.load_opt and args.load_model:
         load_checkpoint()
 
-    #################
-    # TRAINING LOOP #
-    #################
+    val_test_frequency = 5
     times = [time.time()]
     for epoch in range(args.num_epochs):
-        # if specified, save model and optimizer states to disk every checkpoint_freq epochs
         if args.checkpoint_freq > 0 and epoch > 0 and epoch % args.checkpoint_freq == 0:
             save_checkpoint()
 
-        # accumulator for our estimate of the negative log likelihood (or rather -elbo) for this epoch
         epoch_nll = 0.0
-        # prepare mini-batch subsampling indices for this epoch
         shuffled_indices = torch.randperm(N_train_data)
-
-        # process each mini-batch; this is where we take gradient steps
         for which_mini_batch in range(N_mini_batches):
             epoch_nll += process_minibatch(epoch, which_mini_batch, shuffled_indices)
 
-        # report training diagnostics
         times.append(time.time())
-        epoch_time = times[-1] - times[-2]
         logging.info(
-            "[training epoch %04d]  %.4f \t\t\t\t(dt = %.3f sec)"
-            % (epoch, epoch_nll / N_train_time_slices, epoch_time)
+            "[training epoch %04d]  %.4f \t(dt = %.3f sec)",
+            epoch,
+            epoch_nll / max(1.0, N_train_obs),
+            times[-1] - times[-2],
         )
-
-        # do evaluation on test and validation data and report results
-        if val_test_frequency > 0 and epoch > 0 and epoch % val_test_frequency == 0:
-            val_nll, test_nll = do_evaluation()
-            logging.info(
-                "[val/test epoch %04d]  %.4f" % (epoch, val_nll)
-            )
+        if val_test_frequency > 0 and (epoch + 1) % val_test_frequency == 0:
+            val_nll = do_evaluation()
+            logging.info("[val epoch %04d]  %.4f", epoch, val_nll)
+    if args.save_model or args.save_opt:
+        save_checkpoint()
 
 
-# parse command-line arguments and execute the main method
 if __name__ == "__main__":
-    assert pyro.__version__.startswith("1.9.0")
+    assert pyro.__version__.startswith("1.9"), f"Expected Pyro 1.9.x, found {pyro.__version__}"
 
-    parser = argparse.ArgumentParser(description="parse args")
-    parser.add_argument("-n", "--num-epochs", type=int, default=5000)
-    parser.add_argument("-lr", "--learning-rate", type=float, default=0.0003)
-    parser.add_argument("-b1", "--beta1", type=float, default=0.96)
+    parser = argparse.ArgumentParser(description="Train DMM on C. elegans GCaMP traces")
+    parser.add_argument("--source", choices=["randi", "synthetic"], default="randi")
+    parser.add_argument("--data-path", type=str, default=DEFAULT_DATA_PATH)
+    parser.add_argument("--dataset-cache", type=str, default=None)
+    parser.add_argument("--strain", type=str, default="wild-type")
+    parser.add_argument("--norm-mode", choices=["dff_safe", "dff_strict", "robust_z"], default="dff_safe")
+    parser.add_argument("--max-recordings", type=int, default=None)
+    parser.add_argument("--pre-vols", type=int, default=10)
+    parser.add_argument("--post-vols", type=int, default=50)
+    parser.add_argument("--no-stim", dest="use_stim", action="store_false")
+    parser.add_argument("-n", "--num-epochs", type=int, default=20)
+    parser.add_argument("-lr", "--learning-rate", type=float, default=0.001)
+    parser.add_argument("-b1", "--beta1", type=float, default=0.95)
     parser.add_argument("-b2", "--beta2", type=float, default=0.999)
     parser.add_argument("-cn", "--clip-norm", type=float, default=10.0)
     parser.add_argument("-lrd", "--lr-decay", type=float, default=0.99996)
-    parser.add_argument("-wd", "--weight-decay", type=float, default=2.0)
-    parser.add_argument("-mbs", "--mini-batch-size", type=int, default=20)
-    parser.add_argument("-ae", "--annealing-epochs", type=int, default=1000)
+    parser.add_argument("-wd", "--weight-decay", type=float, default=0.0)
+    parser.add_argument("-mbs", "--mini-batch-size", type=int, default=16)
+    parser.add_argument("-ae", "--annealing-epochs", type=int, default=10)
     parser.add_argument("-maf", "--minimum-annealing-factor", type=float, default=0.2)
     parser.add_argument("-rdr", "--rnn-dropout-rate", type=float, default=0.1)
     parser.add_argument("-iafs", "--num-iafs", type=int, default=0)
-    parser.add_argument("-id", "--iaf-dim", type=int, default=100)
+    parser.add_argument("-id", "--iaf-dim", type=int, default=64)
     parser.add_argument("-cf", "--checkpoint-freq", type=int, default=0)
     parser.add_argument("-lopt", "--load-opt", type=str, default="")
     parser.add_argument("-lmod", "--load-model", type=str, default="")
@@ -576,9 +420,6 @@ if __name__ == "__main__":
     parser.add_argument("-smod", "--save-model", type=str, default="")
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--jit", action="store_true")
-    parser.add_argument("--tmc", action="store_true")
-    parser.add_argument("--tmcelbo", action="store_true")
-    parser.add_argument("--tmc-num-samples", default=10, type=int)
     parser.add_argument("-l", "--log", type=str, default="dmm.log")
     args = parser.parse_args()
 

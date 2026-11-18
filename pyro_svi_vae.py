@@ -1,80 +1,117 @@
-import torch
-from torch.utils.data import DataLoader, random_split
-import torch.nn.functional as F
-
+import argparse
 import os
-import time
-import pyro, pyro.optim
-from pyro.infer import MCMC, NUTS, SVI, Trace_ELBO, Predictive, SMCFilter
-from pyro.infer.autoguide import AutoDiagonalNormal
-from pyro.distributions import Empirical
-import pyro.distributions as dist
 
-from torch.nn.parallel import DistributedDataParallel as DDP
-
+import pyro
+from pyro.infer import SVI, Trace_ELBO
+from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import DataLoader, Subset
 from torchinfo import summary
 
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split
-
-from utils import AtlasLoader, responseGenerator, PsuedoDataset
 import c302
+from pyro_svi_c302 import DEFAULT_DATA_PATH, _save_snapshot, evaluate_predictions
+from utils import AtlasLoader, RandiTrialDataset, responseGenerator
 import vae
 
-# Stochastic Variational Inference, Monte Carlo Markov Chain and Sequential Monte Carlo Filter.
-epochs_run = 0
 
-def _save_snapshot(snapshot_path, model, epoch):
-    snapshot = {
-            "MODEL_STATE": model.module.state_dict(),
-            "EPOCHS_RUN": epoch,
-        }
-    torch.save(snapshot, snapshot_path)
-    print(f"Epoch {epoch} | Training snapshot saved at {snapshot_path}")   
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description='simple distributed training job')
-    parser.add_argument('total_epochs', type=int, help='Total epochs to train the model')
-    parser.add_argument('save_every', type=int, help='How often to save a snapshot')
-    parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train VAElegans amortized variational connectome model")
+    parser.add_argument("total_epochs", nargs="?", type=int, default=10, help="Total epochs to train")
+    parser.add_argument("save_every", nargs="?", type=int, default=5, help="Checkpoint frequency in epochs")
+    parser.add_argument("--batch_size", "--batch-size", default=16, type=int)
+    parser.add_argument("--source", choices=["randi", "synthetic"], default="randi")
+    parser.add_argument("--data-path", default=DEFAULT_DATA_PATH, type=str)
+    parser.add_argument("--dataset-cache", default=None, type=str)
+    parser.add_argument("--strain", default="wild-type", type=str)
+    parser.add_argument("--norm-mode", choices=["dff_safe", "dff_strict", "robust_z"], default="dff_safe")
+    parser.add_argument("--lr", default=5e-3, type=float)
+    parser.add_argument("--substeps", default=4, type=int)
+    parser.add_argument("--dt-obs", default=0.5, type=float)
+    parser.add_argument("--pre-vols", default=10, type=int)
+    parser.add_argument("--post-vols", default=50, type=int)
+    parser.add_argument("--max-recordings", default=None, type=int)
+    parser.add_argument("--num-workers", default=0, type=int)
+    parser.add_argument("--snapshot-dir", default=".", type=str)
     args = parser.parse_args()
 
-    x_train, y_train = responseGenerator(folder="./wormfunconn/atlas/", strain="unc-31").Dataset()
-    x_train, x_test, y_train, y_test = train_test_split(x_train, y_train, test_size=0.05, random_state=42)
+    pyro.clear_param_store()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.snapshot_dir, exist_ok=True)
+
+    if args.source == "randi":
+        if args.dataset_cache and os.path.isfile(args.dataset_cache):
+            dataset = RandiTrialDataset.load(args.dataset_cache)
+        else:
+            dataset = AtlasLoader(
+                path=args.data_path,
+                strain=args.strain,
+                norm_mode=args.norm_mode,
+                max_recordings=args.max_recordings,
+            ).build_trial_dataset(pre_vols=args.pre_vols, post_vols=args.post_vols)
+            if args.dataset_cache:
+                dataset.save(args.dataset_cache)
+        indices = list(range(len(dataset)))
+        train_idx, test_idx = train_test_split(indices, test_size=0.1, random_state=42)
+        train_ds = Subset(dataset, train_idx)
+        test_ds = Subset(dataset, test_idx)
+    else:
+        x_all, y_all, m_all = responseGenerator(
+            folder="./wormfunconn/atlas/", strain=args.strain, size=100, dt=args.dt_obs
+        ).Dataset(return_mask=True)
+        noise_all = torch.full((x_all.shape[0], x_all.shape[2]), 0.05, dtype=torch.float32)
+        from pyro_svi_c302 import _TupleDataset
+
+        idx = list(range(len(x_all)))
+        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=42)
+        train_ds = _TupleDataset(x_all[train_idx], y_all[train_idx], m_all[train_idx], noise_all[train_idx])
+        test_ds = _TupleDataset(x_all[test_idx], y_all[test_idx], m_all[test_idx], noise_all[test_idx])
+
+    pin = torch.cuda.is_available()
     train_data = DataLoader(
-       PsuedoDataset(x_train, torch.zeros_like(x_train), y_train),
-       batch_size=args.batch_size,
-       pin_memory=True,
-       shuffle=True,
-       drop_last=True,
-       num_workers = os.cpu_count()-1, 
+        train_ds,
+        batch_size=min(args.batch_size, len(train_ds)),
+        pin_memory=pin,
+        shuffle=True,
+        drop_last=len(train_ds) >= args.batch_size,
+        num_workers=args.num_workers,
     )
     test_data = DataLoader(
-        PsuedoDataset(x_test, torch.zeros_like(x_test), y_test),
-        batch_size=args.batch_size,
-        pin_memory=True,
-        shuffle=True, 
-        drop_last=True,
-        num_workers = os.cpu_count()-1, 
+        test_ds,
+        batch_size=min(args.batch_size, len(test_ds)),
+        pin_memory=pin,
+        shuffle=False,
+        num_workers=args.num_workers,
     )
 
-    model = c302.readConnectome("./data/CElegansNeuronTables.xls")
-    model = c302.RecurrentNematode(model)
-    model = vae.VAElegans(model, model.model.Neuron.neuronSize, len(model.model.synapse.Wicks_SRC), len(model.model.synapse.Gap_Junction_SRC)) 
+    step_model = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    rec_model = c302.RecurrentNematode(step_model, dt_obs=args.dt_obs, substeps=args.substeps)
+    model = vae.VAElegans(
+        rec_model,
+        rec_model.model.Neuron.neuronSize,
+        len(rec_model.model.synapse.Wicks_SRC),
+        len(rec_model.model.synapse.Gap_Junction_SRC),
+    ).to(device)
     summary(model)
 
-    if torch.cuda.is_available():
-        torch.set_default_tensor_type("torch.cuda.DoubleTensor")
-        model = model.to("cuda")
-    Guide = AutoDiagonalNormal(model)
-    optim = pyro.optim.AdagradRMSProp({})
-    svi = SVI(model, Guide, optim, Trace_ELBO())
-    for epoch in range(0, args.total_epochs):
-        print(f"Epoch {epoch} | Batchsize: {args.batch_size} | Steps: {len(train_data)}")
+    optim = pyro.optim.ClippedAdam({"lr": args.lr, "clip_norm": 10.0})
+    svi = SVI(model, model.guide, optim, Trace_ELBO())
+
+    for epoch in range(args.total_epochs):
         loss = 0.0
-        for VoltageClamp, ExternalInput, y_train in train_data:
-            if torch.cuda.is_available():
-                y_train = y_train.cuda() 
-            loss += svi.step(y_train)
-        print(f"loss: {loss}")
+        n_obs = 0
+        for stim, y, mask, noise in train_data:
+            stim = stim.to(device)
+            y = y.to(device)
+            mask = mask.to(device)
+            noise = noise.to(device)
+            loss += svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+            n_obs += int(mask.sum().item())
+        print(f"Epoch {epoch:03d} | elbo/obs={loss / max(1, n_obs):.4f} | total_loss={loss:.2f}")
+        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
+            metrics = evaluate_predictions(model, test_data, device, guide=model.guide, num_samples=2)
+            print(f"  Eval | R2={metrics['r2']:.4f} | MAE={metrics['mae']:.4f} | RMSE={metrics['rmse']:.4f}")
+            _save_snapshot(os.path.join(args.snapshot_dir, f"vae_epoch_{epoch+1}.pt"), model, model.guide, epoch + 1)
+
+
+if __name__ == "__main__":
+    main()
