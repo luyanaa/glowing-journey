@@ -30,6 +30,7 @@ from utils import (
     split_trial_dataset,
     split_train_validation_indices,
     ToyoshimaLoader,
+    nested_grouped_splits,
 )
 import vae
 
@@ -967,6 +968,81 @@ def test_toyoshima_loader_imports_nacl_trials(tmp_path):
     target_idx = [names_idx[n] for n in ("ASHL", "AWCL", "ASEL")]
     assert ds.stim_inputs[0, 10, target_idx].sum() == 3
     assert ds.obs_mask[:, names_idx["AVDL"]].any()
+
+
+def test_gap_junction_symmetric_current_conservation():
+    pyro.clear_param_store()
+    layer = c302.GeneralSynapse([0], [1], [1.0])
+    v = torch.tensor([[-0.060, -0.080]])
+    current = layer(v)
+    assert abs(float(current.sum())) < 1e-6
+    assert torch.allclose(current[0, 0], -current[0, 1], atol=1e-7)
+
+
+def test_causal_preprocessing_prestim_invariance():
+    rng = np.random.default_rng(2)
+    raw = rng.normal(size=(120, 4)).astype(np.float32)
+    altered = raw.copy()
+    altered[60:] = rng.normal(loc=4.0, scale=2.0, size=(60, 4)).astype(np.float32)
+    n1, m1, _ = preprocess_gcamp_recording(raw, causal=True)
+    n2, m2, _ = preprocess_gcamp_recording(altered, causal=True)
+    assert np.allclose(n1[:60], n2[:60], atol=1e-6)
+    assert np.array_equal(m1[:60], m2[:60])
+
+
+def test_per_neuron_stim_gain_sites_and_stim_actuator():
+    pyro.clear_param_store()
+    tiny_syn = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    step = c302.NematodeForStep(3, {}, tiny_syn, per_neuron_stim_gain=True)
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2, stim_actuator=True)
+    vm = vae.VAElegans(
+        rec, rec.model.Neuron.neuronSize,
+        len(rec.model.synapse.Wicks_SRC), len(rec.model.synapse.Gap_Junction_SRC),
+    )
+    stim = torch.zeros(2, 20, 3)
+    stim[:, 10, 0] = 1.0
+    y = torch.zeros(2, 20, 3)
+    mask = torch.ones(2, 20, 3, dtype=torch.bool)
+    noise = torch.full((2, 3), 0.05)
+    trace = pyro.poutine.trace(vm.guide).get_trace(
+        ExternalInput=stim, mask=mask, y=y, noise_scale=noise
+    )
+    assert tuple(trace.nodes["decoder.model.stim_gain_vec"]["value"].shape) == (3,)
+    svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-3}), Trace_ELBO())
+    loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+    assert np.isfinite(loss)
+
+    with torch.no_grad():
+        y_act, _, _ = rec.simulate(stim, dt_obs=0.5)
+    rec_no_act = c302.RecurrentNematode(
+        c302.NematodeForStep(3, {}, tiny_syn, per_neuron_stim_gain=True),
+        dt_obs=0.5, substeps=2, stim_actuator=False,
+    )
+    with torch.no_grad():
+        y_raw, _, _ = rec_no_act.simulate(stim, dt_obs=0.5)
+    assert not torch.allclose(y_act, y_raw, atol=1e-7)
+
+
+def test_nested_grouped_cv_has_disjoint_worm_splits():
+    stim = torch.zeros(20, 5, 6)
+    y = torch.zeros(20, 5, 6)
+    mask = torch.ones(20, 5, 6, dtype=torch.bool)
+    noise = torch.full((20, 6), 0.05)
+    dts = torch.full((20,), 0.5)
+    meta = [{"rec_id": i // 4} for i in range(20)]
+    ds = RandiTrialDataset(stim, y, mask, noise, dts, meta)
+    folds = nested_grouped_splits(ds, n_splits=3, val_size=0.25, random_state=4)
+    assert len(folds) == 3
+    for fold in folds:
+        tr = {meta[i]["rec_id"] for i in fold["train"]}
+        va = {meta[i]["rec_id"] for i in fold["val"]}
+        te = {meta[i]["rec_id"] for i in fold["test"]}
+        assert tr.isdisjoint(va) and tr.isdisjoint(te) and va.isdisjoint(te)
+        assert set(fold["train"]).isdisjoint(fold["val"])
 
 
 def test_all_python_modules_compile():

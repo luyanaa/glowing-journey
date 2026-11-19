@@ -243,8 +243,9 @@ class neuronLayer(PyroModule):
 class GeneralSynapse(PyroModule):
     """Ohmic electrical gap-junction layer: I_{post} = sum_{pre} w * g_syn * (V_pre - V_post)."""
 
-    def __init__(self, synapseInput, synapseOutput, synapseWeight, g_syn=None):
+    def __init__(self, synapseInput, synapseOutput, synapseWeight, g_syn=None, symmetric: bool = True):
         super().__init__()
+        self.symmetric = bool(symmetric)
         src = np.asarray(synapseInput, dtype=np.int64).reshape(-1)
         dst = np.asarray(synapseOutput, dtype=np.int64).reshape(-1)
         w = np.asarray(synapseWeight, dtype=np.float32).reshape(-1)
@@ -276,6 +277,10 @@ class GeneralSynapse(PyroModule):
         w_gap = torch.zeros((n_neurons, n_neurons), device=device, dtype=dtype).index_put(
             (self.synapseInput, self.synapseOutput), g_eff, accumulate=True
         )
+        if self.symmetric:
+            # One row per unordered electrical pair; add the reverse direction so
+            # I_i + I_j = 0 for an isolated pair (no external input/dissipation).
+            w_gap = w_gap + w_gap.T
         cond_1d = w_gap.sum(dim=0)
         return w_gap, cond_1d
 
@@ -894,10 +899,12 @@ class NematodeForStep(PyroModule):
         use_bnn_residual: bool = False,
         bnn_hidden_dim: int = 16,
         per_edge_release: bool = False,
+        per_neuron_stim_gain: bool = False,
     ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.neuronSize = neuronSize
+        self.per_neuron_stim_gain = bool(per_neuron_stim_gain)
         self.Neuron = neuronLayer(neuronSize, NeuronList)
         self.synapse = synapseLayer(
             synapseList,
@@ -909,7 +916,12 @@ class NematodeForStep(PyroModule):
         # (and inhibitory reversal E_inh = -85 mV if negative stimulation is supplied).
         self.stim_e_rev = 0.0
         self.stim_e_inh = -0.085
-        self.stim_gain = _sample_lognormal(self, math.log(1.2), 0.5)
+        if self.per_neuron_stim_gain:
+            self.stim_gain_vec = _sample_lognormal(
+                self, math.log(1.2), 0.3, shape=(neuronSize,), to_event=1
+            )
+        else:
+            self.stim_gain = _sample_lognormal(self, math.log(1.2), 0.5)
         self.bnn_residual = (
             BayesianNNResidual(neuronSize, hidden_dim=bnn_hidden_dim) if use_bnn_residual else None
         )
@@ -931,8 +943,9 @@ class NematodeForStep(PyroModule):
             ext_current = torch.zeros_like(Prev)
             total_extra_cond = syn_cond
         else:
-            g_opt_pos = self.stim_gain * torch.clamp(ExternalInput, min=0.0)
-            g_opt_neg = self.stim_gain * torch.clamp(-ExternalInput, min=0.0)
+            gain = self.stim_gain_vec if self.per_neuron_stim_gain else self.stim_gain
+            g_opt_pos = gain * torch.clamp(ExternalInput, min=0.0)
+            g_opt_neg = gain * torch.clamp(-ExternalInput, min=0.0)
             ext_current = g_opt_pos * self.stim_e_rev + g_opt_neg * self.stim_e_inh
             total_extra_cond = syn_cond + g_opt_pos + g_opt_neg
         if BackgroundCurrent is not None:
@@ -1007,10 +1020,16 @@ class RecurrentNematode(PyroModule):
         prestim_rank: int = 16,
         per_neuron_kinetics: bool = False,
         per_edge_release: bool = False,
+        stim_actuator: bool = False,
+        stim_tau_rise: float = 0.08,
+        stim_tau_decay: float = 0.4,
     ):
         super().__init__()
         self.model = model
         self.per_edge_release = bool(per_edge_release)
+        self.stim_actuator = bool(stim_actuator)
+        self.stim_tau_rise = float(stim_tau_rise)
+        self.stim_tau_decay = float(stim_tau_decay)
         # Keep backward compatibility with callers passing `scale=` while never mutating globals
         self.substeps = int(scale if scale is not None else substeps)
         self.dt_obs = float(dt_obs)
@@ -1097,6 +1116,7 @@ class RecurrentNematode(PyroModule):
         y_preds = []
         v_traj = []
         ca_traj = []
+        stim_act = torch.zeros_like(v)
 
         for t in range(n_t):
             if prestim_state is not None and t == inject_t:
@@ -1111,9 +1131,22 @@ class RecurrentNematode(PyroModule):
                 if prestim_state is not None and t >= inject_t:
                     t_rel_sim = (t - inject_t) * dt_obs + (sub + 0.5) * dt_sim
                     bg_cur = prestim_state[2] * torch.exp(-t_rel_sim / prestim_state[5])
+                if self.stim_actuator:
+                    # First-order rise/decay actuator; the command is not applied
+                    # instantaneously to the membrane.
+                    rise = ext_t > 0
+                    stim_act = torch.where(
+                        rise,
+                        stim_act + dt_sim * (ext_t - stim_act) / self.stim_tau_rise,
+                        stim_act - dt_sim * stim_act / self.stim_tau_decay,
+                    )
+                    stim_act = torch.clamp(stim_act, min=0.0)
+                    ext_eff = stim_act
+                else:
+                    ext_eff = ext_t
                 v = self.model(
                     v,
-                    ExternalInput=ext_t,
+                    ExternalInput=ext_eff,
                     VoltageClamp=clamp_t,
                     dt=dt_sim,
                     sensory_states=sensory_states,
@@ -1326,6 +1359,7 @@ def readConnectome(
     use_bnn_residual: bool = False,
     bnn_hidden_dim: int = 16,
     per_edge_release: bool = False,
+    per_neuron_stim_gain: bool = False,
     aconnectome_ids_path: str = "./pumpprobe/pumpprobe/aconnectome_ids.txt",
     edgelist_path: str = "./data/herm_full_edgelist.csv",
     np_path: str = "./data/edgelist_NP.csv",
@@ -1355,7 +1389,7 @@ def readConnectome(
             if use_sensory_models:
                 neuron_list[idx] = SensoryList[n_name]() if n_name in SensoryList else FallbackSensory()
 
-    gap_src, gap_dst, gap_w = [], [], []
+    gap_pairs = {}
     wicks_src, wicks_dst, wicks_w, wicks_erev_loc, wicks_erev_scale = [], [], [], [], []
     generic_src, generic_dst, generic_w = [], [], []
 
@@ -1370,9 +1404,8 @@ def readConnectome(
         weight = float(row["Weight"])
 
         if edge_type == "electrical":
-            gap_src.append(src_idx)
-            gap_dst.append(dst_idx)
-            gap_w.append(weight)
+            pair = (min(src_idx, dst_idx), max(src_idx, dst_idx))
+            gap_pairs[pair] = max(gap_pairs.get(pair, 0.0), weight)
         elif edge_type == "chemical":
             wicks_src.append(src_idx)
             wicks_dst.append(dst_idx)
@@ -1393,10 +1426,12 @@ def readConnectome(
             generic_dst.append(name_to_idx[target])
             generic_w.append(1.0)
 
+    gap_src = [pair[0] for pair in gap_pairs]
+    gap_dst = [pair[1] for pair in gap_pairs]
+    gap_w = [gap_pairs[pair] for pair in gap_pairs]
     print("Gap Junction: ", len(gap_src))
     print("Chemical Synapse: ", len(wicks_src))
     print("Extrasynaptic Connection: ", len(generic_src))
-
     synapse_list = {
         "General": (gap_src, gap_dst, gap_w),
         "Wicks": (wicks_src, wicks_dst, wicks_w, wicks_erev_loc, wicks_erev_scale),
@@ -1413,6 +1448,7 @@ def readConnectome(
             use_bnn_residual=use_bnn_residual,
             bnn_hidden_dim=bnn_hidden_dim,
             per_edge_release=per_edge_release,
+            per_neuron_stim_gain=per_neuron_stim_gain,
         )
     model.register_buffer("sensory_mask", torch.from_numpy(sensory_mask))
     return model

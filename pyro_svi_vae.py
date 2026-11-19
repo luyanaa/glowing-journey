@@ -140,6 +140,12 @@ def main() -> None:
                         help="Learn per-neuron tau_ca and k_off (hierarchical around v3 global values)")
     parser.add_argument("--per-edge-release", action="store_true",
                         help="Learn per-edge V_rest/V_slope residuals on top of per-neuron release values")
+    parser.add_argument("--per-neuron-stim-gain", action="store_true",
+                        help="Learn a constrained stimulus gain per neuron")
+    parser.add_argument("--stim-actuator", action="store_true",
+                        help="Apply a first-order rise/decay actuator before the membrane")
+    parser.add_argument("--stim-tau-rise", default=0.08, type=float)
+    parser.add_argument("--stim-tau-decay", default=0.4, type=float)
     parser.add_argument("--freeze-nonedge-epochs", default=0, type=int,
                         help="Freeze all parameters except per-edge release residuals for this many epochs")
     parser.add_argument("--init-from", default=None, type=str,
@@ -153,6 +159,8 @@ def main() -> None:
                         help="Recording-grouped validation fraction held out from training")
     parser.add_argument("--eval-test-each-save", action="store_true",
                         help="Evaluate the locked test set at every save (default: final save only)")
+    parser.add_argument("--causal-preprocess", action="store_true",
+                        help="Use past-only Hampel/baseline/normalization for the Randi preprocessing")
     parser.add_argument("--snapshot-dir", default=".", type=str)
     args = parser.parse_args()
 
@@ -172,6 +180,7 @@ def main() -> None:
                 strain=args.strain,
                 norm_mode=args.norm_mode,
                 max_recordings=args.max_recordings,
+                causal_preprocess=args.causal_preprocess,
             ).build_trial_dataset(pre_vols=args.pre_vols, post_vols=args.post_vols)
             if args.dataset_cache:
                 dataset.save(args.dataset_cache)
@@ -258,7 +267,9 @@ def main() -> None:
     )
 
     step_model = c302.readConnectome(
-        "./data/CElegansNeuronTables.xls", per_edge_release=args.per_edge_release
+        "./data/CElegansNeuronTables.xls",
+        per_edge_release=args.per_edge_release,
+        per_neuron_stim_gain=args.per_neuron_stim_gain,
     )
     adj_t = torch.as_tensor(
         step_model.synapse.adjacency_matrix(step_model.neuronSize),
@@ -274,6 +285,9 @@ def main() -> None:
         prestim_rank=args.prestim_rank,
         per_neuron_kinetics=args.per_neuron_kinetics,
         per_edge_release=args.per_edge_release,
+        stim_actuator=args.stim_actuator,
+        stim_tau_rise=args.stim_tau_rise,
+        stim_tau_decay=args.stim_tau_decay,
     )
     model = vae.VAElegans(
         rec_model,

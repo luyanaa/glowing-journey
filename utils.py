@@ -51,6 +51,87 @@ def _estimate_hf_sigma(traces: np.ndarray) -> np.ndarray:
     return 1.4826 * mad_diff / np.sqrt(2.0)
 
 
+def _causal_preprocess_gcamp(
+    raw: np.ndarray,
+    finite_mask: np.ndarray,
+    valid_cols: np.ndarray,
+    dt: float,
+    hampel_window_sec: float,
+    hampel_n_sigma: float,
+    baseline_window_sec: float,
+    baseline_quantile: float,
+    norm_mode: str,
+    min_f0: float,
+    smooth_window: Optional[int],
+    clip_abs: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Past-only Hampel/baseline/normalization for causal pre-stim inputs."""
+    import pandas as pd
+
+    n_t = raw.shape[0]
+    n_cols = raw.shape[1]
+    valid_mask = finite_mask.copy()
+    normalized = np.zeros_like(raw, dtype=np.float64)
+    noise_scale = np.ones(n_cols, dtype=np.float64)
+
+    hampel_win = max(5, int(round(hampel_window_sec / max(dt, 1e-3))))
+    if hampel_win % 2 == 0:
+        hampel_win += 1
+    hampel_win = min(hampel_win, n_t)
+    base_win = max(5, int(round(baseline_window_sec / max(dt, 1e-3))))
+    if base_win % 2 == 0:
+        base_win += 1
+    base_win = min(base_win, n_t)
+    smooth_win = max(3, min(base_win // 5, 15))
+
+    for k, col_idx in enumerate(valid_cols):
+        raw_col = raw[:, col_idx]
+        # Forward-fill only: leading gaps become 0 and remain masked.
+        s = pd.Series(raw_col).ffill().fillna(0.0)
+        med = s.rolling(hampel_win, min_periods=1).median()
+        absdev = (s - med).abs().rolling(hampel_win, min_periods=1).median()
+        local_scale = np.maximum(1.4826 * absdev.to_numpy(), 1e-6)
+        spikes = np.abs(s.to_numpy() - med.to_numpy()) > hampel_n_sigma * local_scale
+        despiked = np.where(spikes, med.to_numpy(), s.to_numpy())
+
+        baseline = (
+            pd.Series(despiked)
+            .rolling(base_win, min_periods=1)
+            .quantile(float(baseline_quantile))
+            .to_numpy()
+        )
+        baseline = pd.Series(baseline).rolling(smooth_win, min_periods=1).mean().to_numpy()
+        delta_f = despiked - baseline
+
+        if smooth_window is not None and smooth_window >= 3:
+            win = int(smooth_window)
+            if win % 2 == 0:
+                win += 1
+            delta_f = pd.Series(delta_f).rolling(win, min_periods=1).mean().to_numpy()
+
+        if norm_mode in ("dff_safe", "dff_strict"):
+            scale_t = pd.Series(baseline).rolling(base_win, min_periods=1).median().to_numpy()
+            scale_t = np.maximum(scale_t, min_f0)
+        elif norm_mode == "robust_z":
+            diff = pd.Series(despiked).diff().abs()
+            scale_t = diff.rolling(base_win, min_periods=1).std().fillna(1.0).to_numpy()
+            scale_t = np.maximum(scale_t, 1e-6)
+        else:
+            raise ValueError(f"Unknown norm_mode={norm_mode!r}")
+
+        out = delta_f / scale_t
+        if clip_abs is not None:
+            out = np.clip(out, -clip_abs, clip_abs)
+        mask_col = finite_mask[:, col_idx]
+        out[~mask_col] = 0.0
+        normalized[:, col_idx] = out
+        valid_mask[:, col_idx] = mask_col
+        hf = np.diff(despiked)
+        noise_scale[col_idx] = float(np.clip(np.std(hf) / max(scale_t[-1], 1e-6), 0.01, 5.0))
+
+    return normalized.astype(np.float32), valid_mask, noise_scale.astype(np.float32)
+
+
 def preprocess_gcamp_recording(
     raw_data: np.ndarray,
     dt: float = 0.5,
@@ -66,6 +147,7 @@ def preprocess_gcamp_recording(
     smooth_polyorder: int = 2,
     min_finite_frac: float = 0.5,
     clip_abs: Optional[float] = 10.0,
+    causal: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Despike, detrend, and normalize a raw GCaMP recording matrix (T, N).
 
@@ -111,6 +193,22 @@ def preprocess_gcamp_recording(
             work[:, k] = raw[:, col_idx]
         else:
             work[:, k] = _interpolate_nonfinite_1d(raw[:, col_idx], f_col)
+
+    if causal:
+        return _causal_preprocess_gcamp(
+            raw,
+            finite_mask,
+            valid_cols,
+            dt,
+            hampel_window_sec,
+            hampel_n_sigma,
+            baseline_window_sec,
+            baseline_quantile,
+            norm_mode,
+            min_f0,
+            smooth_window,
+            clip_abs,
+        )
 
     # 1. Bidirectional Hampel despiking
     hampel_win = max(5, int(round(hampel_window_sec / max(dt, 1e-3))))
@@ -444,8 +542,10 @@ class AtlasLoader(Dataset):
         drop_invalid_f0: bool = True,
         smooth_window: Optional[int] = None,
         max_recordings: Optional[int] = None,
+        causal_preprocess: bool = False,
     ):
         self.device = device
+        self.causal_preprocess = bool(causal_preprocess)
         self.norm_mode = norm_mode
         self.neuron_names, self.name_to_idx = load_canonical_neurons(aconnectome_path)
         self.n_neurons = len(self.neuron_names)
@@ -470,6 +570,7 @@ class AtlasLoader(Dataset):
                 norm_mode=norm_mode,
                 drop_invalid_f0=drop_invalid_f0,
                 smooth_window=smooth_window,
+                causal=self.causal_preprocess,
             )
             self.recordings.append(rec)
             self.x.append((rec["stim_neurons"], rec["stim_volume_i"]))
@@ -524,6 +625,7 @@ class AtlasLoader(Dataset):
         norm_mode: str,
         drop_invalid_f0: bool,
         smooth_window: Optional[int],
+        causal: bool = False,
     ) -> dict:
         prefix = os.path.join(data_dir, f"{rec_id}_")
         raw_gcamp = self._load_txt_matrix(prefix + "gcamp.txt")
@@ -562,6 +664,7 @@ class AtlasLoader(Dataset):
                 norm_mode=norm_mode,
                 drop_invalid_f0=drop_invalid_f0,
                 smooth_window=smooth_window,
+                causal=causal,
             )
             for sub_idx, c_idx in enumerate(mapped_canon_idxs):
                 # Only overwrite if new column has more valid frames
@@ -935,6 +1038,28 @@ def resolve_default_data_path() -> str:
         if os.path.isdir(cand):
             return cand
     return "./data/exported_data"
+
+
+def nested_grouped_splits(
+    dataset: RandiTrialDataset,
+    n_splits: int = 5,
+    val_size: float = 0.2,
+    random_state: int = 42,
+) -> List[Dict[str, List[int]]]:
+    """Recording-grouped outer CV with a grouped validation split inside each train fold."""
+    from sklearn.model_selection import GroupKFold
+
+    groups = np.array([int(dataset.meta[i]["rec_id"]) for i in range(len(dataset))], dtype=np.int64)
+    n_splits = int(min(max(2, n_splits), len(np.unique(groups))))
+    outer = GroupKFold(n_splits=n_splits)
+    folds = []
+    for tr_pos, te_pos in outer.split(np.arange(len(dataset)), groups=groups):
+        core, val, _ = split_train_validation_indices(
+            dataset, tr_pos.tolist(), val_size=val_size,
+            random_state=random_state, group_by_recording=True,
+        )
+        folds.append({"train": core, "val": val, "test": te_pos.tolist()})
+    return folds
 
 
 def resolve_default_toyoshima_path() -> str:

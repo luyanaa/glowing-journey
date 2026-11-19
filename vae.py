@@ -163,6 +163,7 @@ class VAEGuide(PyroModule):
         e_rev_prior: Optional[torch.Tensor] = None,
         per_neuron_kinetics: bool = False,
         per_edge_release: bool = False,
+        per_neuron_stim_gain: bool = False,
     ):
         super().__init__()
         self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim, e_rev_prior=e_rev_prior)
@@ -171,6 +172,7 @@ class VAEGuide(PyroModule):
         self.gap_dim = int(gap_dim)
         self.per_neuron_kinetics = bool(per_neuron_kinetics)
         self.per_edge_release = bool(per_edge_release)
+        self.per_neuron_stim_gain = bool(per_neuron_stim_gain)
 
         # Amortized posterior EMA for open-loop evaluation when y is withheld (y=None)
         self.register_buffer("_has_amortized_post", torch.tensor(False, dtype=torch.bool))
@@ -214,6 +216,14 @@ class VAEGuide(PyroModule):
             self.tau_ca_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
             self.k_off_loc = PyroParam(torch.tensor(math.log(0.045)))
             self.k_off_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
+
+        if self.per_neuron_stim_gain:
+            self.stim_gain_vec_loc = PyroParam(
+                torch.full((self.neuron_dim,), math.log(1.2))
+            )
+            self.stim_gain_vec_scale = PyroParam(
+                torch.full((self.neuron_dim,), 0.3), constraint=constraints.positive
+            )
 
         if self.per_edge_release and self.wicks_dim > 0:
             self.v_rest_edge_loc = PyroParam(torch.zeros(self.wicks_dim))
@@ -316,7 +326,13 @@ class VAEGuide(PyroModule):
                 dist.LogNormal(gap_loc, gap_scale).to_event(1),
             )
 
-        pyro.sample("decoder.model.stim_gain", dist.LogNormal(self.stim_gain_loc, self.stim_gain_scale))
+        if self.per_neuron_stim_gain:
+            pyro.sample(
+                "decoder.model.stim_gain_vec",
+                dist.LogNormal(self.stim_gain_vec_loc, self.stim_gain_vec_scale).to_event(1),
+            )
+        else:
+            pyro.sample("decoder.model.stim_gain", dist.LogNormal(self.stim_gain_loc, self.stim_gain_scale))
         pyro.sample("decoder.obs_sigma", dist.LogNormal(self.obs_sigma_loc, self.obs_sigma_scale))
 
         pyro.sample("decoder.gcamp.v_th_ca_logit", dist.Normal(self.v_th_ca_loc, self.v_th_ca_scale))
@@ -362,11 +378,15 @@ class VAElegans(PyroModule):
         per_edge_release = bool(
             getattr(getattr(getattr(model, "model", None), "synapse", None), "per_edge_release", False)
         )
+        per_neuron_stim_gain = bool(
+            getattr(getattr(model, "model", None), "per_neuron_stim_gain", False)
+        )
         self.guide = VAEGuide(
             neuron_dim, wicks_dim, gap_dim,
             e_rev_prior=e_rev_prior,
             per_neuron_kinetics=per_neuron_kinetics,
             per_edge_release=per_edge_release,
+            per_neuron_stim_gain=per_neuron_stim_gain,
         )
         self.decoder = model
         self.neuron_dim = int(neuron_dim)
@@ -374,6 +394,7 @@ class VAElegans(PyroModule):
         self.gap_dim = int(gap_dim)
         self.per_neuron_kinetics = per_neuron_kinetics
         self.per_edge_release = per_edge_release
+        self.per_neuron_stim_gain = per_neuron_stim_gain
 
     @property
     def encoder(self) -> Encoder:

@@ -110,6 +110,7 @@ Two experimental sources are supported:
 | `vae_opt2_gated_v3` | Option 2 + `direct_hop1` gate during training and inference | Earlier gate hypothesis |
 | `v4_opt2_e8` | v3 + **per-neuron `tau_ca/k_off`**, warm-started | Neuron-level calcium-kinetics heterogeneity |
 | `v5_edge_e2` | v4 + **per-edge `V_rest/V_slope` residuals**, 2 edge-only epochs | Per-edge release-threshold heterogeneity |
+| optional actuator | `--stim-actuator`, `--per-neuron-stim-gain` | First-order opsin rise/decay and constrained target gain |
 
 ### 1.4 Training and inference
 
@@ -320,12 +321,12 @@ v5 edge residuals (e2):
 
 These are not fixed by the current report; they are constraints on how the numbers above may be interpreted.
 
-1. **The test set is not locked.** v3/v4/v5 checkpoints and epochs were inspected against the same 11-recording test set, so the v5 result is **exploratory**, not a locked final benchmark. The 329-trial set should be treated as a historical benchmark. Future work should use recording-grouped nested cross-validation and a single locked final test evaluation.
+1. **The test set is not locked.** v3/v4/v5 checkpoints and epochs were inspected against the same 11-recording test set, so the v5 result is **exploratory**, not a locked final benchmark. The 329-trial set should be treated as a historical benchmark. `utils.nested_grouped_splits` now provides recording-grouped outer CV with grouped validation inside each train fold; it is a protocol helper, not a completed nested-CV study.
 2. **`--val-fraction=0` previously made `val_ds = test_ds`.** The training script now avoids this: with `val_fraction=0`, `val_ds=None`; test is evaluated only at the final save by default (`--eval-test-each-save` opt-in). The historical v3/v4/v5 runs predate this guard.
-3. **Preprocessing is not end-to-end causal.** `preprocess_gcamp_recording` uses a centered Hampel filter, centered rolling percentile baseline, and whole-recording F0/noise estimates. The encoder reads only `y[:, :pre_vols]`, but those values are still functions of post-stimulus frames. A full preprocessing → trial slicing → encoding invariance test is required before claiming causal forecasting.
-4. **The guide uses a batch-mean global posterior.** `Encoder.forward` averages trials in a minibatch to produce global connectome/neuron posterior loc/scale, then an EMA is used at inference. This is an engineering approximation to `p(θ | Y_train)`, not a hierarchical global/local variational posterior. A proper worm-level latent hierarchy remains future work.
-5. **Gap junctions are directed in the current computation.** The CSV contains 2,697 electrical rows with no reverse entry; `adjacency_matrix()` symmetrizes but `GeneralSynapse` uses the directed rows. Current hop grouping and simulation can therefore disagree. A symmetric conductance implementation and current-conservation test are required.
-6. **The optogenetic actuator is phenomenological.** `stim_gain × binary pulse` with `E_opt = 0 V` is not a mechanistic model of the Randi GUR-3/PRDX-2 opsin. It should not be interpreted as measured channel kinetics.
+3. **Preprocessing causality is now opt-in, not retrospective.** `preprocess_gcamp_recording(..., causal=True)` uses past-only Hampel/baseline/normalization and has a pre-stim invariance test. The historical v3/v4/v5 results used the old bidirectional/whole-recording path (`--causal-preprocess` is off by default for backward compatibility), so the old results must not be described as strictly causal forecasting.
+4. **The guide still uses a batch-mean global posterior.** `Encoder.forward` averages trials in a minibatch to produce global connectome/neuron posterior loc/scale, then an EMA is used at inference. This is an engineering approximation to `p(θ | Y_train)`, not a hierarchical global/local variational posterior. A proper worm-level latent hierarchy remains future work.
+5. **Gap-junction symmetry is fixed in the current code.** Electrical pairs are deduplicated, and `GeneralSynapse` symmetrizes its conductance matrix; a KCL/current-conservation test is included. Historical v3/v4/v5 results predate this fix and used directed currents; they should not be used to compare gap-junction topology effects.
+6. **The optogenetic actuator is now optional.** `--stim-actuator` adds a first-order rise/decay state; `--per-neuron-stim-gain` adds constrained per-target gain. The historical results still use the original instantaneous `stim_gain × binary pulse`, so the old latency analysis remains phenomenological.
 7. **Global parameter identifiability is not established.** Strong synaptic conductance, high stimulus gain, and a low calcium threshold can compensate. Synthetic parameter recovery, posterior calibration, and connectome-ablation/shuffle controls are required before treating individual parameters as identified.
 
 ---
@@ -355,9 +356,10 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest tests` → **29 passed**.
+- Regression tests: `pytest tests` → **33 passed**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
+- Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - All Colab sessions are stopped; there are no active sessions.
 
 ### 4.4 Data
@@ -387,5 +389,5 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 - Warm-start from `v5 edge e2` and try **per-edge release time constants / delays**, rather than continuing to tune thresholds.
 - Or add a **low-rank extrasynaptic residual** specifically to fill the 1-hop/2-hop amplitude gap.
 - Any new scheme must use a fixed split seed, 16 samples, report mean±std over at least three training seeds, and use a worm-level independent validation set. Do not select models with the same-pool random 15% holdout again.
-- Before further Randi tuning: lock a historical benchmark, add an end-to-end causal preprocessing test, fix symmetric gap-junction currents, and replace the phenomenological opsin with an actuator state if the delay analysis depends on it.
+- Before further Randi tuning: lock a historical benchmark; use `--causal-preprocess` for any causal claim; keep the symmetric gap-junction fix; and use `--stim-actuator`/`--per-neuron-stim-gain` if latency/gain is interpreted mechanistically.
 - Then run the Toyoshima NaCl dataset as a second experiment (`--source toyoshima`) with the same locked evaluation discipline.
