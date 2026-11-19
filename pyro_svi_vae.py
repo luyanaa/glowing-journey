@@ -162,6 +162,8 @@ def main() -> None:
                         help="Recording-grouped test fraction (default 0.1)")
     parser.add_argument("--shuffle-connectome", default=None, type=int,
                         help="Fixed seed for a connectivity-shuffle control (None = intact graph)")
+    parser.add_argument("--split-file", default=None, type=str,
+                        help="JSON with train/val/test index lists (nested CV fold); overrides test-size/val-fraction")
     parser.add_argument("--val-fraction", default=0.15, type=float,
                         help="Recording-grouped validation fraction held out from training")
     parser.add_argument("--eval-test-each-save", action="store_true",
@@ -221,31 +223,52 @@ def main() -> None:
         source_label = "synthetic"
 
     if args.source != "synthetic":
-        train_idx, test_idx, split_info = split_trial_dataset(
-            dataset,
-            test_size=args.test_size,
-            random_state=args.split_seed,
-            group_by_recording=not args.trial_split,
-        )
-        test_ds = Subset(dataset, test_idx)
-        if args.val_fraction > 0:
-            train_core_idx, val_idx, val_info = split_train_validation_indices(
-                dataset, train_idx, val_size=args.val_fraction, random_state=args.split_seed,
+        if args.split_file:
+            with open(args.split_file, "r") as fh:
+                split = json.load(fh)
+            train_idx = [int(i) for i in split["train"]]
+            val_idx = [int(i) for i in split.get("val", [])]
+            test_idx = [int(i) for i in split["test"]]
+            split_info = {
+                "grouped": 1,
+                "train_recordings": len({dataset.meta[i]["rec_id"] for i in train_idx + val_idx}),
+                "test_recordings": len({dataset.meta[i]["rec_id"] for i in test_idx}),
+                "split_file": args.split_file,
+            }
+            val_info = {"val_recordings": len({dataset.meta[i]["rec_id"] for i in val_idx})}
+            train_ds = Subset(dataset, train_idx)
+            test_ds = Subset(dataset, test_idx)
+            val_ds = Subset(dataset, val_idx) if val_idx else None
+            print(
+                f"Dataset ready ({source_label}, split-file): train={len(train_ds)} trials, "
+                f"val={0 if val_ds is None else len(val_ds)} trials, test={len(test_ds)} trials"
+            )
+        else:
+            train_idx, test_idx, split_info = split_trial_dataset(
+                dataset,
+                test_size=args.test_size,
+                random_state=args.split_seed,
                 group_by_recording=not args.trial_split,
             )
-            val_ds = Subset(dataset, val_idx)
-        else:
-            train_core_idx = list(train_idx)
-            val_idx = []
-            val_info = {"val_recordings": 0}
-            val_ds = None
-        train_ds = Subset(dataset, train_core_idx)
-        print(
-            f"Dataset ready ({source_label}): train={len(train_ds)} trials "
-            f"({split_info['train_recordings']} recs, val={val_info['val_recordings']} recs), "
-            f"val={0 if val_ds is None else len(val_ds)} trials, test={len(test_ds)} trials "
-            f"({split_info['test_recordings']} recs, grouped={bool(split_info['grouped'])})"
-        )
+            test_ds = Subset(dataset, test_idx)
+            if args.val_fraction > 0:
+                train_core_idx, val_idx, val_info = split_train_validation_indices(
+                    dataset, train_idx, val_size=args.val_fraction, random_state=args.split_seed,
+                    group_by_recording=not args.trial_split,
+                )
+                val_ds = Subset(dataset, val_idx)
+            else:
+                train_core_idx = list(train_idx)
+                val_idx = []
+                val_info = {"val_recordings": 0}
+                val_ds = None
+            train_ds = Subset(dataset, train_core_idx)
+            print(
+                f"Dataset ready ({source_label}): train={len(train_ds)} trials "
+                f"({split_info['train_recordings']} recs, val={val_info['val_recordings']} recs), "
+                f"val={0 if val_ds is None else len(val_ds)} trials, test={len(test_ds)} trials "
+                f"({split_info['test_recordings']} recs, grouped={bool(split_info['grouped'])})"
+            )
 
     pin = torch.cuda.is_available()
     train_data = DataLoader(

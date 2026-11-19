@@ -354,9 +354,23 @@ Clean v3 architecture (no per-neuron kinetics, no per-edge release), causal Rand
 | intact connectome | **0.0891** | 0.2101 | 0.301 | **0.402** | **0.0571** | 0.260 | 0.0451 | 0.269 | 0.292 |
 | shuffled connectome | 0.0889 | 0.2101 | 0.297 | 0.249 | -0.0090 | 0.258 | **0.0547** | 0.271 | 0.295 |
 
+Evoked (pre-stimulus-mean-subtracted) 1-hop scores from the same checkpoints: intact `evoked_hop1_R²=0.0310`, shuffled `0.0378`; Δ = **-0.0068**, so the single-seed gate fails. This is a sanity check, not the 3-seed nested gate.
+
 The shuffle **does not degrade** post-stim or 1-hop performance; `hop1_R²` is even slightly higher for the shuffled graph, and `unconn_r` is unchanged. Only the stimulus-target correlation drops (0.402→0.249). Therefore the 1-hop signal in this v3 model is not evidence of topology-specific propagation; it is compatible with shared baseline dynamics/regularization. This is a single shuffle seed, so it is a null-control result, not a full permutation test.
 
-### 3.12 Statistical and causal caveats (review findings)
+### 3.12 P0 evaluation protocol lock
+
+The next model changes must pass a fixed protocol before biological interpretation:
+
+- **Nested recording-grouped CV**: `tools/run_nested_protocol.py` uses `utils.nested_grouped_splits` (5 outer folds, grouped validation inside each outer train fold) and writes explicit `train/val/test` index JSON consumed by `pyro_svi_vae.py --split-file`. The outer test fold is never used for early stopping.
+- **Seeds and conditions**: main comparisons use at least three training seeds. The shuffle gate uses at least three fixed degree-preserving endpoint permutations.
+- **Forced current preprocessing**: Randi runs use the causal cache built with `preprocess_gcamp_recording(..., causal=True)` and the current symmetric gap-junction code; `--causal-preprocess` is passed explicitly even when a cache is loaded.
+- **Evoked metric**: `compute_stratified_metrics` now emits `evoked_post_*`, `evoked_stim_*`, `evoked_hop1_*`, `evoked_hop2_*`, and `evoked_unconnected_*`. Each trial/neuron has its pre-stimulus mean removed from both truth and prediction before post-stimulus scoring; this is separate from the raw `hop1_r2`.
+- **Hard gate**: `evoked_hop1_r2` for intact versus shuffled connectomes. The gate passes only when `delta_mean > 0` and `delta_mean > pooled SEM` (one-sided ~84%). `tools/run_nested_protocol.py` writes `summary.json` with the gate and all seed/shuffle runs. No P1/P2 model change is promoted unless this gate passes.
+
+The protocol was smoke-tested end to end with a tiny cache and one outer fold; the full 5-fold × 3-seed × 3-shuffle run is intentionally a separate compute job, not silently reduced to a single seed.
+
+### 3.13 Statistical and causal caveats (review findings)
 
 These are not fixed by the current report; they are constraints on how the numbers above may be interpreted.
 
@@ -403,9 +417,10 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest tests` → **37 passed**.
+- Regression tests: `pytest tests` → **38 passed**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
+- P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
 - Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
@@ -436,7 +451,7 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 5. The current bottleneck is **1-hop amplitude (~0.26×) and peak-time/phase errors in some neurons**, not another saturation wall.
 6. Under the current symmetric-gap code, a fresh Randi 20-epoch model gives `post_inlier_R²=0.1007` and `hop1_R²=0.0676`; this is weaker than the historical v5 warm-start result. The gap fix itself costs about 5–6% on these metrics in the adapter comparison, and the rest is training-protocol difference.
 7. Toyoshima after the route-B loader rewrite is still weak (`post_inlier_R²=0.0236`, `hop1_R²=0.0356`, `unconn_r=0.141`), although polarity is directionally correct and `stim_r` rises to 0.286. It is not cross-dataset generalization.
-8. The route-A connectome shuffle does not degrade post-stim or 1-hop metrics (`post_inlier_R² 0.0891→0.0889`, `hop1_r 0.260→0.258`, `hop1_R² 0.0451→0.0547`), while stimulus correlation drops (`stim_r 0.402→0.249`). The observed 1-hop signal is therefore not established as topology-specific; it must not be interpreted as connectome propagation without a multi-seed permutation test.
+8. The route-A connectome shuffle does not degrade post-stim or 1-hop metrics (`post_inlier_R² 0.0891→0.0889`, `hop1_r 0.260→0.258`, `hop1_R² 0.0451→0.0547`), while stimulus correlation drops (`stim_r 0.402→0.249`). The evoked gate is also negative (`evoked_hop1_R² 0.0310→0.0378`, Δ=-0.0068). The observed 1-hop signal is therefore not established as topology-specific; it must not be interpreted as connectome propagation without a multi-seed permutation test.
 
 ### Recommended next round
 

@@ -105,6 +105,24 @@ def compute_stratified_metrics(
             out["post_inlier_rmse"] = float(np.sqrt(mean_squared_error(yt_pi, yp_pi)))
             out["post_inlier_r"] = _safe_pearson_r(yt_pi, yp_pi)
 
+    # Baseline-subtracted "evoked" signals: remove each trial/neuron's
+    # pre-stimulus mean before comparing post-stimulus responses.  This avoids
+    # rewarding a model that merely reproduces the slow pre-stimulus baseline.
+    yt_ev = yp_ev = None
+    if y_true.ndim == 3 and 0 < int(pre_vols) < y_true.shape[1]:
+        pre_valid = valid[:, :int(pre_vols), :]
+        pre_count = np.maximum(pre_valid.sum(axis=1), 1)
+        base_true = (y_true[:, :int(pre_vols), :] * pre_valid).sum(axis=1) / pre_count
+        base_pred = (y_pred[:, :int(pre_vols), :] * pre_valid).sum(axis=1) / pre_count
+        yt_ev = y_true - base_true[:, None, :]
+        yp_ev = y_pred - base_pred[:, None, :]
+        post_ev = np.zeros_like(valid)
+        post_ev[:, int(pre_vols):, :] = valid[:, int(pre_vols):, :]
+        if np.any(post_ev):
+            yt_e, yp_e = yt_ev[post_ev], yp_ev[post_ev]
+            out["evoked_post_r2"] = float(r2_score(yt_e, yp_e))
+            out["evoked_post_r"] = _safe_pearson_r(yt_e, yp_e)
+
     if stim is not None and y_true.ndim == 3:
         n_trials, n_t, n_neurons = y_true.shape
         t0 = min(max(0, int(pre_vols)), max(0, n_t - 1))
@@ -124,6 +142,10 @@ def compute_stratified_metrics(
             out["stim_r"] = _safe_pearson_r(yt_s, yp_s)
             out["stim_true_mean"] = float(yt_s.mean())
             out["stim_pred_mean"] = float(yp_s.mean())
+            if yt_ev is not None:
+                yt_se, yp_se = yt_ev[evoked_stim], yp_ev[evoked_stim]
+                out["evoked_stim_r2"] = float(r2_score(yt_se, yp_se))
+                out["evoked_stim_r"] = _safe_pearson_r(yt_se, yp_se)
             evoked_stim_in = evoked_stim & (np.abs(y_true) <= 3.0)
             if np.any(evoked_stim_in):
                 out["stim_inlier_r"] = _safe_pearson_r(y_true[evoked_stim_in], y_pred[evoked_stim_in])
@@ -152,6 +174,10 @@ def compute_stratified_metrics(
                     out[f"{prefix}_mae"] = float(mean_absolute_error(yt_d, yp_d))
                     out[f"{prefix}_rmse"] = float(np.sqrt(mean_squared_error(yt_d, yp_d)))
                     out[f"{prefix}_r"] = _safe_pearson_r(yt_d, yp_d)
+                    if yt_ev is not None:
+                        yt_de, yp_de = yt_ev[sub_mask], yp_ev[sub_mask]
+                        out[f"evoked_{prefix}_r2"] = float(r2_score(yt_de, yp_de))
+                        out[f"evoked_{prefix}_r"] = _safe_pearson_r(yt_de, yp_de)
                     sub_in = sub_mask & (np.abs(y_true) <= 3.0)
                     if np.any(sub_in):
                         out[f"{prefix}_inlier_r"] = _safe_pearson_r(y_true[sub_in], y_pred[sub_in])

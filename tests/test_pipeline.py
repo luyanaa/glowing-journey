@@ -580,6 +580,32 @@ def test_stratified_connectome_hop_evaluation():
     assert m["hop1_count"] == 15 and m["hop1_r2"] > 0.99
     assert m["hop2_count"] == 15 and m["hop2_r2"] > 0.99
     assert m["unconnected_count"] == 15 and m["unconnected_r"] == 0.0
+    # Baseline-subtracted metrics must exist and preserve the exact fit here
+    # because the synthetic pre-stimulus baseline is zero.
+    for key in ("evoked_stim_r2", "evoked_hop1_r2", "evoked_hop2_r2"):
+        assert key in m and m[key] > 0.99
+    assert "evoked_unconnected_r2" in m
+
+
+def test_evoked_metrics_remove_prestim_baseline():
+    syn = c302.synapseLayer(
+        {"General": ([], [], []), "Wicks": ([0], [1], [1.0]), "Generic": ([], [], [])}
+    )
+    adj = syn.adjacency_matrix(3)
+    stim = np.zeros((1, 20, 3), dtype=np.float32)
+    stim[0, 10, 0] = 1.0
+    y_true = np.zeros((1, 20, 3), dtype=np.float32)
+    y_pred = np.zeros((1, 20, 3), dtype=np.float32)
+    # Different constant pre-stim offsets must be removed by the evoked metric.
+    y_true[:, :10, :] = 4.0
+    y_pred[:, :10, :] = -2.0
+    ramp = np.linspace(0.1, 1.0, 10)
+    y_true[0, 10:, 1] = 4.0 + ramp
+    y_pred[0, 10:, 1] = -2.0 + ramp
+    mask = np.ones((1, 20, 3), dtype=bool)
+    m = compute_stratified_metrics(y_true, y_pred, mask, stim=stim, pre_vols=10, adjacency=adj)
+    assert m["evoked_hop1_r2"] > 0.99
+    assert m["evoked_hop1_r"] > 0.99
 
 
 def test_randi_trial_dataset_save_load(tmp_path):
