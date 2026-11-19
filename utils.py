@@ -864,7 +864,26 @@ class ToyoshimaLoader:
     input.  ``stim_targets`` is therefore an explicit operational assumption;
     the default list is the chemosensory set ASH/AWC/ASE, and it can be
     overridden by the caller.
+
+    The protocol alternates 50→25 mM and 25→50 mM steps every 30 s.  The
+    loader encodes the two directions separately as signed, sustained
+    commands on the measured ON/OFF sensory classes rather than collapsing
+    both into one positive pulse.  The raw ratio columns are z-scored; they
+    are multiplied by ``observation_scale`` (default 0.18, the Randi ΔF/F0
+    scale) before being fed to the ΔF/F0-calibrated model/encoder.
     """
+
+    # Measured 0–10 s means from the five audited recordings: ASER/ASH/AWC
+    # prefer the 50→25 mM down-step, ASEL prefers the 25→50 mM up-step.
+    # Values are (down-step sign, up-step sign).
+    DEFAULT_POLARITY_SIGNS = {
+        "ASER": (+1.0, -1.0),
+        "ASEL": (-1.0, +1.0),
+        "ASHR": (+1.0, -1.0),
+        "ASHL": (+1.0, -1.0),
+        "AWCR": (+1.0, -1.0),
+        "AWCL": (+1.0, -1.0),
+    }
 
     def __init__(
         self,
@@ -873,11 +892,17 @@ class ToyoshimaLoader:
         target_fs: float = 2.0,
         stim_targets: Sequence[str] = ("ASH", "AWC", "ASE"),
         max_recordings: Optional[int] = None,
+        observation_scale: float = 0.18,
+        polarity_signs: Optional[dict] = None,
     ):
         import pandas as pd
 
         self.data_dir = path
         self.target_fs = float(target_fs)
+        self.observation_scale = float(observation_scale)
+        self.polarity_signs = dict(self.DEFAULT_POLARITY_SIGNS)
+        if polarity_signs is not None:
+            self.polarity_signs.update(polarity_signs)
         self.neuron_names, self.name_to_idx = load_canonical_neurons(aconnectome_path)
         self.n_neurons = len(self.neuron_names)
         target_indices = []
@@ -932,6 +957,9 @@ class ToyoshimaLoader:
 
         # Resample to the common trial clock.  Interpolation is applied per
         # column before mapping so unmapped neurons remain masked.
+        # The export is already z-scored (std ≈ 1).  Put it on the Randi
+        # ΔF/F0 scale before interpolation and noise estimation.
+        raw = raw * self.observation_scale
         n_native = raw.shape[0]
         t_native = np.arange(n_native, dtype=np.float64) / fs
         t_grid = np.arange(0.0, t_native[-1] + 1e-9, 1.0 / self.target_fs)
@@ -953,7 +981,9 @@ class ToyoshimaLoader:
                 series = np.interp(np.arange(n_native), np.where(finite)[0], series[finite])
             y[:, cidx] = np.interp(t_grid, t_native, series).astype(np.float32)
             mask[:, cidx] = True
-            noise[cidx] = float(np.clip(np.std(np.diff(series)) / np.sqrt(2.0), 0.01, 5.0))
+            noise[cidx] = float(
+                np.clip(np.std(np.diff(series)) / np.sqrt(2.0), 0.01, 5.0)
+            )
             mapped.append(cidx)
         if len(mapped) < 5:
             return None
@@ -977,23 +1007,28 @@ class ToyoshimaLoader:
             "noise_scale": noise,
             "dt": 1.0 / self.target_fs,
             "onsets": sorted(set(onsets)),
+            "interval_s": interval / fs if fs > 0 else 30.0,
             "mapped_neurons": len(mapped),
         }
 
     def build_trial_dataset(
         self,
         pre_vols: int = 10,
-        post_vols: int = 50,
-        stim_duration_s: float = 0.5,
+        post_vols: int = 60,
+        stim_duration_s: float = 30.0,
         min_observed_neurons: int = 5,
         rebaseline_on_pre: bool = True,
         max_pre_abs: float = 5.0,
         trial_clip_abs: Optional[float] = 10.0,
     ) -> RandiTrialDataset:
-        """Cut NaCl-onset trials into the same tensor format as Randi trials."""
+        """Cut NaCl-onset trials with signed, sustained ON/OFF commands.
+
+        ``ev_idx`` is even for the 50→25 mM down-step and odd for the
+        25→50 mM up-step.  The step duration is capped by the inter-onset
+        interval, so a 30 s protocol does not leak into the next trial.
+        """
         trial_len = int(pre_vols) + int(post_vols)
         dt = 1.0 / self.target_fs
-        pulse_steps = max(1, int(round(float(stim_duration_s) / dt)))
         stim_list, y_list, mask_list, noise_list, dt_list, meta_list = [], [], [], [], [], []
 
         for rec in self.recordings:
@@ -1009,8 +1044,17 @@ class ToyoshimaLoader:
                 m_seg = mask_full[v_start:v_end].copy()
                 stim_seg = np.zeros((trial_len, self.n_neurons), dtype=np.float32)
                 rel = int(pre_vols)
+                downstep = (ev_idx % 2 == 0)
+                step_duration_s = min(
+                    float(stim_duration_s), float(rec.get("interval_s", stim_duration_s))
+                )
+                pulse_steps = max(1, int(round(step_duration_s / dt)))
+                pulse_steps = min(pulse_steps, trial_len - rel)
                 for target in self.stim_targets:
-                    stim_seg[rel:min(trial_len, rel + pulse_steps), target] = 1.0
+                    target_name = self.neuron_names[target]
+                    signs = self.polarity_signs.get(target_name, (1.0, 1.0))
+                    sign = signs[0] if downstep else signs[1]
+                    stim_seg[rel:rel + pulse_steps, target] = sign
 
                 if rebaseline_on_pre and pre_vols >= 3:
                     for c in np.where(np.any(m_seg[:pre_vols], axis=0))[0]:
@@ -1040,6 +1084,9 @@ class ToyoshimaLoader:
                     "event_idx": int(ev_idx),
                     "stim_neuron": "NaCl",
                     "stim_neuron_idx": int(self.stim_targets[0]),
+                    "polarity": "down" if downstep else "up",
+                    "polarity_value": 1 if downstep else -1,
+                    "step_duration_s": float(step_duration_s),
                     "source": str(rec["name"]),
                 })
 

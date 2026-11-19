@@ -160,6 +160,8 @@ def main() -> None:
     parser.add_argument("--split-seed", default=42, type=int, help="Fixed data split seed")
     parser.add_argument("--test-size", default=0.1, type=float,
                         help="Recording-grouped test fraction (default 0.1)")
+    parser.add_argument("--shuffle-connectome", default=None, type=int,
+                        help="Fixed seed for a connectivity-shuffle control (None = intact graph)")
     parser.add_argument("--val-fraction", default=0.15, type=float,
                         help="Recording-grouped validation fraction held out from training")
     parser.add_argument("--eval-test-each-save", action="store_true",
@@ -278,6 +280,7 @@ def main() -> None:
         "./data/CElegansNeuronTables.xls",
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
+        shuffle_seed=args.shuffle_connectome,
     )
     adj_t = torch.as_tensor(
         step_model.synapse.adjacency_matrix(step_model.neuronSize),

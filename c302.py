@@ -1384,8 +1384,16 @@ def readConnectome(
     edgelist_path: str = "./data/herm_full_edgelist.csv",
     np_path: str = "./data/edgelist_NP.csv",
     ma_path: str = "./data/edgelist_MA.csv",
+    shuffle_seed: Optional[int] = None,
 ):
-    """Build C. elegans connectome step model aligned to the 300 canonical neuron IDs."""
+    """Build C. elegans connectome step model aligned to the 300 canonical neuron IDs.
+
+    ``shuffle_seed`` applies a fixed random permutation to all edge endpoints
+    (gap, chemical, and extrasynaptic) while leaving neuron identities,
+    sensory masks, and stimulus targets fixed.  This is the connectome-shuffle
+    control: graph degree is preserved, but the mapping from canonical neuron
+    identity to local topology is destroyed.
+    """
     sensory_df = pd.read_excel(path, sheet_name="Sensory")
     sensory_set = set(sensory_df["Neuron"].dropna().astype(str).map(_normalize_neuron_name))
 
@@ -1450,8 +1458,19 @@ def readConnectome(
             generic_dst.append(name_to_idx[target])
             generic_w.append(1.0)
 
-    gap_src = [pair[0] for pair in gap_pairs]
-    gap_dst = [pair[1] for pair in gap_pairs]
+    if shuffle_seed is not None:
+        rng = np.random.default_rng(int(shuffle_seed))
+        perm = rng.permutation(len(neuron_names))
+        gap_src = [int(perm[pair[0]]) for pair in gap_pairs]
+        gap_dst = [int(perm[pair[1]]) for pair in gap_pairs]
+        wicks_src = [int(perm[i]) for i in wicks_src]
+        wicks_dst = [int(perm[i]) for i in wicks_dst]
+        generic_src = [int(perm[i]) for i in generic_src]
+        generic_dst = [int(perm[i]) for i in generic_dst]
+        # A permutation is injective, so non-self edges stay non-self.
+    else:
+        gap_src = [pair[0] for pair in gap_pairs]
+        gap_dst = [pair[1] for pair in gap_pairs]
     gap_w = [gap_pairs[pair] for pair in gap_pairs]
     print("Gap Junction: ", len(gap_src))
     print("Chemical Synapse: ", len(wicks_src))

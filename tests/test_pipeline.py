@@ -908,6 +908,30 @@ def test_per_neuron_kinetics_shapes_and_warm_start_expansion():
         )
 
 
+def test_connectome_shuffle_preserves_degree_and_changes_edges():
+    pyro.clear_param_store()
+    orig = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    shuf = c302.readConnectome("./data/CElegansNeuronTables.xls", shuffle_seed=7)
+    go, gs = orig.synapse.general, shuf.synapse.general
+    assert go.inputSize == gs.inputSize
+    deg_o = np.bincount(
+        np.concatenate([go.synapseInput.numpy(), go.synapseOutput.numpy()]),
+        minlength=300,
+    )
+    deg_s = np.bincount(
+        np.concatenate([gs.synapseInput.numpy(), gs.synapseOutput.numpy()]),
+        minlength=300,
+    )
+    assert np.array_equal(np.sort(deg_o), np.sort(deg_s))
+    assert not np.array_equal(
+        np.stack([go.synapseInput.numpy(), go.synapseOutput.numpy()], axis=1),
+        np.stack([gs.synapseInput.numpy(), gs.synapseOutput.numpy()], axis=1),
+    )
+    # Same seed is reproducible.
+    shuf2 = c302.readConnectome("./data/CElegansNeuronTables.xls", shuffle_seed=7)
+    assert np.array_equal(shuf.synapse.general.synapseInput.numpy(), shuf2.synapse.general.synapseInput.numpy())
+
+
 def test_electrical_self_loops_are_filtered():
     pyro.clear_param_store()
     step = c302.readConnectome("./data/CElegansNeuronTables.xls")
@@ -1002,9 +1026,21 @@ def test_toyoshima_loader_imports_nacl_trials(tmp_path):
     assert len(ds) >= 2
     assert ds.y.shape[1:] == (60, 300)
     assert ds.meta[0]["stim_neuron"] == "NaCl"
+    assert ds.meta[0]["polarity"] == "down"
+    assert ds.meta[1]["polarity"] == "up"
     names_idx = loader.name_to_idx
     target_idx = [names_idx[n] for n in ("ASHL", "AWCL", "ASEL")]
-    assert ds.stim_inputs[0, 10, target_idx].sum() == 3
+    # 50→25 mM: ASHL/AWCL positive, ASEL negative.  The 10 s fixture interval
+    # caps the 30 s default step at 20 frames.
+    assert ds.stim_inputs[0, 10, target_idx].tolist() == [1.0, 1.0, -1.0]
+    assert torch.all(ds.stim_inputs[0, 10:30, target_idx[0]] == 1.0)
+    assert torch.all(ds.stim_inputs[0, 30:, target_idx[0]] == 0.0)
+    # 25→50 mM flips the signs.
+    assert ds.stim_inputs[1, 10, target_idx].tolist() == [-1.0, -1.0, 1.0]
+    assert ds.meta[0]["step_duration_s"] == 10.0
+    # The loader maps z-scored columns onto the Randi ΔF/F0 scale.
+    observed = ds.y[ds.obs_mask]
+    assert float(observed.std()) < 0.5
     assert ds.obs_mask[:, names_idx["AVDL"]].any()
 
 
