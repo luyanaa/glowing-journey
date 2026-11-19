@@ -7,13 +7,31 @@
   "frames_per_recording": 6000,
   "mapped_neurons": {"min": 65, "max": 151, "mean": 127},
   "stimulation_cycles_total": 679,
+  "surviving_trials": 582,
   "native_frame_rate_hz": {"min": 3.69, "max": 5.72},
   "resample_hz": 2.0,
-  "trial_geometry": {"pre_frames": 10, "post_frames": 50, "dt_s": 0.5},
+  "trial_geometry": {"pre_frames": 10, "post_frames": 60, "dt_s": 0.5},
+  "stimulus_encoding": {
+    "protocol": "50->25 mM and 25->50 mM alternate every 30 s; even k is down-step, odd k is up-step",
+    "duration_s": 30.0,
+    "duration_cap": "inter-onset interval",
+    "polarity_counts": {"down": 295, "up": 287},
+    "observation_scale": 0.18,
+    "observation_scale_note": "z-scored ratio columns are multiplied by 0.18 before the DeltaF/F0-calibrated encoder",
+    "polarity_signs": {
+      "ASER": [1.0, -1.0],
+      "ASEL": [-1.0, 1.0],
+      "ASHR": [1.0, -1.0],
+      "ASHL": [1.0, -1.0],
+      "AWCR": [1.0, -1.0],
+      "AWCL": [1.0, -1.0]
+    },
+    "sign_source": "audit of first five recordings, 0-10 s post-step means; operational model input, not a measured activation map"
+  },
   "operational_targets": {
     "requested": ["ASH", "AWC", "ASE"],
     "canonical": ["ASHL", "ASHR", "AWCL", "AWCR", "ASEL", "ASER"],
-    "note": "NaCl is a sensory perturbation, not a targeted optogenetic input; this target set is an explicit modeling assumption."
+    "note": "NaCl is a sensory perturbation, not a targeted optogenetic input; the target set and ON/OFF signs are explicit modeling assumptions."
   },
   "example_recording": {
     "sample": 1,
@@ -23,6 +41,15 @@
     "surviving_trials": 47,
     "mask_fraction": 0.26
   },
+  "benchmark": {
+    "checkpoint": "glowing-journey_runs/route_ab_2026-11-19/toyo_v2/vae_epoch_20.pt",
+    "eval_json": "report/data/toyoshima_v2_eval16.json",
+    "post_inlier_r2": 0.023630619049072266,
+    "hop1_r2": 0.03561896085739136,
+    "stim_r": 0.2862320330069999,
+    "unconnected_r": 0.14096803040070868,
+    "status": "weak; polarity directionally correct, not cross-dataset generalization"
+  },
   "loader": "utils.ToyoshimaLoader",
-  "cli": "python pyro_svi_vae.py 10 5 --source toyoshima --toyoshima-path <dir> --dt-obs 0.5"
+  "cli": "python pyro_svi_vae.py 20 5 --source toyoshima --dataset-cache <cache.npz> --post-vols 60 --use-prestim-encoder --per-neuron-kinetics --per-edge-release"
 }

@@ -190,11 +190,12 @@ Local source: `/Users/yanlu/Google Drive/マイドライブ/cleandata_smoothened
 | Canonical mapped neurons | 65–151 (mean 127) |
 | Total NaCl cycles | 679 |
 | Loader | `utils.ToyoshimaLoader` |
-| Trial geometry | 10 pre + 50 post frames at 2 Hz (`dt = 0.5 s`) |
+| Trial geometry | 10 pre + 60 post frames at 2 Hz (`dt = 0.5 s`; 30 s step) |
+| Surviving trials, corrected loader | 582 (295 down / 287 up) |
 
-NaCl switching is a sensory perturbation, not a targeted optogenetic input. The loader therefore uses an explicit operational target set, defaulting to the chemosensory classes **ASH/AWC/ASE**, expanded to canonical `ASHL/ASHR/AWCL/AWCR/ASEL/ASER`. This is a modeling assumption, not a measured activation map. A one-recording smoke test (sample 1, `180710a`) produced 47 trials from 48 onsets with 78 mapped neurons and a 0.26 observation mask.
+NaCl switching is a sensory perturbation, not a targeted optogenetic input. The corrected loader uses an explicit operational target set, defaulting to the chemosensory classes **ASH/AWC/ASE**, expanded to canonical `ASHL/ASHR/AWCL/AWCR/ASEL/ASER`, with measured ON/OFF signs and a sustained 30 s step. This is a modeling assumption, not a measured activation map. A one-recording smoke test (sample 1, `180710a`) produced 47 trials from 48 onsets with 78 mapped neurons and a 0.26 observation mask.
 
-`report/data/toyoshima_manifest.json` records these counts. The dataset was benchmarked under the current protocol in §3.10; it is a **negative loader/protocol result**, and the loader still needs the P0 polarity/duration and z-score-scale repair before it can support a biological conclusion.
+`report/data/toyoshima_manifest.json` records these counts. The dataset was benchmarked with the corrected polarity/duration and observation-scale loader in §3.10. The result is still weak, but it is now a usable loader/protocol baseline rather than the earlier polarity/scale artifact.
 
 ---
 
@@ -334,27 +335,39 @@ The symmetric adapter lowers `post_inlier_R²` from 0.1219 to 0.1145 (−6.1%) a
 
 #### Toyoshima
 
-| Run | post_inlier_R² | post_inlier_RMSE | post_r | stim_r | hop1_r | hop1_R² | hop2_r | unconn_r |
+The corrected loader has 582 trials; the pre-fix row used 585. 50→25 and 25→50 mM transitions are separate signed, sustained 30 s commands with the measured ON/OFF target signs, and z-scored ratio columns are mapped by `observation_scale=0.18` to the Randi ΔF/F0 scale. The pre-fix row is kept for provenance; its RMSE is on the z-score scale and is not comparable to the corrected row.
+
+| Run | post_inlier_R² | post_r | stim_r | stim_R² | hop1_r | hop1_R² | hop2_r | unconn_r |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| current 20-epoch symmetric | **0.0165** | 0.9128 | 0.129 | 0.192 | 0.135 | 0.0171 | 0.144 | 0.112 |
-| zero baseline | 0.0000 | 0.9526 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| pre-fix loader (collapsed 0.5 s +1 pulse) | 0.0165 | 0.129 | 0.192 | 0.0159 | 0.135 | 0.0171 | 0.144 | 0.112 |
+| corrected loader, 20 epochs | **0.0236** | 0.158 | 0.286 | -0.098 | 0.196 | **0.0356** | 0.154 | 0.141 |
+| zero baseline | 0.0000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
 
-Toyoshima has 21 recordings and 585 NaCl-onset trials: 16 training recordings (13 core + 3 validation) and 5 test recordings. The current model explains 1.6% of post-stim variance, improves post-stim RMSE over zero only from 0.953 to 0.913, and predicts stimulated mean 0.038 versus true 0.174. All strata, including unconnected neurons, have similar correlations (0.11–0.19), so the model is fitting a weak global/mean component rather than a connectome-specific NaCl response. This is **not** evidence of cross-dataset generalization.
+The corrected loader improves `post_inlier_R²` from 0.0165 to 0.0236, `hop1_R²` from 0.0171 to 0.0356, and `stim_r` from 0.192 to 0.286. It is still weak: post-stim RMSE is 0.1717 versus zero 0.1739, and `stim_R²` is negative because the predicted stimulus-mean (0.0245) is much smaller than the true mean (0.1073). Polarity is at least directionally correct: down-step ASER true/pred = 0.251/0.033, up-step ASER = -0.195/-0.115, up-step ASEL = 0.127/0.038. However, `unconn_r=0.141` is close to `hop1_r=0.196`, so this is still mostly a weak global/mean component, not a validated connectome-specific NaCl response. It is **not** evidence of cross-dataset generalization.
 
-**P0 loader caveat:** the current Toyoshima loader treats every 50↔25 mM transition as an identical 0.5 s +1 pulse, although the original protocol alternates 30 s 50→25 and 25→50 mM steps with opposite ON/OFF responses. It also feeds z-scored ratio columns into a model/encoder calibrated for Randi ΔF/F0. Therefore the low score above is **not a clean biological negative**; the loader polarity/duration and observation-scale mapping must be repaired (route B) before interpreting NaCl response learning.
+### 3.11 Route A: connectome-shuffle control
 
-### 3.11 Statistical and causal caveats (review findings)
+Clean v3 architecture (no per-neuron kinetics, no per-edge release), causal Randi cache, symmetric gap junctions, 20 epochs, 16 posterior samples, and the **original biological adjacency for evaluation**. The control permutes all edge endpoints with a fixed seed, preserving node degrees and stimulus targets while destroying identity-to-topology mapping.
+
+| Run | post_inlier_R² | post_inlier_RMSE | post_r | stim_r | stim_R² | hop1_r | hop1_R² | hop2_r | unconn_r |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| intact connectome | **0.0891** | 0.2101 | 0.301 | **0.402** | **0.0571** | 0.260 | 0.0451 | 0.269 | 0.292 |
+| shuffled connectome | 0.0889 | 0.2101 | 0.297 | 0.249 | -0.0090 | 0.258 | **0.0547** | 0.271 | 0.295 |
+
+The shuffle **does not degrade** post-stim or 1-hop performance; `hop1_R²` is even slightly higher for the shuffled graph, and `unconn_r` is unchanged. Only the stimulus-target correlation drops (0.402→0.249). Therefore the 1-hop signal in this v3 model is not evidence of topology-specific propagation; it is compatible with shared baseline dynamics/regularization. This is a single shuffle seed, so it is a null-control result, not a full permutation test.
+
+### 3.12 Statistical and causal caveats (review findings)
 
 These are not fixed by the current report; they are constraints on how the numbers above may be interpreted.
 
-1. **The test set is not locked.** v3/v4/v5 checkpoints and epochs were inspected against the same 11-recording test set, so the v5 result is **exploratory**, not a locked final benchmark. The 329-trial set should be treated as a historical benchmark. `utils.nested_grouped_splits` now provides recording-grouped outer CV with grouped validation inside each train fold; it is a protocol helper, not a completed nested-CV study.
+1. **The test set is not locked.** v3/v4/v5 and route-A checkpoints/epochs were inspected against the same 11-recording test set, so the v5 and route-A results are **exploratory**, not a locked final benchmark. The 329-trial set should be treated as a historical benchmark. `utils.nested_grouped_splits` now provides recording-grouped outer CV with grouped validation inside each train fold; it is a protocol helper, not a completed nested-CV study.
 2. **`--val-fraction=0` previously made `val_ds = test_ds`.** The training script now avoids this: with `val_fraction=0`, `val_ds=None`; test is evaluated only at the final save by default (`--eval-test-each-save` opt-in). The historical v3/v4/v5 runs predate this guard.
 3. **Preprocessing causality is now opt-in, not retrospective.** `preprocess_gcamp_recording(..., causal=True)` uses past-only Hampel/baseline/normalization and has a pre-stim invariance test. The historical v3/v4/v5 results used the old bidirectional/whole-recording path (`--causal-preprocess` is off by default for backward compatibility), so the old results must not be described as strictly causal forecasting.
 4. **The guide still uses a batch-mean global posterior.** `Encoder.forward` averages trials in a minibatch to produce global connectome/neuron posterior loc/scale, then an EMA is used at inference. This is an engineering approximation to `p(θ | Y_train)`, not a hierarchical global/local variational posterior. A proper worm-level latent hierarchy remains future work.
 5. **Gap-junction symmetry is fixed in the current code.** Electrical pairs are deduplicated, electrical self-loops are filtered, and `GeneralSynapse` symmetrizes its conductance matrix; a KCL/current-conservation test is included. Historical v3/v4/v5 results predate this fix and used directed currents; they should not be used to compare gap-junction topology effects. The symmetric adapter in §3.10 is a post-hoc evaluation of the old v5 weights, not a retrain; the current 20-epoch model is a from-scratch control.
 6. **The optogenetic actuator is now optional.** `--stim-actuator` adds a first-order rise/decay state; `--per-neuron-stim-gain` adds constrained per-target gain. The historical results still use the original instantaneous `stim_gain × binary pulse`, so the old latency analysis remains phenomenological.
-7. **Global parameter identifiability is not established.** Strong synaptic conductance, high stimulus gain, and a low calcium threshold can compensate. A 3-neuron/1-edge synthetic probe (`report/data/identifiability_probe.json`) recovered `g_max=0.010` vs true `0.050`, `tau_ca=5.10 s` vs `7.0 s`, and `k_off=0.0399 s^-1` vs `0.045`, while `v_th_ca` stayed near the prior median. This is direct evidence for compensation; synthetic recovery, posterior calibration, and connectome-ablation/shuffle controls are required before treating individual parameters as identified.
-8. **Toyoshima is a negative current-protocol result, not a success.** The 20-epoch model reaches `post_inlier_R² = 0.0165` and `hop1_R² = 0.0171`; the stimulated prediction mean is 0.038 versus 0.174 true. Do not use this run as evidence for NaCl response generalization; the loader's ASH/AWC/ASE target mapping and the 2 Hz resampling/trial extraction are operational assumptions that need validation.
+7. **Global parameter identifiability is not established.** Strong synaptic conductance, high stimulus gain, and a low calcium threshold can compensate. A 3-neuron/1-edge synthetic probe (`report/data/identifiability_probe.json`) recovered `g_max=0.010` vs true `0.050`, `tau_ca=5.10 s` vs `7.0 s`, and `k_off=0.0399 s^-1` vs `0.045`, while `v_th_ca` stayed near the prior median. This is direct evidence for compensation; synthetic recovery and posterior calibration are required before treating individual parameters as identified. The route-A shuffle control is a single-seed null, not a full permutation test.
+8. **Toyoshima remains a weak result after the route-B loader rewrite.** The corrected run reaches `post_inlier_R² = 0.0236` and `hop1_R² = 0.0356`; `unconn_r=0.141` is close to `hop1_r=0.196`, and the stimulated prediction mean is 0.0245 versus 0.1073 true. Polarity is directionally correct, but this is not cross-dataset generalization. The asymmetric ON/OFF target signs are inferred from the audit of five recordings, and the 2 Hz resampling/trial extraction remain operational assumptions.
 
 ---
 
@@ -369,6 +382,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/v4_kinetics_2026-11-19/` | Per-neuron `tau_ca/k_off`, opt1 e6 / opt2 e8 checkpoints, C/G probe |
 | `glowing-journey_runs/v5_edge_2026-11-19/` | Per-edge release, historical best e2 checkpoint, edge-long negative result |
 | `glowing-journey_runs/current_2026-11-19/` | Current-code 20-epoch Randi and Toyoshima checkpoints, metrics, and 16-sample eval JSON |
+| `glowing-journey_runs/route_ab_2026-11-19/` | Corrected Toyoshima, causal Randi baseline, and connectome-shuffle checkpoints/metrics |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -379,7 +393,10 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `v4_kinetics_2026-11-19/checkpoints/opt2_vae_epoch_8.pt`
 - `v5_edge_2026-11-19/checkpoints/edge_vae_epoch_2.pt` ← historical best (pre-gap-fix)
 - `current_2026-11-19/randi/vae_epoch_20.pt` ← current-code Randi control
-- `current_2026-11-19/toyo/vae_epoch_20.pt` ← current-code Toyoshima control
+- `current_2026-11-19/toyo/vae_epoch_20.pt` ← pre-fix Toyoshima control
+- `route_ab_2026-11-19/toyo_v2/vae_epoch_20.pt` ← corrected Toyoshima loader
+- `route_ab_2026-11-19/randi_base/vae_epoch_20.pt` ← causal v3 baseline
+- `route_ab_2026-11-19/randi_shuffle/vae_epoch_20.pt` ← connectome-shuffle control
 
 ### 4.3 Code and tests
 
@@ -390,7 +407,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
-- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`.
+- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
@@ -418,7 +435,8 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 4. Per-edge release residuals (v5 e2) push hop1_R² to 0.0736, but must be early-stopped at 2 epochs; further training degrades the result.
 5. The current bottleneck is **1-hop amplitude (~0.26×) and peak-time/phase errors in some neurons**, not another saturation wall.
 6. Under the current symmetric-gap code, a fresh Randi 20-epoch model gives `post_inlier_R²=0.1007` and `hop1_R²=0.0676`; this is weaker than the historical v5 warm-start result. The gap fix itself costs about 5–6% on these metrics in the adapter comparison, and the rest is training-protocol difference.
-7. The current model does **not** learn the Toyoshima NaCl data (`post_inlier_R²=0.0165`, `hop1_R²=0.0171`, stimulated mean 0.038 vs 0.174). The next Toyoshima step must be data/preprocessing and stimulus-input validation, not more epochs or parameter tuning.
+7. Toyoshima after the route-B loader rewrite is still weak (`post_inlier_R²=0.0236`, `hop1_R²=0.0356`, `unconn_r=0.141`), although polarity is directionally correct and `stim_r` rises to 0.286. It is not cross-dataset generalization.
+8. The route-A connectome shuffle does not degrade post-stim or 1-hop metrics (`post_inlier_R² 0.0891→0.0889`, `hop1_r 0.260→0.258`, `hop1_R² 0.0451→0.0547`), while stimulus correlation drops (`stim_r 0.402→0.249`). The observed 1-hop signal is therefore not established as topology-specific; it must not be interpreted as connectome propagation without a multi-seed permutation test.
 
 ### Recommended next round
 
