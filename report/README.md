@@ -1,7 +1,7 @@
 # C. elegans Whole-Brain GCaMP Modeling Report
 
 > **Status**: research generative model, not a sign-off model.  
-> **Code**: `glowing-journey`, base `e26d99c`; `39201be` added the per-neuron/per-edge features and this report; this commit adds the Toyoshima NaCl loader and test-evaluation guard.  
+> **Code**: `glowing-journey`, base `e26d99c`; `39201be` added the per-neuron/per-edge features; `69dabff` added the current-code re-observation. P1/P2 audit fixes are in the latest commit.  
 > **Result sources**: `/Users/yanlu/Documents/glowing-journey_runs/{ab,v3,v4,v5}_2026-11-19/`.  
 > **Last compiled**: 2026-11-19.
 
@@ -194,7 +194,7 @@ Local source: `/Users/yanlu/Google Drive/マイドライブ/cleandata_smoothened
 
 NaCl switching is a sensory perturbation, not a targeted optogenetic input. The loader therefore uses an explicit operational target set, defaulting to the chemosensory classes **ASH/AWC/ASE**, expanded to canonical `ASHL/ASHR/AWCL/AWCR/ASEL/ASER`. This is a modeling assumption, not a measured activation map. A one-recording smoke test (sample 1, `180710a`) produced 47 trials from 48 onsets with 78 mapped neurons and a 0.26 observation mask.
 
-`report/data/toyoshima_manifest.json` records these counts. The dataset is not yet benchmarked; importing it does not change the Randi results above.
+`report/data/toyoshima_manifest.json` records these counts. The dataset was benchmarked under the current protocol in §3.10; it is a **negative loader/protocol result**, and the loader still needs the P0 polarity/duration and z-score-scale repair before it can support a biological conclusion.
 
 ---
 
@@ -296,7 +296,7 @@ Warm-started from `v4_opt2_e8`, adding zero-initialized per-edge residuals on to
 4. **Edge-only continuation degrades**: after v5 e2, hop1_R² drops from 0.0736 to 0.0575–0.0581; do not continue edge-only.
 5. **Amplitude remains low**: v5 hop1 amp 0.261; target is 1.0.
 6. **Phase is not closed**: `ASHR` and others still show >5 s peak-time errors.
-7. **Model positioning**: research model, not sign-off; do not generate formal Liberty or use it for tape-out sign-off.
+7. **Model positioning**: research model, not sign-off.
 
 ### 3.9 Parameter audit
 
@@ -339,7 +339,9 @@ The symmetric adapter lowers `post_inlier_R²` from 0.1219 to 0.1145 (−6.1%) a
 | current 20-epoch symmetric | **0.0165** | 0.9128 | 0.129 | 0.192 | 0.135 | 0.0171 | 0.144 | 0.112 |
 | zero baseline | 0.0000 | 0.9526 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
 
-Toyoshima has 21 recordings, 585 NaCl-onset trials, 16 train / 3 validation / 5 test recordings. The current model explains 1.6% of post-stim variance, improves post-stim RMSE over zero only from 0.953 to 0.913, and predicts stimulated mean 0.038 versus true 0.174. All strata, including unconnected neurons, have similar correlations (0.11–0.19), so the model is fitting a weak global/mean component rather than a connectome-specific NaCl response. This is **not** evidence of cross-dataset generalization.
+Toyoshima has 21 recordings and 585 NaCl-onset trials: 16 training recordings (13 core + 3 validation) and 5 test recordings. The current model explains 1.6% of post-stim variance, improves post-stim RMSE over zero only from 0.953 to 0.913, and predicts stimulated mean 0.038 versus true 0.174. All strata, including unconnected neurons, have similar correlations (0.11–0.19), so the model is fitting a weak global/mean component rather than a connectome-specific NaCl response. This is **not** evidence of cross-dataset generalization.
+
+**P0 loader caveat:** the current Toyoshima loader treats every 50↔25 mM transition as an identical 0.5 s +1 pulse, although the original protocol alternates 30 s 50→25 and 25→50 mM steps with opposite ON/OFF responses. It also feeds z-scored ratio columns into a model/encoder calibrated for Randi ΔF/F0. Therefore the low score above is **not a clean biological negative**; the loader polarity/duration and observation-scale mapping must be repaired (route B) before interpreting NaCl response learning.
 
 ### 3.11 Statistical and causal caveats (review findings)
 
@@ -349,7 +351,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 2. **`--val-fraction=0` previously made `val_ds = test_ds`.** The training script now avoids this: with `val_fraction=0`, `val_ds=None`; test is evaluated only at the final save by default (`--eval-test-each-save` opt-in). The historical v3/v4/v5 runs predate this guard.
 3. **Preprocessing causality is now opt-in, not retrospective.** `preprocess_gcamp_recording(..., causal=True)` uses past-only Hampel/baseline/normalization and has a pre-stim invariance test. The historical v3/v4/v5 results used the old bidirectional/whole-recording path (`--causal-preprocess` is off by default for backward compatibility), so the old results must not be described as strictly causal forecasting.
 4. **The guide still uses a batch-mean global posterior.** `Encoder.forward` averages trials in a minibatch to produce global connectome/neuron posterior loc/scale, then an EMA is used at inference. This is an engineering approximation to `p(θ | Y_train)`, not a hierarchical global/local variational posterior. A proper worm-level latent hierarchy remains future work.
-5. **Gap-junction symmetry is fixed in the current code.** Electrical pairs are deduplicated, and `GeneralSynapse` symmetrizes its conductance matrix; a KCL/current-conservation test is included. Historical v3/v4/v5 results predate this fix and used directed currents; they should not be used to compare gap-junction topology effects. The symmetric adapter in §3.10 is a post-hoc evaluation of the old v5 weights, not a retrain; the current 20-epoch model is a from-scratch control.
+5. **Gap-junction symmetry is fixed in the current code.** Electrical pairs are deduplicated, electrical self-loops are filtered, and `GeneralSynapse` symmetrizes its conductance matrix; a KCL/current-conservation test is included. Historical v3/v4/v5 results predate this fix and used directed currents; they should not be used to compare gap-junction topology effects. The symmetric adapter in §3.10 is a post-hoc evaluation of the old v5 weights, not a retrain; the current 20-epoch model is a from-scratch control.
 6. **The optogenetic actuator is now optional.** `--stim-actuator` adds a first-order rise/decay state; `--per-neuron-stim-gain` adds constrained per-target gain. The historical results still use the original instantaneous `stim_gain × binary pulse`, so the old latency analysis remains phenomenological.
 7. **Global parameter identifiability is not established.** Strong synaptic conductance, high stimulus gain, and a low calcium threshold can compensate. A 3-neuron/1-edge synthetic probe (`report/data/identifiability_probe.json`) recovered `g_max=0.010` vs true `0.050`, `tau_ca=5.10 s` vs `7.0 s`, and `k_off=0.0399 s^-1` vs `0.045`, while `v_th_ca` stayed near the prior median. This is direct evidence for compensation; synthetic recovery, posterior calibration, and connectome-ablation/shuffle controls are required before treating individual parameters as identified.
 8. **Toyoshima is a negative current-protocol result, not a success.** The 20-epoch model reaches `post_inlier_R² = 0.0165` and `hop1_R² = 0.0171`; the stimulated prediction mean is 0.038 versus 0.174 true. Do not use this run as evidence for NaCl response generalization; the loader's ASH/AWC/ASE target mapping and the 2 Hz resampling/trial extraction are operational assumptions that need validation.
@@ -384,9 +386,10 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest tests` → **33 passed**.
+- Regression tests: `pytest tests` → **36 passed**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
+- P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
 - Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.

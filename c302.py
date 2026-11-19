@@ -1004,6 +1004,28 @@ class RNNematode(PyroModule):
         return out
 
 
+def _advance_stim_actuator(
+    stim_act: torch.Tensor,
+    ext_t: torch.Tensor,
+    dt_sim: float,
+    tau_rise: float,
+    tau_decay: float,
+) -> torch.Tensor:
+    """Exact first-order rise/decay update for the optogenetic actuator.
+
+    The input is held constant over one simulation substep.  Comparing the
+    current state with the target avoids overshoot even when ``dt_sim``
+    exceeds the rise time, and keeps negative (inhibitory) commands instead of
+    clamping them to zero.  For a positive step from zero this is
+    ``1 - exp(-dt_sim / tau_rise)``; for a decay toward zero it is
+    ``stim_act * exp(-dt_sim / tau_decay)``.
+    """
+    tau_rise_t = torch.as_tensor(max(float(tau_rise), 1e-6), dtype=stim_act.dtype, device=stim_act.device)
+    tau_decay_t = torch.as_tensor(max(float(tau_decay), 1e-6), dtype=stim_act.dtype, device=stim_act.device)
+    tau = torch.where(ext_t > stim_act, tau_rise_t, tau_decay_t)
+    return ext_t + (stim_act - ext_t) * torch.exp(-float(dt_sim) / tau)
+
+
 class RecurrentNematode(PyroModule):
     """Multi-step biophysical connectome ODE + Ca2+ + GCaMP generative model for Pyro SVI/MCMC."""
 
@@ -1133,14 +1155,12 @@ class RecurrentNematode(PyroModule):
                     bg_cur = prestim_state[2] * torch.exp(-t_rel_sim / prestim_state[5])
                 if self.stim_actuator:
                     # First-order rise/decay actuator; the command is not applied
-                    # instantaneously to the membrane.
-                    rise = ext_t > 0
-                    stim_act = torch.where(
-                        rise,
-                        stim_act + dt_sim * (ext_t - stim_act) / self.stim_tau_rise,
-                        stim_act - dt_sim * stim_act / self.stim_tau_decay,
+                    # instantaneously to the membrane.  Use the exact exponential
+                    # update so dt_sim > tau_rise cannot overshoot, and preserve
+                    # negative commands.
+                    stim_act = _advance_stim_actuator(
+                        stim_act, ext_t, dt_sim, self.stim_tau_rise, self.stim_tau_decay
                     )
-                    stim_act = torch.clamp(stim_act, min=0.0)
                     ext_eff = stim_act
                 else:
                     ext_eff = ext_t
@@ -1404,6 +1424,10 @@ def readConnectome(
         weight = float(row["Weight"])
 
         if edge_type == "electrical":
+            # A self-loop contributes no electrical current (V_i - V_i == 0)
+            # and would be doubled by the symmetric W + W.T assembly.
+            if src_idx == dst_idx:
+                continue
             pair = (min(src_idx, dst_idx), max(src_idx, dst_idx))
             gap_pairs[pair] = max(gap_pairs.get(pair, 0.0), weight)
         elif edge_type == "chemical":

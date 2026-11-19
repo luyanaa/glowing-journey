@@ -62,6 +62,8 @@ def _causal_preprocess_gcamp(
     baseline_quantile: float,
     norm_mode: str,
     min_f0: float,
+    min_f0_snr: float,
+    drop_invalid_f0: bool,
     smooth_window: Optional[int],
     clip_abs: Optional[float],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -109,13 +111,36 @@ def _causal_preprocess_gcamp(
                 win += 1
             delta_f = pd.Series(delta_f).rolling(win, min_periods=1).mean().to_numpy()
 
+        # Noise/F0 validity must not depend on the later recording.  Use the
+        # first ~5 s only; the full baseline window may be the whole recording
+        # for short sessions, which would reintroduce future leakage.
+        noise_win = max(5, int(round(5.0 / max(dt, 1e-3))))
+        first_n = min(n_t, noise_win)
+        sigma_hf = (
+            float(_estimate_hf_sigma(despiked[:first_n, None])[0])
+            if first_n >= 2
+            else 1.0
+        )
         if norm_mode in ("dff_safe", "dff_strict"):
             scale_t = pd.Series(baseline).rolling(base_win, min_periods=1).median().to_numpy()
             scale_t = np.maximum(scale_t, min_f0)
+            f0 = float(np.median(baseline[:first_n]))
+            f0_ok = f0 > max(float(min_f0), float(min_f0_snr) * sigma_hf)
+            if (norm_mode == "dff_strict" or drop_invalid_f0) and not f0_ok:
+                # Invalid baseline: keep the column masked instead of
+                # silently normalizing by an unstable F0.
+                valid_mask[:, col_idx] = False
+                continue
         elif norm_mode == "robust_z":
-            diff = pd.Series(despiked).diff().abs()
-            scale_t = diff.rolling(base_win, min_periods=1).std().fillna(1.0).to_numpy()
-            scale_t = np.maximum(scale_t, 1e-6)
+            # Robust scale from the causal delta_f distribution, not from the
+            # absolute first difference (which is spike-sensitive).
+            delta_series = pd.Series(delta_f)
+            delta_med = delta_series.rolling(base_win, min_periods=1).median()
+            delta_mad = (delta_series - delta_med).abs().rolling(base_win, min_periods=1).median()
+            scale_t = np.maximum(1.4826 * delta_mad.to_numpy(), 1e-6)
+            if sigma_hf <= 1e-6:
+                valid_mask[:, col_idx] = False
+                continue
         else:
             raise ValueError(f"Unknown norm_mode={norm_mode!r}")
 
@@ -126,8 +151,12 @@ def _causal_preprocess_gcamp(
         out[~mask_col] = 0.0
         normalized[:, col_idx] = out
         valid_mask[:, col_idx] = mask_col
-        hf = np.diff(despiked)
-        noise_scale[col_idx] = float(np.clip(np.std(hf) / max(scale_t[-1], 1e-6), 0.01, 5.0))
+        # Estimate noise from the first causal baseline window, never from the
+        # full recording or from scale_t[-1] (both would use future frames).
+        scale_ref = float(np.median(scale_t[:first_n]))
+        noise_scale[col_idx] = float(
+            np.clip(sigma_hf / max(scale_ref, 1e-6), 0.01, 5.0)
+        )
 
     return normalized.astype(np.float32), valid_mask, noise_scale.astype(np.float32)
 
@@ -206,6 +235,8 @@ def preprocess_gcamp_recording(
             baseline_quantile,
             norm_mode,
             min_f0,
+            min_f0_snr,
+            drop_invalid_f0,
             smooth_window,
             clip_abs,
         )

@@ -894,6 +894,44 @@ def test_per_neuron_kinetics_shapes_and_warm_start_expansion():
         vm.guide.k_off_loc,
         torch.full((3,), float(state["guide.k_off_loc_unconstrained"])),
     )
+    for prefix in ("tau_ca", "k_off"):
+        raw = getattr(vm.guide, f"{prefix}_scale_unconstrained")
+        assert torch.allclose(
+            raw,
+            torch.full((3,), float(state[f"guide.{prefix}_scale_unconstrained"])),
+        )
+        # The constrained view must reflect the raw write, not remain at the
+        # previous ExpTransform value.
+        assert torch.allclose(
+            getattr(vm.guide, f"{prefix}_scale"),
+            torch.exp(raw),
+        )
+
+
+def test_electrical_self_loops_are_filtered():
+    pyro.clear_param_store()
+    step = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    gap = step.synapse.general
+    assert gap.inputSize > 0
+    assert not torch.any(gap.synapseInput == gap.synapseOutput)
+
+
+def test_stim_actuator_exact_exponential_and_signed():
+    act = torch.zeros(3)
+    ext = torch.ones(3)
+    out = c302._advance_stim_actuator(act, ext, dt_sim=0.1, tau_rise=0.08, tau_decay=0.4)
+    expected = 1.0 - torch.exp(torch.tensor(-0.1 / 0.08))
+    assert torch.all(out < 1.0)
+    assert torch.allclose(out, torch.full((3,), float(expected)), atol=1e-6)
+
+    # A negative command must not be clamped away.
+    neg = c302._advance_stim_actuator(torch.zeros(3), -torch.ones(3), 0.1, 0.08, 0.4)
+    assert torch.all(neg < 0.0)
+
+    # Decay to zero is the exact exponential, not an Euler step.
+    decay = c302._advance_stim_actuator(torch.ones(3), torch.zeros(3), 0.1, 0.08, 0.4)
+    expected_decay = torch.exp(torch.tensor(-0.1 / 0.4))
+    assert torch.allclose(decay, torch.full((3,), float(expected_decay)), atol=1e-6)
 
 
 def test_per_edge_release_sites_and_forward():
@@ -981,13 +1019,35 @@ def test_gap_junction_symmetric_current_conservation():
 
 def test_causal_preprocessing_prestim_invariance():
     rng = np.random.default_rng(2)
-    raw = rng.normal(size=(120, 4)).astype(np.float32)
+    # A positive baseline is required for dff_safe; the default
+    # drop_invalid_f0=True must mask columns whose F0 is not usable.
+    raw = (2.0 + rng.normal(scale=0.05, size=(120, 4))).astype(np.float32)
     altered = raw.copy()
-    altered[60:] = rng.normal(loc=4.0, scale=2.0, size=(60, 4)).astype(np.float32)
-    n1, m1, _ = preprocess_gcamp_recording(raw, causal=True)
-    n2, m2, _ = preprocess_gcamp_recording(altered, causal=True)
+    altered[60:] = (4.0 + 2.0 * rng.normal(size=(60, 4))).astype(np.float32)
+    n1, m1, q1 = preprocess_gcamp_recording(raw, causal=True)
+    n2, m2, q2 = preprocess_gcamp_recording(altered, causal=True)
     assert np.allclose(n1[:60], n2[:60], atol=1e-6)
     assert np.array_equal(m1[:60], m2[:60])
+    # Noise is estimated from the first causal window, so changing post-stim
+    # frames must not change it.
+    assert np.allclose(q1, q2, atol=1e-7)
+
+
+def test_causal_preprocessing_drops_invalid_f0_and_uses_past_noise():
+    rng = np.random.default_rng(3)
+    raw = np.empty((120, 2), dtype=np.float32)
+    raw[:, 0] = 2.0 + rng.normal(scale=0.01, size=120)
+    raw[:, 1] = 0.1 + rng.normal(scale=0.01, size=120)
+    norm, valid, _ = preprocess_gcamp_recording(
+        raw, causal=True, norm_mode="dff_strict", drop_invalid_f0=True
+    )
+    assert valid[:, 1].sum() == 0
+    assert valid[:, 0].any()
+    assert np.allclose(norm[:, 1], 0.0)
+    # robust_z must be finite and not use the absolute-difference scale path.
+    norm_z, valid_z, _ = preprocess_gcamp_recording(raw, causal=True, norm_mode="robust_z")
+    assert np.isfinite(norm_z).all()
+    assert valid_z[:, 0].any()
 
 
 def test_per_neuron_stim_gain_sites_and_stim_actuator():

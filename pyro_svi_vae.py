@@ -79,14 +79,17 @@ def _load_compatible_state_dict(module, state):
 def _expand_scalar_kinetics(module, state):
     """Initialize per-neuron tau_ca/k_off loc+scale from a scalar v3 checkpoint."""
     pairs = [
-        ("guide.tau_ca_loc_unconstrained", "tau_ca_loc"),
-        ("guide.tau_ca_scale_unconstrained", "tau_ca_scale"),
-        ("guide.k_off_loc_unconstrained", "k_off_loc"),
-        ("guide.k_off_scale_unconstrained", "k_off_scale"),
+        ("guide.tau_ca_loc_unconstrained", "tau_ca_loc_unconstrained"),
+        ("guide.tau_ca_scale_unconstrained", "tau_ca_scale_unconstrained"),
+        ("guide.k_off_loc_unconstrained", "k_off_loc_unconstrained"),
+        ("guide.k_off_scale_unconstrained", "k_off_scale_unconstrained"),
     ]
     expanded = []
     for key, attr in pairs:
         if key in state and state[key].numel() == 1:
+            # Write the *unconstrained* PyroParam. Accessing ``guide.tau_ca_scale``
+            # returns the constrained tensor from ExpTransform; filling that
+            # temporary silently leaves the trainable parameter unchanged.
             target = getattr(module.guide, attr)
             with torch.no_grad():
                 target.fill_(float(state[key].detach().cpu()))
