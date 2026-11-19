@@ -1,0 +1,19 @@
+{
+  "protocol": "3 neurons, 1 Wicks chemical edge, 4 trials x 20 frames, no pre-stim encoder; true parameters fixed in simulation, 300 SVI steps, AutoDiagonalNormal.",
+  "true": {
+    "wicks_g_max": 0.05,
+    "gcamp_tau_ca_s": 7.0,
+    "gcamp_v_th_ca_logit": -0.22314368188381195,
+    "gcamp_k_off_s-1": 0.045,
+    "neuron_G_mean": 0.5
+  },
+  "recovered_median": {
+    "wicks_g_max": 0.009969204664230347,
+    "gcamp_tau_ca_s": 5.103347301483154,
+    "gcamp_v_th_ca_logit": -0.05008329078555107,
+    "gcamp_k_off_s-1": 0.039925508201122284,
+    "neuron_G_mean": 0.4615847466786703
+  },
+  "svi_seconds": 13.0,
+  "conclusion": "Even in a tiny identifiable-in-principle model, SVI does not recover the true conductance/kinetics combination: g_max is 5x low, tau_ca 27% low, k_off 11% low, while V_th is near the prior median. This is direct evidence for compensation/identifiability problems and a reason to add hierarchical/structured priors rather than interpreting individual fitted parameters."
+}
