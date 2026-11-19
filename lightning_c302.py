@@ -12,9 +12,9 @@ from torch.utils.data import DataLoader, Subset
 from torchinfo import summary
 
 import c302
-from pyro_svi_c302 import DEFAULT_DATA_PATH, _TupleDataset
+from pyro_svi_c302 import DEFAULT_DATA_PATH, _TupleDataset, init_to_prior_median
 from soft_dtw_cuda import SoftDTW
-from utils import AtlasLoader, responseGenerator
+from utils import AtlasLoader, RandiTrialDataset, responseGenerator, split_trial_dataset
 
 
 def _save_snapshot(snapshot_path, model, epoch):
@@ -30,12 +30,13 @@ def _save_snapshot(snapshot_path, model, epoch):
 class PyroLightningModule(pl.LightningModule):
     """PyTorch Lightning wrapper driving Pyro ELBO optimization on GCaMP trials."""
 
-    def __init__(self, loss_fn: pyro.infer.elbo.ELBOModule, lr: float):
+    def __init__(self, loss_fn: pyro.infer.elbo.ELBOModule, lr: float, dataset_size: int = None):
         super().__init__()
         self.loss_fn = loss_fn
         self.model = loss_fn.model
         self.guide = loss_fn.guide
         self.lr = lr
+        self.dataset_size = dataset_size
         self.predictive = pyro.infer.Predictive(
             self.model, guide=self.guide, num_samples=1, return_sites=("_RETURN",)
         )
@@ -46,9 +47,14 @@ class PyroLightningModule(pl.LightningModule):
 
     def _shared_step(self, batch, stage: str):
         stim, y, mask, noise = batch
-        loss = self.loss_fn(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+        ds_size = self.dataset_size if stage == "train" else None
+        loss = self.loss_fn(
+            ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=ds_size
+        )
         with torch.no_grad():
-            y_hat = self.model(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
+            y_hat = self.predictive(
+                ExternalInput=stim, mask=None, y=None, noise_scale=noise
+            )["_RETURN"].mean(dim=0)
             masked_hat = y_hat * mask.float()
             masked_y = y * mask.float()
             acc = self.acc(masked_hat, masked_y).mean()
@@ -89,12 +95,16 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", "--batch-size", default=16, type=int)
     parser.add_argument("--source", choices=["randi", "synthetic"], default="randi")
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH, type=str)
+    parser.add_argument("--dataset-cache", default=None, type=str)
     parser.add_argument("--strain", default="wild-type", type=str)
     parser.add_argument("--norm-mode", choices=["dff_safe", "dff_strict", "robust_z"], default="dff_safe")
     parser.add_argument("--max-recordings", default=None, type=int)
     parser.add_argument("--learning_rate", default=5e-3, type=float)
     parser.add_argument("--substeps", default=4, type=int)
     parser.add_argument("--dt-obs", default=0.5, type=float)
+    parser.add_argument("--use-bnn", action="store_true")
+    parser.add_argument("--use-extrasynaptic", action="store_true")
+    parser.add_argument("--trial-split", action="store_true")
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--accelerator", default="auto")
     parser.add_argument("--strategy", default="auto")
@@ -105,14 +115,23 @@ if __name__ == "__main__":
     pyro.clear_param_store()
 
     if args.source == "randi":
-        dataset = AtlasLoader(
-            path=args.data_path,
-            strain=args.strain,
-            norm_mode=args.norm_mode,
-            max_recordings=args.max_recordings,
-        ).build_trial_dataset()
-        idx = list(range(len(dataset)))
-        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=args.seed)
+        if args.dataset_cache and os.path.isfile(args.dataset_cache):
+            dataset = RandiTrialDataset.load(args.dataset_cache)
+        else:
+            dataset = AtlasLoader(
+                path=args.data_path,
+                strain=args.strain,
+                norm_mode=args.norm_mode,
+                max_recordings=args.max_recordings,
+            ).build_trial_dataset()
+            if args.dataset_cache:
+                dataset.save(args.dataset_cache)
+        train_idx, test_idx, _ = split_trial_dataset(
+            dataset,
+            test_size=0.1,
+            random_state=args.seed,
+            group_by_recording=not args.trial_split,
+        )
         train_ds = Subset(dataset, train_idx)
         test_ds = Subset(dataset, test_idx)
     else:
@@ -140,16 +159,22 @@ if __name__ == "__main__":
         shuffle=False,
     )
 
-    step_model = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    step_model = c302.readConnectome(
+        "./data/CElegansNeuronTables.xls",
+        use_extrasynaptic=args.use_extrasynaptic,
+        use_bnn_residual=args.use_bnn,
+    )
     model = c302.RecurrentNematode(step_model, dt_obs=args.dt_obs, substeps=args.substeps)
     summary(model)
-    guide = AutoDiagonalNormal(model, init_scale=0.02)
+    guide = AutoDiagonalNormal(model, init_loc_fn=init_to_prior_median, init_scale=0.02)
     loss_fn = Trace_ELBO()(model, guide)
-    training_plan = PyroLightningModule(loss_fn, args.learning_rate)
+    training_plan = PyroLightningModule(loss_fn, args.learning_rate, dataset_size=len(train_ds))
 
     # Materialize Pyro guide parameters before Trainer starts
     stim_b, y_b, mask_b, noise_b = next(iter(train_data))
-    loss_fn(ExternalInput=stim_b, mask=mask_b, y=y_b, noise_scale=noise_b)
+    loss_fn(
+        ExternalInput=stim_b, mask=mask_b, y=y_b, noise_scale=noise_b, dataset_size=len(train_ds)
+    )
 
     trainer = pl.Trainer(
         accelerator=args.accelerator,

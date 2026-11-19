@@ -65,7 +65,7 @@ def preprocess_gcamp_recording(
     smooth_window: Optional[int] = None,
     smooth_polyorder: int = 2,
     min_finite_frac: float = 0.5,
-    clip_abs: Optional[float] = 20.0,
+    clip_abs: Optional[float] = 10.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Despike, detrend, and normalize a raw GCaMP recording matrix (T, N).
 
@@ -603,6 +603,9 @@ class AtlasLoader(Dataset):
         stim_duration_s: float = 0.5,
         min_observed_neurons: int = 5,
         rebaseline_on_pre: bool = True,
+        max_pre_abs: float = 5.0,
+        max_pre_dev: Optional[float] = 2.0,
+        trial_clip_abs: Optional[float] = 10.0,
     ) -> RandiTrialDataset:
         """Slice aligned (T_trial, 300) optogenetic perturbation trials."""
         trial_len = pre_vols + post_vols
@@ -652,11 +655,26 @@ class AtlasLoader(Dataset):
                 if rebaseline_on_pre and pre_vols >= 3:
                     # Subtract per-trial pre-stimulus median on observed neurons to
                     # remove residual slow trial-to-trial offset before stimulation.
+                    # Reject neurons whose pre-stimulus median itself is an extreme artifact
+                    # and re-clip after subtraction so outliers cannot double to +/- 2*clip_abs.
                     for c in np.where(np.any(m_seg[:pre_vols], axis=0))[0]:
                         pre_valid = y_seg[:pre_vols, c][m_seg[:pre_vols, c]]
                         if pre_valid.size >= 3:
-                            y_seg[:, c] -= np.median(pre_valid)
+                            pre_med = float(np.median(pre_valid))
+                            pre_max_dev = float(np.max(np.abs(pre_valid - pre_med)))
+                            if abs(pre_med) > max_pre_abs or (
+                                max_pre_dev is not None and pre_max_dev > max_pre_dev
+                            ):
+                                m_seg[:, c] = False
+                                y_seg[:, c] = 0.0
+                                continue
+                            y_seg[:, c] -= pre_med
+                            if trial_clip_abs is not None:
+                                y_seg[:, c] = np.clip(y_seg[:, c], -trial_clip_abs, trial_clip_abs)
                             y_seg[~m_seg[:, c], c] = 0.0
+
+                if int(np.sum(np.any(m_seg, axis=0))) < min_observed_neurons:
+                    continue
 
                 stim_list.append(torch.from_numpy(stim_seg))
                 y_list.append(torch.from_numpy(y_seg))
@@ -697,3 +715,97 @@ class WormTensor(AtlasLoader):
 
     def __init__(self, path: str, device: str = "cpu", **kwargs):
         super().__init__(path=path, strain="wild-type", device=device, **kwargs)
+
+
+def resolve_default_data_path() -> str:
+    """Resolve Randi exported_data directory via env var or standard local/Colab fallbacks."""
+    env_path = os.environ.get("RANDI_DATA_DIR")
+    if env_path:
+        return env_path
+    candidates = [
+        "/content/drive/MyDrive/exported_data",
+        "./data/exported_data",
+        "/Users/yanlu/Google Drive/マイドライブ/exported_data",
+    ]
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return cand
+    return "./data/exported_data"
+
+
+def split_trial_dataset(
+    dataset: RandiTrialDataset,
+    test_size: float = 0.1,
+    random_state: int = 42,
+    group_by_recording: bool = True,
+    max_trials: Optional[int] = None,
+) -> Tuple[List[int], List[int], Dict[str, int]]:
+    """Split trials into train/test subsets grouped by recording ID to avoid worm leakage."""
+    from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+    n_total = len(dataset) if max_trials is None else min(len(dataset), int(max_trials))
+    indices = np.arange(n_total)
+    groups = np.array([int(dataset.meta[i]["rec_id"]) for i in range(n_total)], dtype=np.int64)
+    unique_recs = np.unique(groups)
+
+    if group_by_recording and len(unique_recs) >= 2:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+        tr_pos, te_pos = next(splitter.split(indices, groups=groups))
+        train_idx = indices[tr_pos].tolist()
+        test_idx = indices[te_pos].tolist()
+        info = {
+            "grouped": 1,
+            "train_recordings": int(len(np.unique(groups[tr_pos]))),
+            "test_recordings": int(len(np.unique(groups[te_pos]))),
+        }
+        return train_idx, test_idx, info
+
+    train_idx, test_idx = train_test_split(
+        indices.tolist(), test_size=test_size, random_state=random_state
+    )
+    info = {
+        "grouped": 0,
+        "train_recordings": int(len(unique_recs)),
+        "test_recordings": int(len(unique_recs)),
+    }
+    return train_idx, test_idx, info
+
+def split_train_validation_indices(
+    dataset: RandiTrialDataset,
+    train_idx: Sequence[int],
+    val_size: float = 0.15,
+    random_state: int = 42,
+    group_by_recording: bool = True,
+) -> Tuple[List[int], List[int], Dict[str, int]]:
+    """Split an existing train index list into train-core/validation by recording.
+
+    Validation trials are removed from training, so validation metrics are not
+    in-sample.  Recording-level grouping prevents same-worm leakage.
+    """
+    from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+    indices = np.asarray(list(train_idx), dtype=np.int64)
+    if len(indices) == 0:
+        return [], [], {"val_recordings": 0, "train_recordings": 0}
+    groups = np.array([int(dataset.meta[int(i)]["rec_id"]) for i in indices], dtype=np.int64)
+    unique_recs = np.unique(groups)
+
+    if group_by_recording and len(unique_recs) >= 2 and 0.0 < val_size < 1.0:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
+        tr_pos, va_pos = next(splitter.split(indices, groups=groups))
+        core = indices[tr_pos].tolist()
+        val = indices[va_pos].tolist()
+        info = {
+            "train_recordings": int(len(np.unique(groups[tr_pos]))),
+            "val_recordings": int(len(np.unique(groups[va_pos]))),
+        }
+        return core, val, info
+
+    core, val = train_test_split(
+        indices.tolist(), test_size=val_size, random_state=random_state
+    )
+    info = {
+        "train_recordings": int(len(unique_recs)),
+        "val_recordings": int(len(unique_recs)),
+    }
+    return core, val, info

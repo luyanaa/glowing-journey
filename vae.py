@@ -52,25 +52,28 @@ class TCN(PyroModule):
 class Encoder(PyroModule):
     """Amortized TCN encoder producing variational loc/scale for connectome parameters."""
 
-    def __init__(self, neuron_dim: int, wicks_dim: int, gap_dim: int):
+    def __init__(
+        self,
+        neuron_dim: int,
+        wicks_dim: int,
+        gap_dim: int,
+        e_rev_prior: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
 
-        # Amortized posterior EMA for open-loop evaluation when y is withheld (y=None)
-        self.register_buffer("_has_amortized_post", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer("_ema_neuron_loc", torch.zeros(3, self.neuron_dim))
-        self.register_buffer("_ema_neuron_scale", torch.ones(3, self.neuron_dim))
-        self.register_buffer("_ema_wicks_loc", torch.zeros(4, self.wicks_dim))
-        self.register_buffer("_ema_wicks_scale", torch.ones(4, self.wicks_dim))
-        self.register_buffer("_ema_gap_loc", torch.zeros(self.gap_dim))
-        self.register_buffer("_ema_gap_scale", torch.ones(self.gap_dim))
+        if e_rev_prior is not None and self.wicks_dim > 0:
+            e_prior = torch.as_tensor(e_rev_prior, dtype=torch.float32).detach().clone().reshape(self.wicks_dim)
+        else:
+            e_prior = torch.full((self.wicks_dim,), -0.025, dtype=torch.float32)
+        self.register_buffer("e_rev_prior", e_prior)
 
-        # Neuron params: E (Normal), log G, log C (LogNormal) -> 3 loc + 3 scale
-        self.neuron = TCN(input_size=self.neuron_dim, output_size=self.neuron_dim * 6)
-        # Chemical synapse params: log g_max, V_rest, log V_slope, E_rev -> 4 loc + 4 scale
-        self.wick = TCN(input_size=self.neuron_dim, output_size=max(1, self.wicks_dim) * 8)
+        # Neuron + presynaptic release params: E, log G, log C, wicks.V_rest, log wicks.V_slope -> 5 loc + 5 scale
+        self.neuron = TCN(input_size=self.neuron_dim, output_size=self.neuron_dim * 10)
+        # Edge-wise chemical synapse params: log g_max, E_rev -> 2 loc + 2 scale
+        self.wick = TCN(input_size=self.neuron_dim, output_size=max(1, self.wicks_dim) * 4)
         # Gap junction params: log g_syn -> 1 loc + 1 scale
         self.gap = TCN(input_size=self.neuron_dim, output_size=max(1, self.gap_dim) * 2)
 
@@ -88,52 +91,55 @@ class Encoder(PyroModule):
             x = x.unsqueeze(0)
 
         # Pool across batch so global connectome variational parameters match (D,) shapes
-        neuron_raw = self.neuron(x).mean(dim=0).view(6, self.neuron_dim)
+        neuron_raw = self.neuron(x).mean(dim=0).view(10, self.neuron_dim)
         neuron_loc = torch.stack(
             [
                 -0.065 + 0.02 * torch.tanh(neuron_raw[0]),
-                math.log(0.5) + 0.5 * torch.tanh(neuron_raw[1]),
-                math.log(0.05) + 0.5 * torch.tanh(neuron_raw[2]),
+                math.log(0.5) + 0.8 * torch.tanh(neuron_raw[1]),
+                math.log(0.05) + 0.8 * torch.tanh(neuron_raw[2]),
+                -0.042 + 0.02 * torch.tanh(neuron_raw[3]),
+                math.log(0.015) + 0.5 * torch.tanh(neuron_raw[4]),
             ],
             dim=0,
         )
         neuron_scale = torch.stack(
             [
-                0.002 + 0.02 * torch.sigmoid(neuron_raw[3]),
-                0.02 + 0.3 * torch.sigmoid(neuron_raw[4]),
-                0.02 + 0.3 * torch.sigmoid(neuron_raw[5]),
+                0.002 + 0.02 * torch.sigmoid(neuron_raw[5]),
+                0.02 + 0.35 * torch.sigmoid(neuron_raw[6]),
+                0.02 + 0.35 * torch.sigmoid(neuron_raw[7]),
+                0.002 + 0.02 * torch.sigmoid(neuron_raw[8]),
+                0.02 + 0.25 * torch.sigmoid(neuron_raw[9]),
             ],
             dim=0,
         )
 
         if self.wicks_dim > 0:
-            wick_raw = self.wick(x).mean(dim=0).view(8, self.wicks_dim)
+            wick_raw = self.wick(x).mean(dim=0).view(4, self.wicks_dim)
             wicks_loc = torch.stack(
                 [
-                    math.log(0.01) + 0.5 * torch.tanh(wick_raw[0]),
-                    -0.042 + 0.015 * torch.tanh(wick_raw[1]),
-                    math.log(0.015) + 0.3 * torch.tanh(wick_raw[2]),
-                    -0.025 + 0.04 * torch.tanh(wick_raw[3]),
+                    # Centered on calm 0.01 nS resting prior with wide [0.0011, 0.090] nS dynamic range
+                    math.log(0.01) + 2.2 * torch.tanh(wick_raw[0]),
+                    # Centered per-edge on neurotransmitter prior (GABA -75 mV, Glu -35 mV, ACh 0 mV)
+                    self.e_rev_prior.to(device=x.device, dtype=x.dtype) + 0.045 * torch.tanh(wick_raw[1]),
                 ],
                 dim=0,
             )
             wicks_scale = torch.stack(
                 [
-                    0.02 + 0.3 * torch.sigmoid(wick_raw[4]),
-                    0.002 + 0.02 * torch.sigmoid(wick_raw[5]),
-                    0.02 + 0.2 * torch.sigmoid(wick_raw[6]),
-                    0.005 + 0.03 * torch.sigmoid(wick_raw[7]),
+                    0.02 + 0.5 * torch.sigmoid(wick_raw[2]),
+                    0.005 + 0.035 * torch.sigmoid(wick_raw[3]),
                 ],
                 dim=0,
             )
         else:
-            wicks_loc = torch.empty(4, 0, device=x.device, dtype=x.dtype)
-            wicks_scale = torch.empty(4, 0, device=x.device, dtype=x.dtype)
+            wicks_loc = torch.empty(2, 0, device=x.device, dtype=x.dtype)
+            wicks_scale = torch.empty(2, 0, device=x.device, dtype=x.dtype)
 
         if self.gap_dim > 0:
             gap_raw = self.gap(x).mean(dim=0).view(2, self.gap_dim)
-            gap_loc = math.log(0.01) + 0.5 * torch.tanh(gap_raw[0])
-            gap_scale = 0.02 + 0.3 * torch.sigmoid(gap_raw[1])
+            # Centered on 0.015 nS prior with wide [0.0017, 0.135] nS dynamic range
+            gap_loc = math.log(0.015) + 2.2 * torch.tanh(gap_raw[0])
+            gap_scale = 0.02 + 0.5 * torch.sigmoid(gap_raw[1])
         else:
             gap_loc = torch.empty(0, device=x.device, dtype=x.dtype)
             gap_scale = torch.empty(0, device=x.device, dtype=x.dtype)
@@ -141,46 +147,57 @@ class Encoder(PyroModule):
         return neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale
 
 
-class VAElegans(PyroModule):
-    """Amortized Variational Autoencoder pairing a TCN encoder with RecurrentNematode decoder."""
+class VAEGuide(PyroModule):
+    """Standalone PyroModule guide owning Encoder + global/GCaMP variational PyroParams.
 
-    def __init__(self, model: RecurrentNematode, neuron_dim: int, wicks_dim: int, gap_dim: int):
+    Keeping guide parameters isolated from VAElegans.decoder ensures SVI registers and updates
+    all Encoder weights and all 20 shared/GCaMP PyroParams cleanly without pulling decoder-side
+    modules (such as CausalPreStimEncoder) into the guide trace.
+    """
+
+    def __init__(
+        self,
+        neuron_dim: int,
+        wicks_dim: int,
+        gap_dim: int,
+        e_rev_prior: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
-        self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim)
-        self.decoder = model
+        self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim, e_rev_prior=e_rev_prior)
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
 
         # Amortized posterior EMA for open-loop evaluation when y is withheld (y=None)
         self.register_buffer("_has_amortized_post", torch.tensor(False, dtype=torch.bool))
-        self.register_buffer("_ema_neuron_loc", torch.zeros(3, self.neuron_dim))
-        self.register_buffer("_ema_neuron_scale", torch.ones(3, self.neuron_dim))
-        self.register_buffer("_ema_wicks_loc", torch.zeros(4, self.wicks_dim))
-        self.register_buffer("_ema_wicks_scale", torch.ones(4, self.wicks_dim))
+        self.register_buffer("_ema_neuron_loc", torch.zeros(5, self.neuron_dim))
+        self.register_buffer("_ema_neuron_scale", torch.ones(5, self.neuron_dim))
+        self.register_buffer("_ema_wicks_loc", torch.zeros(2, self.wicks_dim))
+        self.register_buffer("_ema_wicks_scale", torch.ones(2, self.wicks_dim))
         self.register_buffer("_ema_gap_loc", torch.zeros(self.gap_dim))
         self.register_buffer("_ema_gap_scale", torch.ones(self.gap_dim))
 
         # Variational parameters for shared/GCaMP parameters in RecurrentNematode
-        self.stim_gain_loc = PyroParam(torch.tensor(math.log(0.04)))
+        self.stim_gain_loc = PyroParam(torch.tensor(math.log(1.2)))
         self.stim_gain_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
         self.obs_sigma_loc = PyroParam(torch.tensor(math.log(0.15)))
         self.obs_sigma_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
 
-        self.v_th_ca_loc = PyroParam(torch.tensor(-0.048))
-        self.v_th_ca_scale = PyroParam(torch.tensor(0.005), constraint=constraints.positive)
-        self.v_slope_ca_loc = PyroParam(torch.tensor(math.log(0.012)))
+        # Unconstrained logit params mapped into (V_TH_CA_LOW, V_TH_CA_HIGH)
+        self.v_th_ca_loc = PyroParam(torch.tensor(-0.05))
+        self.v_th_ca_scale = PyroParam(torch.tensor(0.3), constraint=constraints.positive)
+        self.v_slope_ca_loc = PyroParam(torch.tensor(math.log(0.008)))
         self.v_slope_ca_scale = PyroParam(torch.tensor(0.15), constraint=constraints.positive)
-        self.alpha_ca_loc = PyroParam(torch.tensor(math.log(2.0)))
+        self.alpha_ca_loc = PyroParam(torch.tensor(math.log(2.5)))
         self.alpha_ca_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
-        self.tau_ca_loc = PyroParam(torch.tensor(math.log(0.6)))
+        self.tau_ca_loc = PyroParam(torch.tensor(math.log(7.0)))
         self.tau_ca_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
-        self.k_on_loc = PyroParam(torch.tensor(math.log(4.0)))
+        self.k_on_loc = PyroParam(torch.tensor(math.log(0.06)))
         self.k_on_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
-        self.k_off_loc = PyroParam(torch.tensor(math.log(1.2)))
+        self.k_off_loc = PyroParam(torch.tensor(math.log(0.045)))
         self.k_off_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
 
-        self.gcamp_gain_loc = PyroParam(torch.full((self.neuron_dim,), math.log(1.5)))
+        self.gcamp_gain_loc = PyroParam(torch.full((self.neuron_dim,), math.log(1.4)))
         self.gcamp_gain_scale = PyroParam(
             torch.full((self.neuron_dim,), 0.2), constraint=constraints.positive
         )
@@ -189,19 +206,6 @@ class VAElegans(PyroModule):
             torch.full((self.neuron_dim,), 0.02), constraint=constraints.positive
         )
 
-    def reconstruct_img(
-        self,
-        x: torch.Tensor,
-        ExternalInput: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Posterior-guided reconstruction given GCaMP trace x and optional stimulus."""
-        if ExternalInput is None:
-            ExternalInput = torch.zeros_like(x)
-        pred = pyro.infer.Predictive(
-            self.forward, guide=self.guide, num_samples=1, return_sites=("_RETURN",)
-        )(ExternalInput=ExternalInput, mask=None, y=x)
-        return pred["_RETURN"].squeeze(0)
-
     def forward(
         self,
         ExternalInput: Optional[torch.Tensor] = None,
@@ -209,24 +213,13 @@ class VAElegans(PyroModule):
         mask: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
         noise_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.decoder(
-            ExternalInput=ExternalInput,
-            VoltageClamp=VoltageClamp,
-            mask=mask,
-            y=y,
-            noise_scale=noise_scale,
-        )
-
-    def guide(
-        self,
-        ExternalInput: Optional[torch.Tensor] = None,
-        VoltageClamp: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-        y: Optional[torch.Tensor] = None,
-        noise_scale: Optional[torch.Tensor] = None,
+        dataset_size: Optional[int] = None,
+        pre_stim_obs: Optional[torch.Tensor] = None,
+        pre_stim_mask: Optional[torch.Tensor] = None,
+        drift_gate: Optional[torch.Tensor] = None,
     ) -> None:
-        pyro.module("vae_guide", self)
+        # VAEGuide is a PyroModule: PyroModule.__call__ automatically registers both self.encoder
+        # and all 20 variational PyroParams without touching sibling VAElegans.decoder.
         if y is not None:
             neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale = self.encoder(y)
             with torch.no_grad():
@@ -269,15 +262,15 @@ class VAElegans(PyroModule):
             )
             pyro.sample(
                 "decoder.model.synapse.wicks.V_rest",
-                dist.Normal(wicks_loc[1], wicks_scale[1]).to_event(1),
+                dist.Normal(neuron_loc[3], neuron_scale[3]).to_event(1),
             )
             pyro.sample(
                 "decoder.model.synapse.wicks.V_slope",
-                dist.LogNormal(wicks_loc[2], wicks_scale[2]).to_event(1),
+                dist.LogNormal(neuron_loc[4], neuron_scale[4]).to_event(1),
             )
             pyro.sample(
                 "decoder.model.synapse.wicks.E_rev",
-                dist.Normal(wicks_loc[3], wicks_scale[3]).to_event(1),
+                dist.Normal(wicks_loc[1], wicks_scale[1]).to_event(1),
             )
 
         if self.gap_dim > 0:
@@ -289,7 +282,7 @@ class VAElegans(PyroModule):
         pyro.sample("decoder.model.stim_gain", dist.LogNormal(self.stim_gain_loc, self.stim_gain_scale))
         pyro.sample("decoder.obs_sigma", dist.LogNormal(self.obs_sigma_loc, self.obs_sigma_scale))
 
-        pyro.sample("decoder.gcamp.v_th_ca", dist.Normal(self.v_th_ca_loc, self.v_th_ca_scale))
+        pyro.sample("decoder.gcamp.v_th_ca_logit", dist.Normal(self.v_th_ca_loc, self.v_th_ca_scale))
         pyro.sample("decoder.gcamp.v_slope_ca", dist.LogNormal(self.v_slope_ca_loc, self.v_slope_ca_scale))
         pyro.sample("decoder.gcamp.alpha_ca", dist.LogNormal(self.alpha_ca_loc, self.alpha_ca_scale))
         pyro.sample("decoder.gcamp.tau_ca", dist.LogNormal(self.tau_ca_loc, self.tau_ca_scale))
@@ -302,4 +295,133 @@ class VAElegans(PyroModule):
         pyro.sample(
             "decoder.gcamp.offset",
             dist.Normal(self.gcamp_offset_loc, self.gcamp_offset_scale).to_event(1),
+        )
+
+
+class VAElegans(PyroModule):
+    """Amortized Variational Autoencoder pairing a TCN encoder guide with RecurrentNematode decoder."""
+
+    def __init__(self, model: RecurrentNematode, neuron_dim: int, wicks_dim: int, gap_dim: int):
+        super().__init__()
+        e_rev_prior = None
+        if (
+            hasattr(model, "model")
+            and hasattr(model.model, "synapse")
+            and hasattr(model.model.synapse, "wicks")
+            and hasattr(model.model.synapse.wicks, "e_rev_loc_buf")
+        ):
+            e_rev_prior = model.model.synapse.wicks.e_rev_loc_buf
+        self.guide = VAEGuide(neuron_dim, wicks_dim, gap_dim, e_rev_prior=e_rev_prior)
+        self.decoder = model
+        self.neuron_dim = int(neuron_dim)
+        self.wicks_dim = int(wicks_dim)
+        self.gap_dim = int(gap_dim)
+
+    @property
+    def encoder(self) -> Encoder:
+        return self.guide.encoder
+
+    @property
+    def _has_amortized_post(self) -> torch.Tensor:
+        return self.guide._has_amortized_post
+
+    @property
+    def _ema_neuron_loc(self) -> torch.Tensor:
+        return self.guide._ema_neuron_loc
+
+    @property
+    def _ema_neuron_scale(self) -> torch.Tensor:
+        return self.guide._ema_neuron_scale
+
+    @property
+    def _ema_wicks_loc(self) -> torch.Tensor:
+        return self.guide._ema_wicks_loc
+
+    @property
+    def _ema_wicks_scale(self) -> torch.Tensor:
+        return self.guide._ema_wicks_scale
+
+    @property
+    def _ema_gap_loc(self) -> torch.Tensor:
+        return self.guide._ema_gap_loc
+
+    @property
+    def _ema_gap_scale(self) -> torch.Tensor:
+        return self.guide._ema_gap_scale
+
+    @property
+    def stim_gain_loc(self) -> torch.Tensor:
+        return self.guide.stim_gain_loc
+
+    @property
+    def obs_sigma_loc(self) -> torch.Tensor:
+        return self.guide.obs_sigma_loc
+
+    @property
+    def v_th_ca_loc(self) -> torch.Tensor:
+        return self.guide.v_th_ca_loc
+
+    @property
+    def v_slope_ca_loc(self) -> torch.Tensor:
+        return self.guide.v_slope_ca_loc
+
+    @property
+    def alpha_ca_loc(self) -> torch.Tensor:
+        return self.guide.alpha_ca_loc
+
+    @property
+    def tau_ca_loc(self) -> torch.Tensor:
+        return self.guide.tau_ca_loc
+
+    @property
+    def k_on_loc(self) -> torch.Tensor:
+        return self.guide.k_on_loc
+
+    @property
+    def k_off_loc(self) -> torch.Tensor:
+        return self.guide.k_off_loc
+
+    @property
+    def gcamp_gain_loc(self) -> torch.Tensor:
+        return self.guide.gcamp_gain_loc
+
+    @property
+    def gcamp_offset_loc(self) -> torch.Tensor:
+        return self.guide.gcamp_offset_loc
+
+    def reconstruct_img(
+        self,
+        x: torch.Tensor,
+        ExternalInput: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Posterior-guided reconstruction given GCaMP trace x and optional stimulus."""
+        if ExternalInput is None:
+            ExternalInput = torch.zeros_like(x)
+        pred = pyro.infer.Predictive(
+            self.forward, guide=self.guide, num_samples=1, return_sites=("_RETURN",)
+        )(ExternalInput=ExternalInput, mask=None, y=x)
+        return pred["_RETURN"].squeeze(0)
+
+    def forward(
+        self,
+        ExternalInput: Optional[torch.Tensor] = None,
+        VoltageClamp: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None,
+        noise_scale: Optional[torch.Tensor] = None,
+        dataset_size: Optional[int] = None,
+        pre_stim_obs: Optional[torch.Tensor] = None,
+        pre_stim_mask: Optional[torch.Tensor] = None,
+        drift_gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.decoder(
+            ExternalInput=ExternalInput,
+            VoltageClamp=VoltageClamp,
+            mask=mask,
+            y=y,
+            noise_scale=noise_scale,
+            dataset_size=dataset_size,
+            pre_stim_obs=pre_stim_obs,
+            pre_stim_mask=pre_stim_mask,
+            drift_gate=drift_gate,
         )

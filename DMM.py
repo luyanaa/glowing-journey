@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 
 from pyro_svi_c302 import DEFAULT_DATA_PATH
-from utils import AtlasLoader, RandiTrialDataset, responseGenerator
+from utils import AtlasLoader, RandiTrialDataset, responseGenerator, split_trial_dataset
 
 
 def reverse_sequences_pad(sequences: torch.Tensor, seq_lengths: torch.Tensor) -> torch.Tensor:
@@ -269,13 +269,27 @@ def main(args) -> None:
             if args.dataset_cache:
                 ds.save(args.dataset_cache)
         x_all, y_all, mask_all = ds.stim_inputs, ds.y, ds.obs_mask
+        train_idx, test_idx, split_info = split_trial_dataset(
+            ds,
+            test_size=0.1,
+            random_state=42,
+            group_by_recording=not getattr(args, "trial_split", False),
+        )
+        logging.info(
+            "Randi split: train=%d trials (%d recs), test=%d trials (%d recs, grouped=%s)",
+            len(train_idx),
+            split_info["train_recordings"],
+            len(test_idx),
+            split_info["test_recordings"],
+            bool(split_info["grouped"]),
+        )
     else:
         x_all, y_all, mask_all = responseGenerator(
             folder="./wormfunconn/atlas/", strain=args.strain, size=100
         ).Dataset(return_mask=True)
+        idx = np.arange(len(y_all))
+        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=42)
 
-    idx = np.arange(len(y_all))
-    train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=42)
     x_train, y_train, m_train = x_all[train_idx], y_all[train_idx], mask_all[train_idx]
     x_test, y_test, m_test = x_all[test_idx], y_all[test_idx], mask_all[test_idx]
 
@@ -329,7 +343,7 @@ def main(args) -> None:
 
     def load_checkpoint():
         assert exists(args.load_opt) and exists(args.load_model), "--load-model and/or --load-opt misspecified"
-        dmm.load_state_dict(torch.load(args.load_model, map_location=device))
+        dmm.load_state_dict(torch.load(args.load_model, map_location=device, weights_only=False))
         adam.load(args.load_opt)
 
     def process_minibatch(epoch, which_mini_batch, shuffled_indices):
@@ -420,6 +434,7 @@ if __name__ == "__main__":
     parser.add_argument("-smod", "--save-model", type=str, default="")
     parser.add_argument("--cuda", action="store_true")
     parser.add_argument("--jit", action="store_true")
+    parser.add_argument("--trial-split", action="store_true", help="Disable recording-level grouping in split")
     parser.add_argument("-l", "--log", type=str, default="dmm.log")
     args = parser.parse_args()
 
