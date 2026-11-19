@@ -60,6 +60,54 @@ def reweight_hop1_noise(
     return noise * factor
 
 
+def _load_compatible_state_dict(module, state):
+    """Load only keys whose names and shapes match the current module."""
+    current = module.state_dict()
+    filtered = {}
+    skipped = []
+    for key, value in state.items():
+        if key in current and current[key].shape == value.shape:
+            filtered[key] = value
+        else:
+            skipped.append(key)
+    missing, unexpected = module.load_state_dict(filtered, strict=False)
+    return skipped, list(missing), list(unexpected)
+
+
+def _expand_scalar_kinetics(module, state):
+    """Initialize per-neuron tau_ca/k_off loc+scale from a scalar v3 checkpoint."""
+    pairs = [
+        ("guide.tau_ca_loc_unconstrained", "tau_ca_loc"),
+        ("guide.tau_ca_scale_unconstrained", "tau_ca_scale"),
+        ("guide.k_off_loc_unconstrained", "k_off_loc"),
+        ("guide.k_off_scale_unconstrained", "k_off_scale"),
+    ]
+    expanded = []
+    for key, attr in pairs:
+        if key in state and state[key].numel() == 1:
+            target = getattr(module.guide, attr)
+            with torch.no_grad():
+                target.fill_(float(state[key].detach().cpu()))
+            expanded.append(key)
+    return expanded
+
+
+def _set_kinetics_only_trainable(module, kinetics_only: bool):
+    for name, param in module.named_parameters():
+        if kinetics_only:
+            param.requires_grad_("tau_ca" in name or "k_off" in name)
+        else:
+            param.requires_grad_(True)
+
+
+def _set_edge_only_trainable(module, edge_only: bool):
+    for name, param in module.named_parameters():
+        if edge_only:
+            param.requires_grad_("v_rest_edge" in name or "v_slope_edge" in name)
+        else:
+            param.requires_grad_(True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train VAElegans amortized variational connectome model")
     parser.add_argument("total_epochs", nargs="?", type=int, default=10, help="Total epochs to train")
@@ -83,6 +131,16 @@ def main() -> None:
                         help="Gate pre-stimulus drift on direct/1-hop stimulus targets")
     parser.add_argument("--hop1-loss-weight", default=1.0, type=float,
                         help="Relative likelihood weight on 1-hop downstream neurons")
+    parser.add_argument("--per-neuron-kinetics", action="store_true",
+                        help="Learn per-neuron tau_ca and k_off (hierarchical around v3 global values)")
+    parser.add_argument("--per-edge-release", action="store_true",
+                        help="Learn per-edge V_rest/V_slope residuals on top of per-neuron release values")
+    parser.add_argument("--freeze-nonedge-epochs", default=0, type=int,
+                        help="Freeze all parameters except per-edge release residuals for this many epochs")
+    parser.add_argument("--init-from", default=None, type=str,
+                        help="Warm-start checkpoint; scalar tau_ca/k_off are expanded to per-neuron vectors")
+    parser.add_argument("--freeze-nonkinetics-epochs", default=0, type=int,
+                        help="Freeze all parameters except guide tau_ca/k_off for this many epochs")
     parser.add_argument("--trial-split", action="store_true", help="Disable recording-level grouping in split")
     parser.add_argument("--seed", default=42, type=int, help="Training RNG seed")
     parser.add_argument("--split-seed", default=42, type=int, help="Fixed data split seed")
@@ -173,7 +231,9 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
-    step_model = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    step_model = c302.readConnectome(
+        "./data/CElegansNeuronTables.xls", per_edge_release=args.per_edge_release
+    )
     adj_t = torch.as_tensor(
         step_model.synapse.adjacency_matrix(step_model.neuronSize),
         dtype=torch.float32,
@@ -186,6 +246,8 @@ def main() -> None:
         use_prestim_encoder=args.use_prestim_encoder,
         pre_vols=args.pre_vols,
         prestim_rank=args.prestim_rank,
+        per_neuron_kinetics=args.per_neuron_kinetics,
+        per_edge_release=args.per_edge_release,
     )
     model = vae.VAElegans(
         rec_model,
@@ -193,13 +255,36 @@ def main() -> None:
         len(rec_model.model.synapse.Wicks_SRC),
         len(rec_model.model.synapse.Gap_Junction_SRC),
     ).to(device)
+    if args.init_from:
+        snap = torch.load(args.init_from, map_location=device, weights_only=False)
+        state = snap["MODEL_STATE"]
+        skipped, missing, unexpected = _load_compatible_state_dict(model, state)
+        expanded = _expand_scalar_kinetics(model, state) if args.per_neuron_kinetics else []
+        print(
+            f"Warm start from {args.init_from}: loaded compatible={len(state)-len(skipped)} "
+            f"skipped={len(skipped)} missing={len(missing)} unexpected={len(unexpected)} "
+            f"expanded_kinetics={expanded}",
+            flush=True,
+        )
     summary(model)
 
     optim = pyro.optim.ClippedAdam({"lr": args.lr, "clip_norm": 10.0})
     svi = SVI(model, model.guide, optim, Trace_ELBO())
 
     n_train_trials = len(train_ds)
+    freeze_epochs = max(0, int(args.freeze_nonkinetics_epochs))
+    edge_freeze_epochs = max(0, int(args.freeze_nonedge_epochs))
     for epoch in range(args.total_epochs):
+        if freeze_epochs:
+            frozen = epoch < freeze_epochs
+            _set_kinetics_only_trainable(model, frozen)
+            if epoch == freeze_epochs:
+                print("Unfreezing all parameters after kinetics-only warm start", flush=True)
+        if edge_freeze_epochs:
+            frozen = epoch < edge_freeze_epochs
+            _set_edge_only_trainable(model, frozen)
+            if epoch == edge_freeze_epochs:
+                print("Unfreezing all parameters after edge-only warm start", flush=True)
         t0 = time.time()
         loss = 0.0
         scaled_obs = 0.0

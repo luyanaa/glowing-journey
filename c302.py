@@ -325,6 +325,7 @@ class WicksSynapse(PyroModule):
         V_slope=None,
         E_rev=None,
         neuron_size: Optional[int] = None,
+        per_edge_release: bool = False,
     ):
         super().__init__()
         src = np.asarray(synapseInput, dtype=np.int64).reshape(-1)
@@ -333,6 +334,7 @@ class WicksSynapse(PyroModule):
         self.inputSize = int(len(src))
         self.neuron_size = None if neuron_size is None else int(neuron_size)
         self.share_presynaptic = self.neuron_size is not None
+        self.per_edge_release = bool(per_edge_release)
         self.register_buffer("synapseInput", torch.as_tensor(src, dtype=torch.long))
         self.register_buffer("synapseOutput", torch.as_tensor(dst, dtype=torch.long))
         self.register_buffer("synapseWeight", torch.as_tensor(w, dtype=torch.float32))
@@ -373,17 +375,31 @@ class WicksSynapse(PyroModule):
                 if E_rev is None
                 else E_rev
             )
+            if self.per_edge_release:
+                # Zero-mean residual release threshold/slope on top of the shared
+                # per-presynaptic-neuron values; allows individual edges to lead/lag.
+                self.v_rest_edge_delta = _sample_normal(
+                    self, 0.0, 0.005, shape=(self.inputSize,), to_event=1
+                )
+                self.v_slope_edge_logdelta = _sample_normal(
+                    self, 0.0, 0.1, shape=(self.inputSize,), to_event=1
+                )
+            else:
+                self.register_buffer("v_rest_edge_delta", torch.empty(0, dtype=torch.float32))
+                self.register_buffer("v_slope_edge_logdelta", torch.empty(0, dtype=torch.float32))
         else:
             self.register_buffer("g_max", torch.empty(0, dtype=torch.float32))
             self.register_buffer("V_rest", torch.empty(0, dtype=torch.float32))
             self.register_buffer("V_slope", torch.empty(0, dtype=torch.float32))
             self.register_buffer("E_rev", torch.empty(0, dtype=torch.float32))
+            self.register_buffer("v_rest_edge_delta", torch.empty(0, dtype=torch.float32))
+            self.register_buffer("v_slope_edge_logdelta", torch.empty(0, dtype=torch.float32))
 
     def build_weight_matrices(
         self, n_neurons: int, device: torch.device, dtype: torch.dtype
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Assemble differentiable dense (N, N) drive/conductance matrices for shared presynaptic params."""
-        if self.inputSize == 0 or not self.share_presynaptic:
+        if self.inputSize == 0 or not self.share_presynaptic or self.per_edge_release:
             return None
         g_w = (torch.clamp(self.g_max, min=0.0) * self.synapseWeight).to(dtype=dtype)
         # Physiological reversal potential guardrail [-95 mV, +30 mV] prevents unphysical +/-200 mV runaway
@@ -403,7 +419,7 @@ class WicksSynapse(PyroModule):
         """Return (synaptic_drive_current, postsynaptic_conductance_sum) for semi-implicit integration."""
         if self.inputSize == 0:
             return torch.zeros_like(inputSignal), torch.zeros_like(inputSignal)
-        if self.share_presynaptic:
+        if self.share_presynaptic and not self.per_edge_release:
             mats = (
                 cached
                 if cached is not None
@@ -419,10 +435,18 @@ class WicksSynapse(PyroModule):
         cond = torch.zeros_like(inputSignal)
         dim = 0 if inputSignal.dim() == 1 else 1
         pre_v = torch.index_select(inputSignal, dim, self.synapseInput)
-        slope = torch.clamp(self.V_slope, min=1e-3)
+        if self.per_edge_release:
+            v_rest = self.V_rest[self.synapseInput] + self.v_rest_edge_delta
+            slope = torch.clamp(
+                self.V_slope[self.synapseInput] * torch.exp(self.v_slope_edge_logdelta),
+                min=1e-3,
+            )
+        else:
+            v_rest = self.V_rest
+            slope = torch.clamp(self.V_slope, min=1e-3)
         g = torch.clamp(self.g_max, min=0.0)
         e_rev = torch.clamp(self.E_rev, min=-0.095, max=0.030)
-        act = torch.sigmoid((pre_v - self.V_rest) / slope)
+        act = torch.sigmoid((pre_v - v_rest) / slope)
         g_eff = g * self.synapseWeight * act
         drive.index_add_(dim, self.synapseOutput, g_eff * e_rev)
         cond.index_add_(dim, self.synapseOutput, g_eff)
@@ -484,8 +508,10 @@ class synapseLayer(PyroModule):
         synapseList: dict,
         use_extrasynaptic: bool = False,
         neuron_size: Optional[int] = None,
+        per_edge_release: bool = False,
     ):
         super().__init__()
+        self.per_edge_release = bool(per_edge_release)
         wicks_tuple = synapseList["Wicks"]
         self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight = wicks_tuple[:3]
         e_rev_loc = wicks_tuple[3] if len(wicks_tuple) > 3 else None
@@ -502,6 +528,7 @@ class synapseLayer(PyroModule):
             e_rev_loc=e_rev_loc,
             e_rev_scale=e_rev_scale,
             neuron_size=neuron_size,
+            per_edge_release=per_edge_release,
         )
         self.general = GeneralSynapse(
             self.Gap_Junction_SRC,
@@ -637,12 +664,19 @@ class CalciumGCaMPLayer(PyroModule):
     def v_th_ca(self) -> torch.Tensor:
         return self.logit_to_v_th_ca(self.v_th_ca_logit)
 
-    def __init__(self, neuron_size: int, ca_rest: float = 0.05, hill_n: float = 2.0):
+    def __init__(
+        self,
+        neuron_size: int,
+        ca_rest: float = 0.05,
+        hill_n: float = 2.0,
+        per_neuron_kinetics: bool = False,
+    ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.neuron_size = neuron_size
         self.ca_rest = float(ca_rest)
         self.hill_n = float(hill_n)
+        self.per_neuron_kinetics = bool(per_neuron_kinetics)
 
         # Shared nuclear GCaMP6s indicator kinetics + neuron-specific gain/offset.
         # Sample v_th_ca_logit as an unconstrained Normal and map deterministically via sigmoid
@@ -655,9 +689,20 @@ class CalciumGCaMPLayer(PyroModule):
         self.v_th_ca_logit = _sample_normal(self, -0.05, 0.8)
         self.v_slope_ca = _sample_lognormal(self, math.log(0.008), 0.3)
         self.alpha_ca = _sample_lognormal(self, math.log(2.5), 0.4)
-        self.tau_ca = _sample_lognormal(self, math.log(7.0), 0.45)
+        if self.per_neuron_kinetics:
+            # Hierarchical per-neuron Ca2+ extrusion / GCaMP unbinding.  The prior is
+            # deliberately tight around the v3 global values so a warm start cannot
+            # collapse into arbitrarily fast/slow kinetics.
+            self.tau_ca = _sample_lognormal(
+                self, math.log(7.0), 0.35, shape=(neuron_size,), to_event=1
+            )
+            self.k_off = _sample_lognormal(
+                self, math.log(0.045), 0.35, shape=(neuron_size,), to_event=1
+            )
+        else:
+            self.tau_ca = _sample_lognormal(self, math.log(7.0), 0.45)
+            self.k_off = _sample_lognormal(self, math.log(0.045), 0.45)
         self.k_on = _sample_lognormal(self, math.log(0.06), 0.45)
-        self.k_off = _sample_lognormal(self, math.log(0.045), 0.45)
 
         self.gain = _sample_lognormal(self, math.log(1.4), 0.5, shape=(neuron_size,), to_event=1)
         self.offset = _sample_normal(self, 0.0, 0.05, shape=(neuron_size,), to_event=1)
@@ -848,13 +893,17 @@ class NematodeForStep(PyroModule):
         use_extrasynaptic: bool = False,
         use_bnn_residual: bool = False,
         bnn_hidden_dim: int = 16,
+        per_edge_release: bool = False,
     ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.neuronSize = neuronSize
         self.Neuron = neuronLayer(neuronSize, NeuronList)
         self.synapse = synapseLayer(
-            synapseList, use_extrasynaptic=use_extrasynaptic, neuron_size=neuronSize
+            synapseList,
+            use_extrasynaptic=use_extrasynaptic,
+            neuron_size=neuronSize,
+            per_edge_release=per_edge_release,
         )
         # Optogenetic Chrimson cation-channel conductance (nS) with physiological reversal E_opt = 0 V
         # (and inhibitory reversal E_inh = -85 mV if negative stimulation is supplied).
@@ -956,9 +1005,12 @@ class RecurrentNematode(PyroModule):
         use_prestim_encoder: bool = False,
         pre_vols: int = 10,
         prestim_rank: int = 16,
+        per_neuron_kinetics: bool = False,
+        per_edge_release: bool = False,
     ):
         super().__init__()
         self.model = model
+        self.per_edge_release = bool(per_edge_release)
         # Keep backward compatibility with callers passing `scale=` while never mutating globals
         self.substeps = int(scale if scale is not None else substeps)
         self.dt_obs = float(dt_obs)
@@ -969,7 +1021,8 @@ class RecurrentNematode(PyroModule):
 
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         neuron_size = getattr(model, "neuronSize", 300)
-        self.gcamp = CalciumGCaMPLayer(neuron_size)
+        self.per_neuron_kinetics = bool(per_neuron_kinetics)
+        self.gcamp = CalciumGCaMPLayer(neuron_size, per_neuron_kinetics=self.per_neuron_kinetics)
         self.prestim_encoder = (
             CausalPreStimEncoder(neuron_size, rank=prestim_rank) if self.use_prestim_encoder else None
         )
@@ -1232,6 +1285,7 @@ class RecurrentNematode(PyroModule):
             V_rest=PyroSample(dist.Normal(wicks_loc[1], torch.clamp(wicks_scale[1], min=1e-4)).to_event(1)),
             V_slope=PyroSample(dist.LogNormal(wicks_loc[2], torch.clamp(wicks_scale[2], min=1e-4)).to_event(1)),
             neuron_size=getattr(self.model.synapse, "neuron_size", None),
+            per_edge_release=getattr(prev_wicks, "per_edge_release", False),
         )
         self.model.synapse.general = GeneralSynapse(
             self.model.synapse.Gap_Junction_SRC,
@@ -1271,6 +1325,7 @@ def readConnectome(
     use_extrasynaptic: bool = False,
     use_bnn_residual: bool = False,
     bnn_hidden_dim: int = 16,
+    per_edge_release: bool = False,
     aconnectome_ids_path: str = "./pumpprobe/pumpprobe/aconnectome_ids.txt",
     edgelist_path: str = "./data/herm_full_edgelist.csv",
     np_path: str = "./data/edgelist_NP.csv",
@@ -1357,6 +1412,7 @@ def readConnectome(
             use_extrasynaptic=use_extrasynaptic,
             use_bnn_residual=use_bnn_residual,
             bnn_hidden_dim=bnn_hidden_dim,
+            per_edge_release=per_edge_release,
         )
     model.register_buffer("sensory_mask", torch.from_numpy(sensory_mask))
     return model

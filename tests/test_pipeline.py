@@ -16,7 +16,12 @@ from pyro_svi_c302 import (
     evaluate_predictions,
     init_to_prior_median,
 )
-from pyro_svi_vae import compute_drift_gate, reweight_hop1_noise
+from pyro_svi_vae import (
+    _expand_scalar_kinetics,
+    _load_compatible_state_dict,
+    compute_drift_gate,
+    reweight_hop1_noise,
+)
 from utils import (
     AtlasLoader,
     RandiTrialDataset,
@@ -846,6 +851,82 @@ def test_evaluate_predictions_passes_drift_gate_mode():
     assert "post_inlier_r2" in m_gated
     assert "stim_inlier_r" in m_gated
     assert "hop1_inlier_r" in m_gated
+
+
+def test_per_neuron_kinetics_shapes_and_warm_start_expansion():
+    pyro.clear_param_store()
+    g = c302.CalciumGCaMPLayer(4, per_neuron_kinetics=True)
+    assert tuple(g.tau_ca.shape) == (4,)
+    assert tuple(g.k_off.shape) == (4,)
+    out = g.forward(torch.full((2, 5, 4), -0.065))
+    assert out.shape == (2, 5, 4) and torch.isfinite(out).all()
+
+    tiny_syn = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    step = c302.NematodeForStep(3, {}, tiny_syn)
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2, per_neuron_kinetics=True)
+    vm = vae.VAElegans(
+        rec, rec.model.Neuron.neuronSize,
+        len(rec.model.synapse.Wicks_SRC), len(rec.model.synapse.Gap_Junction_SRC),
+    )
+    state = dict(vm.state_dict())
+    scalar_keys = [
+        "guide.tau_ca_loc_unconstrained",
+        "guide.tau_ca_scale_unconstrained",
+        "guide.k_off_loc_unconstrained",
+        "guide.k_off_scale_unconstrained",
+    ]
+    for key in scalar_keys:
+        state[key] = state[key].detach().mean().reshape(())
+    skipped, missing, unexpected = _load_compatible_state_dict(vm, state)
+    expanded = _expand_scalar_kinetics(vm, state)
+    assert set(expanded) == set(scalar_keys)
+    assert torch.allclose(
+        vm.guide.tau_ca_loc,
+        torch.full((3,), float(state["guide.tau_ca_loc_unconstrained"])),
+    )
+    assert torch.allclose(
+        vm.guide.k_off_loc,
+        torch.full((3,), float(state["guide.k_off_loc_unconstrained"])),
+    )
+
+
+def test_per_edge_release_sites_and_forward():
+    pyro.clear_param_store()
+    tiny_syn = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    step = c302.NematodeForStep(3, {}, tiny_syn, per_edge_release=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, per_neuron_kinetics=True, per_edge_release=True
+    )
+    vm = vae.VAElegans(
+        rec, rec.model.Neuron.neuronSize,
+        len(rec.model.synapse.Wicks_SRC), len(rec.model.synapse.Gap_Junction_SRC),
+    )
+    assert vm.per_edge_release and vm.guide.per_edge_release
+    assert tuple(vm.guide.v_rest_edge_loc.shape) == (1,)
+    assert tuple(vm.guide.v_slope_edge_loc.shape) == (1,)
+    stim = torch.zeros(2, 6, 3)
+    y = torch.zeros(2, 6, 3)
+    mask = torch.ones(2, 6, 3, dtype=torch.bool)
+    noise = torch.full((2, 3), 0.05)
+    trace = pyro.poutine.trace(vm.guide).get_trace(
+        ExternalInput=stim, mask=mask, y=y, noise_scale=noise
+    )
+    for key in (
+        "decoder.model.synapse.wicks.v_rest_edge_delta",
+        "decoder.model.synapse.wicks.v_slope_edge_logdelta",
+    ):
+        assert tuple(trace.nodes[key]["value"].shape) == (1,)
+    svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-3}), Trace_ELBO())
+    loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+    assert np.isfinite(loss)
 
 
 def test_all_python_modules_compile():

@@ -1,0 +1,31 @@
+{
+  "warning": "The controlled-seed Colab VM (gj-l4c) was stopped. Its checkpoints and full logs under /content/runs_seed and /content/runs_full were lost. The values below are copied from the training logs, which used 2 posterior samples for the in-training Val/Test evaluation.",
+  "protocol": {
+    "holdout": "w2, gate direct_hop1, hop1-loss-weight=2, seed=42/43, split-seed=42, val-fraction=0.15 worm-grouped holdout from train; test is the fixed 11-recording/329-trial split.",
+    "full_train": "w2, gate direct_hop1, hop1-loss-weight=2, seed=42, split-seed=42, val-fraction=0 (all 99 train recordings)."
+  },
+  "results_2sample_training_logs": {
+    "w2_seed42_holdout": {
+      "val_hop1_r": 0.286,
+      "test_hop1_r": -0.063,
+      "test_stim_r": -0.044,
+      "test_unconnected_r": 0.319
+    },
+    "w2_seed43_holdout": {
+      "val_hop1_r": 0.276,
+      "test_hop1_r": -0.060,
+      "test_stim_r": -0.016,
+      "test_unconnected_r": 0.325
+    },
+    "w2_seed42_full_train": {
+      "test_hop1_r": -0.061,
+      "test_stim_r": -0.138,
+      "test_unconnected_r": 0.314
+    }
+  },
+  "incomplete": [
+    "w2_seed43_full_train (started, aborted before epoch 20)",
+    "w4 controlled seeds (not run; session stopped)"
+  ],
+  "interpretation": "The holdout validation metric does not predict the unseen-worm test metric. Values are 2-sample training logs and are not the final 8/16-sample evaluation; the older w2/w4 checkpoints in checkpoints/ are the ones with stable 8/16-sample statistics."
+}

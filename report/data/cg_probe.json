@@ -1,0 +1,37 @@
+{
+  "protocol": "v4 opt1_e6 checkpoint; fixed 16 posterior samples; full 329-trial test; no training. Selected C/G override sets C=0.01, G=0.5 for AVDL/AVDR/ASHR/AVER (fastCG_selected) or all 300 neurons (fastCG_all).",
+  "base": {
+    "post_r": 0.2397,
+    "post_inlier_r2": 0.0482,
+    "stim_r": 0.3904,
+    "hop1_r": 0.1901,
+    "hop1_r2": 0.0127,
+    "hop2_r": 0.0719,
+    "unconnected_r": 0.0568,
+    "rmse": 0.1812,
+    "hop1_amp": 0.1162
+  },
+  "fastCG_selected": {
+    "post_r": 0.2394,
+    "post_inlier_r2": 0.0480,
+    "stim_r": 0.3921,
+    "hop1_r": 0.1871,
+    "hop1_r2": 0.0110,
+    "hop2_r": 0.0721,
+    "unconnected_r": 0.0563,
+    "rmse": 0.1812,
+    "hop1_amp": 0.1119
+  },
+  "fastCG_all": {
+    "post_r": 0.2342,
+    "post_inlier_r2": 0.0391,
+    "stim_r": 0.3746,
+    "hop1_r": 0.1567,
+    "hop1_r2": -0.0075,
+    "hop2_r": 0.0669,
+    "unconnected_r": 0.0524,
+    "rmse": 0.1820,
+    "hop1_amp": 0.0673
+  },
+  "conclusion": "Fast membrane C/G does not improve full-test hop1 correlation; global fast C/G severely degrades it. The 16-trial zero-shot gain was sampling noise. Membrane C/G is not the next lever."
+}

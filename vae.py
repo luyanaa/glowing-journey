@@ -161,12 +161,16 @@ class VAEGuide(PyroModule):
         wicks_dim: int,
         gap_dim: int,
         e_rev_prior: Optional[torch.Tensor] = None,
+        per_neuron_kinetics: bool = False,
+        per_edge_release: bool = False,
     ):
         super().__init__()
         self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim, e_rev_prior=e_rev_prior)
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
+        self.per_neuron_kinetics = bool(per_neuron_kinetics)
+        self.per_edge_release = bool(per_edge_release)
 
         # Amortized posterior EMA for open-loop evaluation when y is withheld (y=None)
         self.register_buffer("_has_amortized_post", torch.tensor(False, dtype=torch.bool))
@@ -190,12 +194,36 @@ class VAEGuide(PyroModule):
         self.v_slope_ca_scale = PyroParam(torch.tensor(0.15), constraint=constraints.positive)
         self.alpha_ca_loc = PyroParam(torch.tensor(math.log(2.5)))
         self.alpha_ca_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
-        self.tau_ca_loc = PyroParam(torch.tensor(math.log(7.0)))
-        self.tau_ca_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
         self.k_on_loc = PyroParam(torch.tensor(math.log(0.06)))
         self.k_on_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
-        self.k_off_loc = PyroParam(torch.tensor(math.log(0.045)))
-        self.k_off_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
+        if self.per_neuron_kinetics:
+            self.tau_ca_loc = PyroParam(
+                torch.full((self.neuron_dim,), math.log(7.0))
+            )
+            self.tau_ca_scale = PyroParam(
+                torch.full((self.neuron_dim,), 0.35), constraint=constraints.positive
+            )
+            self.k_off_loc = PyroParam(
+                torch.full((self.neuron_dim,), math.log(0.045))
+            )
+            self.k_off_scale = PyroParam(
+                torch.full((self.neuron_dim,), 0.35), constraint=constraints.positive
+            )
+        else:
+            self.tau_ca_loc = PyroParam(torch.tensor(math.log(7.0)))
+            self.tau_ca_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
+            self.k_off_loc = PyroParam(torch.tensor(math.log(0.045)))
+            self.k_off_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
+
+        if self.per_edge_release and self.wicks_dim > 0:
+            self.v_rest_edge_loc = PyroParam(torch.zeros(self.wicks_dim))
+            self.v_rest_edge_scale = PyroParam(
+                torch.full((self.wicks_dim,), 0.005), constraint=constraints.positive
+            )
+            self.v_slope_edge_loc = PyroParam(torch.zeros(self.wicks_dim))
+            self.v_slope_edge_scale = PyroParam(
+                torch.full((self.wicks_dim,), 0.1), constraint=constraints.positive
+            )
 
         self.gcamp_gain_loc = PyroParam(torch.full((self.neuron_dim,), math.log(1.4)))
         self.gcamp_gain_scale = PyroParam(
@@ -272,6 +300,15 @@ class VAEGuide(PyroModule):
                 "decoder.model.synapse.wicks.E_rev",
                 dist.Normal(wicks_loc[1], wicks_scale[1]).to_event(1),
             )
+            if self.per_edge_release:
+                pyro.sample(
+                    "decoder.model.synapse.wicks.v_rest_edge_delta",
+                    dist.Normal(self.v_rest_edge_loc, self.v_rest_edge_scale).to_event(1),
+                )
+                pyro.sample(
+                    "decoder.model.synapse.wicks.v_slope_edge_logdelta",
+                    dist.Normal(self.v_slope_edge_loc, self.v_slope_edge_scale).to_event(1),
+                )
 
         if self.gap_dim > 0:
             pyro.sample(
@@ -285,9 +322,19 @@ class VAEGuide(PyroModule):
         pyro.sample("decoder.gcamp.v_th_ca_logit", dist.Normal(self.v_th_ca_loc, self.v_th_ca_scale))
         pyro.sample("decoder.gcamp.v_slope_ca", dist.LogNormal(self.v_slope_ca_loc, self.v_slope_ca_scale))
         pyro.sample("decoder.gcamp.alpha_ca", dist.LogNormal(self.alpha_ca_loc, self.alpha_ca_scale))
-        pyro.sample("decoder.gcamp.tau_ca", dist.LogNormal(self.tau_ca_loc, self.tau_ca_scale))
+        if self.per_neuron_kinetics:
+            pyro.sample(
+                "decoder.gcamp.tau_ca",
+                dist.LogNormal(self.tau_ca_loc, self.tau_ca_scale).to_event(1),
+            )
+            pyro.sample(
+                "decoder.gcamp.k_off",
+                dist.LogNormal(self.k_off_loc, self.k_off_scale).to_event(1),
+            )
+        else:
+            pyro.sample("decoder.gcamp.tau_ca", dist.LogNormal(self.tau_ca_loc, self.tau_ca_scale))
+            pyro.sample("decoder.gcamp.k_off", dist.LogNormal(self.k_off_loc, self.k_off_scale))
         pyro.sample("decoder.gcamp.k_on", dist.LogNormal(self.k_on_loc, self.k_on_scale))
-        pyro.sample("decoder.gcamp.k_off", dist.LogNormal(self.k_off_loc, self.k_off_scale))
         pyro.sample(
             "decoder.gcamp.gain",
             dist.LogNormal(self.gcamp_gain_loc, self.gcamp_gain_scale).to_event(1),
@@ -311,11 +358,22 @@ class VAElegans(PyroModule):
             and hasattr(model.model.synapse.wicks, "e_rev_loc_buf")
         ):
             e_rev_prior = model.model.synapse.wicks.e_rev_loc_buf
-        self.guide = VAEGuide(neuron_dim, wicks_dim, gap_dim, e_rev_prior=e_rev_prior)
+        per_neuron_kinetics = bool(getattr(getattr(model, "gcamp", None), "per_neuron_kinetics", False))
+        per_edge_release = bool(
+            getattr(getattr(getattr(model, "model", None), "synapse", None), "per_edge_release", False)
+        )
+        self.guide = VAEGuide(
+            neuron_dim, wicks_dim, gap_dim,
+            e_rev_prior=e_rev_prior,
+            per_neuron_kinetics=per_neuron_kinetics,
+            per_edge_release=per_edge_release,
+        )
         self.decoder = model
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
+        self.per_neuron_kinetics = per_neuron_kinetics
+        self.per_edge_release = per_edge_release
 
     @property
     def encoder(self) -> Encoder:
