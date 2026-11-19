@@ -155,6 +155,8 @@ def main() -> None:
     parser.add_argument("--trial-split", action="store_true", help="Disable recording-level grouping in split")
     parser.add_argument("--seed", default=42, type=int, help="Training RNG seed")
     parser.add_argument("--split-seed", default=42, type=int, help="Fixed data split seed")
+    parser.add_argument("--test-size", default=0.1, type=float,
+                        help="Recording-grouped test fraction (default 0.1)")
     parser.add_argument("--val-fraction", default=0.15, type=float,
                         help="Recording-grouped validation fraction held out from training")
     parser.add_argument("--eval-test-each-save", action="store_true",
@@ -186,15 +188,18 @@ def main() -> None:
                 dataset.save(args.dataset_cache)
         source_label = "randi"
     elif args.source == "toyoshima":
-        targets = tuple(t.strip() for t in args.toyoshima_targets.split(",") if t.strip())
-        dataset = ToyoshimaLoader(
-            args.toyoshima_path,
-            target_fs=1.0 / float(args.dt_obs),
-            stim_targets=targets,
-            max_recordings=args.max_recordings,
-        ).build_trial_dataset(pre_vols=args.pre_vols, post_vols=args.post_vols)
-        if args.dataset_cache:
-            dataset.save(args.dataset_cache)
+        if args.dataset_cache and os.path.isfile(args.dataset_cache):
+            dataset = RandiTrialDataset.load(args.dataset_cache)
+        else:
+            targets = tuple(t.strip() for t in args.toyoshima_targets.split(",") if t.strip())
+            dataset = ToyoshimaLoader(
+                args.toyoshima_path,
+                target_fs=1.0 / float(args.dt_obs),
+                stim_targets=targets,
+                max_recordings=args.max_recordings,
+            ).build_trial_dataset(pre_vols=args.pre_vols, post_vols=args.post_vols)
+            if args.dataset_cache:
+                dataset.save(args.dataset_cache)
         source_label = "toyoshima"
     else:
         x_all, y_all, m_all = responseGenerator(
@@ -204,7 +209,7 @@ def main() -> None:
         from pyro_svi_c302 import _TupleDataset
 
         idx = list(range(len(x_all)))
-        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=42)
+        train_idx, test_idx = train_test_split(idx, test_size=args.test_size, random_state=42)
         train_ds = _TupleDataset(x_all[train_idx], y_all[train_idx], m_all[train_idx], noise_all[train_idx])
         test_ds = _TupleDataset(x_all[test_idx], y_all[test_idx], m_all[test_idx], noise_all[test_idx])
         val_ds = None
@@ -213,7 +218,7 @@ def main() -> None:
     if args.source != "synthetic":
         train_idx, test_idx, split_info = split_trial_dataset(
             dataset,
-            test_size=0.1,
+            test_size=args.test_size,
             random_state=args.split_seed,
             group_by_recording=not args.trial_split,
         )
