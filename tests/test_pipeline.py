@@ -29,6 +29,7 @@ from utils import (
     responseGenerator,
     split_trial_dataset,
     split_train_validation_indices,
+    ToyoshimaLoader,
 )
 import vae
 
@@ -927,6 +928,45 @@ def test_per_edge_release_sites_and_forward():
     svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-3}), Trace_ELBO())
     loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
     assert np.isfinite(loss)
+
+
+def test_toyoshima_loader_imports_nacl_trials(tmp_path):
+    import pandas as pd
+
+    names = ["ASHL", "AWCL", "ASEL", "AVDL", "AVDR", "AVJL"]
+    data = np.random.default_rng(0).normal(size=(100, len(names))).astype(np.float32)
+    pd.DataFrame(data).to_csv(tmp_path / "1_ratio.csv", index=False, header=False)
+    pd.Series(names).to_csv(tmp_path / "1_uniqNames.csv", index=False, header=False)
+    timing = pd.DataFrame(
+        [{
+            "#sample": 1,
+            "#animal": 1,
+            "name": "toy",
+            "anesthesia": 0,
+            "frames/sec": 2.0,
+            "frame number of first stimuli (NaCl concenctration change from 50 mM to 25mM)": 10.0,
+            "every N frames NaCl concentration change": 20.0,
+            "number of stimulation cycles": 3.0,
+            "total duration (sec)": 50.0,
+        }]
+    )
+    with pd.ExcelWriter(tmp_path / "stimulation_timing.xlsx") as writer:
+        timing.to_excel(writer, index=False, startrow=1)
+
+    loader = ToyoshimaLoader(
+        tmp_path,
+        aconnectome_path="./pumpprobe/pumpprobe/aconnectome_ids.txt",
+        target_fs=2.0,
+        stim_targets=("ASH", "AWC", "ASE"),
+    )
+    ds = loader.build_trial_dataset(pre_vols=10, post_vols=50)
+    assert len(ds) >= 2
+    assert ds.y.shape[1:] == (60, 300)
+    assert ds.meta[0]["stim_neuron"] == "NaCl"
+    names_idx = loader.name_to_idx
+    target_idx = [names_idx[n] for n in ("ASHL", "AWCL", "ASEL")]
+    assert ds.stim_inputs[0, 10, target_idx].sum() == 3
+    assert ds.obs_mask[:, names_idx["AVDL"]].any()
 
 
 def test_all_python_modules_compile():

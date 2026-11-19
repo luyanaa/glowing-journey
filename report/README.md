@@ -1,7 +1,7 @@
 # C. elegans Whole-Brain GCaMP Modeling Report
 
 > **Status**: research generative model, not a sign-off model.  
-> **Code**: `glowing-journey`, base commit `e26d99c` plus the per-neuron-kinetics / per-edge-release changes in this commit.  
+> **Code**: `glowing-journey`, base `e26d99c`; `39201be` added the per-neuron/per-edge features and this report; this commit adds the Toyoshima NaCl loader and test-evaluation guard.  
 > **Result sources**: `/Users/yanlu/Documents/glowing-journey_runs/{ab,v3,v4,v5}_2026-11-19/`.  
 > **Last compiled**: 2026-11-19.
 
@@ -94,6 +94,11 @@ $$
 
 The model uses 300 neurons, 2167 gap junctions, and 3638 chemical synapses. The 8770 neuropeptide / monoamine extrasynaptic links are disabled by default.
 
+Two experimental sources are supported:
+
+- **Randi optogenetic whole-brain GCaMP** (primary benchmark in this report).
+- **Toyoshima et al. (2022) NaCl whole-brain GCaMP** (`--source toyoshima`; a sensory rather than optogenetic perturbation; see §2.5).
+
 ### 1.3 Model variants
 
 | Variant | Key change | Purpose |
@@ -169,6 +174,26 @@ Derived caches live under `glowing-journey_runs/` and are not copied into this r
 - Earlier v2 caches under `ab_2026-11-19/cache/`
 
 This report keeps only lightweight split/parameter/negative-control JSON files and figures. Raw data and full caches are not committed to git.
+
+### 2.5 Toyoshima et al. NaCl dataset (second experiment)
+
+Local source: `/Users/yanlu/Google Drive/マイドライブ/cleandata_smoothened2`.
+
+| Property | Value |
+|---|---:|
+| Timing rows | 24 |
+| Complete `ratio`/`uniqNames` recordings | 21 |
+| Missing ratio files | samples 2, 12, 13 |
+| Frames per recording | 6000 |
+| Native frame rate | 3.69–5.72 Hz |
+| Canonical mapped neurons | 65–151 (mean 127) |
+| Total NaCl cycles | 679 |
+| Loader | `utils.ToyoshimaLoader` |
+| Trial geometry | 10 pre + 50 post frames at 2 Hz (`dt = 0.5 s`) |
+
+NaCl switching is a sensory perturbation, not a targeted optogenetic input. The loader therefore uses an explicit operational target set, defaulting to the chemosensory classes **ASH/AWC/ASE**, expanded to canonical `ASHL/ASHR/AWCL/AWCR/ASEL/ASER`. This is a modeling assumption, not a measured activation map. A one-recording smoke test (sample 1, `180710a`) produced 47 trials from 48 onsets with 78 mapped neurons and a 0.26 observation mask.
+
+`report/data/toyoshima_manifest.json` records these counts. The dataset is not yet benchmarked; importing it does not change the Randi results above.
 
 ---
 
@@ -291,6 +316,18 @@ v5 edge residuals (e2):
 - `v_rest_edge_delta`: mean +0.9 mV, std 3.4 mV, range [-17.2, +15.8] mV
 - `v_slope` factor: 0.998 ± 0.0069, range [0.972, 1.022]
 
+### 3.10 Statistical and causal caveats (review findings)
+
+These are not fixed by the current report; they are constraints on how the numbers above may be interpreted.
+
+1. **The test set is not locked.** v3/v4/v5 checkpoints and epochs were inspected against the same 11-recording test set, so the v5 result is **exploratory**, not a locked final benchmark. The 329-trial set should be treated as a historical benchmark. Future work should use recording-grouped nested cross-validation and a single locked final test evaluation.
+2. **`--val-fraction=0` previously made `val_ds = test_ds`.** The training script now avoids this: with `val_fraction=0`, `val_ds=None`; test is evaluated only at the final save by default (`--eval-test-each-save` opt-in). The historical v3/v4/v5 runs predate this guard.
+3. **Preprocessing is not end-to-end causal.** `preprocess_gcamp_recording` uses a centered Hampel filter, centered rolling percentile baseline, and whole-recording F0/noise estimates. The encoder reads only `y[:, :pre_vols]`, but those values are still functions of post-stimulus frames. A full preprocessing → trial slicing → encoding invariance test is required before claiming causal forecasting.
+4. **The guide uses a batch-mean global posterior.** `Encoder.forward` averages trials in a minibatch to produce global connectome/neuron posterior loc/scale, then an EMA is used at inference. This is an engineering approximation to `p(θ | Y_train)`, not a hierarchical global/local variational posterior. A proper worm-level latent hierarchy remains future work.
+5. **Gap junctions are directed in the current computation.** The CSV contains 2,697 electrical rows with no reverse entry; `adjacency_matrix()` symmetrizes but `GeneralSynapse` uses the directed rows. Current hop grouping and simulation can therefore disagree. A symmetric conductance implementation and current-conservation test are required.
+6. **The optogenetic actuator is phenomenological.** `stim_gain × binary pulse` with `E_opt = 0 V` is not a mechanistic model of the Randi GUR-3/PRDX-2 opsin. It should not be interpreted as measured channel kinetics.
+7. **Global parameter identifiability is not established.** Strong synaptic conductance, high stimulus gain, and a low calcium threshold can compensate. Synthetic parameter recovery, posterior calibration, and connectome-ablation/shuffle controls are required before treating individual parameters as identified.
+
 ---
 
 ## 4. Reproduction and File Index
@@ -303,6 +340,7 @@ v5 edge residuals (e2):
 | `glowing-journey_runs/v3_2026-11-19/` | v3 sequential ablation, 16-sample summary, two diagnostic figures |
 | `glowing-journey_runs/v4_kinetics_2026-11-19/` | Per-neuron `tau_ca/k_off`, opt1 e6 / opt2 e8 checkpoints, C/G probe |
 | `glowing-journey_runs/v5_edge_2026-11-19/` | Per-edge release, best e2 checkpoint, edge-long negative result |
+| `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
 
@@ -317,7 +355,9 @@ v5 edge residuals (e2):
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest tests` → **28 passed**.
+- Regression tests: `pytest tests` → **29 passed**.
+- `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
+- `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - All Colab sessions are stopped; there are no active sessions.
 
 ### 4.4 Data
@@ -347,3 +387,5 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 - Warm-start from `v5 edge e2` and try **per-edge release time constants / delays**, rather than continuing to tune thresholds.
 - Or add a **low-rank extrasynaptic residual** specifically to fill the 1-hop/2-hop amplitude gap.
 - Any new scheme must use a fixed split seed, 16 samples, report mean±std over at least three training seeds, and use a worm-level independent validation set. Do not select models with the same-pool random 15% holdout again.
+- Before further Randi tuning: lock a historical benchmark, add an end-to-end causal preprocessing test, fix symmetric gap-junction currents, and replace the phenomenological opsin with an actuator state if the delay analysis depends on it.
+- Then run the Toyoshima NaCl dataset as a second experiment (`--source toyoshima`) with the same locked evaluation discipline.

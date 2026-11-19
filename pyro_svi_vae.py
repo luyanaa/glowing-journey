@@ -24,6 +24,8 @@ from utils import (
     responseGenerator,
     split_trial_dataset,
     split_train_validation_indices,
+    ToyoshimaLoader,
+    resolve_default_toyoshima_path,
 )
 import vae
 
@@ -113,8 +115,11 @@ def main() -> None:
     parser.add_argument("total_epochs", nargs="?", type=int, default=10, help="Total epochs to train")
     parser.add_argument("save_every", nargs="?", type=int, default=5, help="Checkpoint frequency in epochs")
     parser.add_argument("--batch_size", "--batch-size", default=16, type=int)
-    parser.add_argument("--source", choices=["randi", "synthetic"], default="randi")
+    parser.add_argument("--source", choices=["randi", "toyoshima", "synthetic"], default="randi")
     parser.add_argument("--data-path", default=DEFAULT_DATA_PATH, type=str)
+    parser.add_argument("--toyoshima-path", default=resolve_default_toyoshima_path(), type=str)
+    parser.add_argument("--toyoshima-targets", default="ASH,AWC,ASE", type=str,
+                        help="Comma-separated operational NaCl sensory targets")
     parser.add_argument("--dataset-cache", default=None, type=str)
     parser.add_argument("--strain", default="wild-type", type=str)
     parser.add_argument("--norm-mode", choices=["dff_safe", "dff_strict", "robust_z"], default="dff_safe")
@@ -146,6 +151,8 @@ def main() -> None:
     parser.add_argument("--split-seed", default=42, type=int, help="Fixed data split seed")
     parser.add_argument("--val-fraction", default=0.15, type=float,
                         help="Recording-grouped validation fraction held out from training")
+    parser.add_argument("--eval-test-each-save", action="store_true",
+                        help="Evaluate the locked test set at every save (default: final save only)")
     parser.add_argument("--snapshot-dir", default=".", type=str)
     args = parser.parse_args()
 
@@ -168,6 +175,33 @@ def main() -> None:
             ).build_trial_dataset(pre_vols=args.pre_vols, post_vols=args.post_vols)
             if args.dataset_cache:
                 dataset.save(args.dataset_cache)
+        source_label = "randi"
+    elif args.source == "toyoshima":
+        targets = tuple(t.strip() for t in args.toyoshima_targets.split(",") if t.strip())
+        dataset = ToyoshimaLoader(
+            args.toyoshima_path,
+            target_fs=1.0 / float(args.dt_obs),
+            stim_targets=targets,
+            max_recordings=args.max_recordings,
+        ).build_trial_dataset(pre_vols=args.pre_vols, post_vols=args.post_vols)
+        if args.dataset_cache:
+            dataset.save(args.dataset_cache)
+        source_label = "toyoshima"
+    else:
+        x_all, y_all, m_all = responseGenerator(
+            folder="./wormfunconn/atlas/", strain=args.strain, size=100, dt=args.dt_obs
+        ).Dataset(return_mask=True)
+        noise_all = torch.full((x_all.shape[0], x_all.shape[2]), 0.05, dtype=torch.float32)
+        from pyro_svi_c302 import _TupleDataset
+
+        idx = list(range(len(x_all)))
+        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=42)
+        train_ds = _TupleDataset(x_all[train_idx], y_all[train_idx], m_all[train_idx], noise_all[train_idx])
+        test_ds = _TupleDataset(x_all[test_idx], y_all[test_idx], m_all[test_idx], noise_all[test_idx])
+        val_ds = None
+        source_label = "synthetic"
+
+    if args.source != "synthetic":
         train_idx, test_idx, split_info = split_trial_dataset(
             dataset,
             test_size=0.1,
@@ -183,28 +217,16 @@ def main() -> None:
             val_ds = Subset(dataset, val_idx)
         else:
             train_core_idx = list(train_idx)
-            val_idx = list(test_idx)
-            val_info = {"val_recordings": split_info["test_recordings"]}
-            val_ds = test_ds
+            val_idx = []
+            val_info = {"val_recordings": 0}
+            val_ds = None
         train_ds = Subset(dataset, train_core_idx)
         print(
-            f"Dataset ready (randi): train={len(train_ds)} trials "
+            f"Dataset ready ({source_label}): train={len(train_ds)} trials "
             f"({split_info['train_recordings']} recs, val={val_info['val_recordings']} recs), "
-            f"val={len(val_ds)} trials, test={len(test_ds)} trials "
+            f"val={0 if val_ds is None else len(val_ds)} trials, test={len(test_ds)} trials "
             f"({split_info['test_recordings']} recs, grouped={bool(split_info['grouped'])})"
         )
-    else:
-        x_all, y_all, m_all = responseGenerator(
-            folder="./wormfunconn/atlas/", strain=args.strain, size=100, dt=args.dt_obs
-        ).Dataset(return_mask=True)
-        noise_all = torch.full((x_all.shape[0], x_all.shape[2]), 0.05, dtype=torch.float32)
-        from pyro_svi_c302 import _TupleDataset
-
-        idx = list(range(len(x_all)))
-        train_idx, test_idx = train_test_split(idx, test_size=0.1, random_state=42)
-        train_ds = _TupleDataset(x_all[train_idx], y_all[train_idx], m_all[train_idx], noise_all[train_idx])
-        test_ds = _TupleDataset(x_all[test_idx], y_all[test_idx], m_all[test_idx], noise_all[test_idx])
-        val_ds = test_ds
 
     pin = torch.cuda.is_available()
     train_data = DataLoader(
@@ -216,12 +238,16 @@ def main() -> None:
         drop_last=len(train_ds) >= args.batch_size,
         num_workers=args.num_workers,
     )
-    val_data = DataLoader(
-        val_ds,
-        batch_size=min(args.batch_size, len(val_ds)),
-        pin_memory=pin,
-        shuffle=False,
-        num_workers=args.num_workers,
+    val_data = (
+        DataLoader(
+            val_ds,
+            batch_size=min(args.batch_size, len(val_ds)),
+            pin_memory=pin,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+        if val_ds is not None
+        else None
     )
     test_data = DataLoader(
         test_ds,
@@ -311,26 +337,30 @@ def main() -> None:
         print(f"Epoch {epoch:03d} | elbo/obs={avg_loss:.4f} | total_loss={loss:.2f} | dt={dt_ep:.2f}s")
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             gate_mode = args.drift_gate if args.use_prestim_encoder else "none"
-            val_metrics = evaluate_predictions(
-                model,
-                val_data,
-                device,
-                guide=model.guide,
-                num_samples=4,
-                pre_vols=args.pre_vols,
-                drift_gate_mode=gate_mode,
-            )
-            test_metrics = evaluate_predictions(
-                model,
-                test_data,
-                device,
-                guide=model.guide,
-                num_samples=4,
-                pre_vols=args.pre_vols,
-                drift_gate_mode=gate_mode,
-            )
-            print(f"  Val  | {format_eval_summary(val_metrics)}")
-            print(f"  Test | {format_eval_summary(test_metrics)}")
+            val_metrics = {}
+            if val_data is not None:
+                val_metrics = evaluate_predictions(
+                    model,
+                    val_data,
+                    device,
+                    guide=model.guide,
+                    num_samples=4,
+                    pre_vols=args.pre_vols,
+                    drift_gate_mode=gate_mode,
+                )
+                print(f"  Val  | {format_eval_summary(val_metrics)}")
+            test_metrics = {}
+            if args.eval_test_each_save or (epoch + 1) == args.total_epochs:
+                test_metrics = evaluate_predictions(
+                    model,
+                    test_data,
+                    device,
+                    guide=model.guide,
+                    num_samples=4,
+                    pre_vols=args.pre_vols,
+                    drift_gate_mode=gate_mode,
+                )
+                print(f"  Test | {format_eval_summary(test_metrics)}")
             _save_snapshot(os.path.join(args.snapshot_dir, f"vae_epoch_{epoch+1}.pt"), model, model.guide, epoch + 1)
             metrics_path = os.path.join(args.snapshot_dir, f"metrics_epoch_{epoch+1}.json")
             with open(metrics_path, "w") as mf:

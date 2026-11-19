@@ -717,6 +717,210 @@ class WormTensor(AtlasLoader):
         super().__init__(path=path, strain="wild-type", device=device, **kwargs)
 
 
+class ToyoshimaLoader:
+    """Load Toyoshima et al. (2022) NaCl whole-brain GCaMP data as a second dataset.
+
+    The export contains ``N_ratio.csv`` (time x neurons), ``N_uniqNames.csv``
+    (column labels), and ``stimulation_timing.xlsx`` (NaCl switching times).
+    The loader resamples each recording to ``target_fs`` (default 2 Hz),
+    maps available neuron IDs onto the 300-neuron canonical space, and cuts
+    trials around each NaCl onset.
+
+    The NaCl stimulus is a sensory perturbation, not a targeted optogenetic
+    input.  ``stim_targets`` is therefore an explicit operational assumption;
+    the default list is the chemosensory set ASH/AWC/ASE, and it can be
+    overridden by the caller.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        aconnectome_path: str = DEFAULT_ACONNECTOME_IDS_PATH,
+        target_fs: float = 2.0,
+        stim_targets: Sequence[str] = ("ASH", "AWC", "ASE"),
+        max_recordings: Optional[int] = None,
+    ):
+        import pandas as pd
+
+        self.data_dir = path
+        self.target_fs = float(target_fs)
+        self.neuron_names, self.name_to_idx = load_canonical_neurons(aconnectome_path)
+        self.n_neurons = len(self.neuron_names)
+        target_indices = []
+        for n in stim_targets:
+            cname = canonicalize_neuron_label(n)
+            if cname in self.name_to_idx:
+                target_indices.append(self.name_to_idx[cname])
+                continue
+            # Toyoshima labels are often bilateral classes (ASH, AWC, ASE),
+            # whereas the canonical connectome uses ASHL/ASHR etc.
+            for suffix in ("L", "R"):
+                split_name = cname + suffix
+                if split_name in self.name_to_idx:
+                    target_indices.append(self.name_to_idx[split_name])
+        self.stim_targets = sorted(set(target_indices))
+        if not self.stim_targets:
+            raise ValueError("No Toyoshima stimulus target maps to the canonical 300-neuron space")
+
+        timing_path = os.path.join(path, "stimulation_timing.xlsx")
+        if not os.path.isfile(timing_path):
+            raise FileNotFoundError(f"Toyoshima stimulation timing not found: {timing_path}")
+        timing = pd.read_excel(timing_path, header=1)
+        timing = timing.dropna(subset=["#sample"])
+        self.timing = timing
+
+        records = []
+        for _, row in timing.iterrows():
+            sample = int(row["#sample"])
+            ratio_path = os.path.join(path, f"{sample}_ratio.csv")
+            names_path = os.path.join(path, f"{sample}_uniqNames.csv")
+            if not (os.path.isfile(ratio_path) and os.path.isfile(names_path)):
+                continue
+            rec = self._load_recording(sample, ratio_path, names_path, row)
+            if rec is not None:
+                records.append(rec)
+            if max_recordings is not None and len(records) >= int(max_recordings):
+                break
+        if not records:
+            raise FileNotFoundError(f"No complete Toyoshima ratio/name pairs found in {path}")
+        self.recordings = records
+
+    def _load_recording(self, sample, ratio_path, names_path, timing_row):
+        import pandas as pd
+
+        raw = pd.read_csv(ratio_path, header=None).to_numpy(dtype=np.float64)
+        labels = pd.read_csv(names_path, header=None)[0].astype(str).tolist()
+        if raw.ndim != 2 or raw.shape[1] != len(labels):
+            return None
+        fs = float(timing_row["frames/sec"])
+        if not np.isfinite(fs) or fs <= 0:
+            return None
+
+        # Resample to the common trial clock.  Interpolation is applied per
+        # column before mapping so unmapped neurons remain masked.
+        n_native = raw.shape[0]
+        t_native = np.arange(n_native, dtype=np.float64) / fs
+        t_grid = np.arange(0.0, t_native[-1] + 1e-9, 1.0 / self.target_fs)
+        y = np.zeros((len(t_grid), self.n_neurons), dtype=np.float32)
+        mask = np.zeros((len(t_grid), self.n_neurons), dtype=bool)
+        noise = np.ones(self.n_neurons, dtype=np.float32)
+
+        mapped = []
+        for col, label in enumerate(labels):
+            cname = canonicalize_neuron_label(label.strip())
+            if cname not in self.name_to_idx:
+                continue
+            cidx = self.name_to_idx[cname]
+            series = raw[:, col]
+            finite = np.isfinite(series)
+            if finite.sum() < 5:
+                continue
+            if not np.all(finite):
+                series = np.interp(np.arange(n_native), np.where(finite)[0], series[finite])
+            y[:, cidx] = np.interp(t_grid, t_native, series).astype(np.float32)
+            mask[:, cidx] = True
+            noise[cidx] = float(np.clip(np.std(np.diff(series)) / np.sqrt(2.0), 0.01, 5.0))
+            mapped.append(cidx)
+        if len(mapped) < 5:
+            return None
+
+        first = float(timing_row["frame number of first stimuli (NaCl concenctration change from 50 mM to 25mM)"])
+        interval = float(timing_row["every N frames NaCl concentration change"])
+        cycles = int(round(float(timing_row["number of stimulation cycles"])))
+        onsets = []
+        for k in range(max(0, cycles)):
+            t_sec = (first + k * interval) / fs
+            idx = int(round(t_sec * self.target_fs))
+            if 0 <= idx < len(t_grid):
+                onsets.append(idx)
+        if not onsets:
+            return None
+        return {
+            "rec_id": int(sample),
+            "name": str(timing_row.get("name", sample)),
+            "y": y,
+            "mask": mask,
+            "noise_scale": noise,
+            "dt": 1.0 / self.target_fs,
+            "onsets": sorted(set(onsets)),
+            "mapped_neurons": len(mapped),
+        }
+
+    def build_trial_dataset(
+        self,
+        pre_vols: int = 10,
+        post_vols: int = 50,
+        stim_duration_s: float = 0.5,
+        min_observed_neurons: int = 5,
+        rebaseline_on_pre: bool = True,
+        max_pre_abs: float = 5.0,
+        trial_clip_abs: Optional[float] = 10.0,
+    ) -> RandiTrialDataset:
+        """Cut NaCl-onset trials into the same tensor format as Randi trials."""
+        trial_len = int(pre_vols) + int(post_vols)
+        dt = 1.0 / self.target_fs
+        pulse_steps = max(1, int(round(float(stim_duration_s) / dt)))
+        stim_list, y_list, mask_list, noise_list, dt_list, meta_list = [], [], [], [], [], []
+
+        for rec in self.recordings:
+            y_full = rec["y"]
+            mask_full = rec["mask"]
+            n_t = y_full.shape[0]
+            for ev_idx, onset in enumerate(rec["onsets"]):
+                v_start = int(onset) - int(pre_vols)
+                v_end = int(onset) + int(post_vols)
+                if v_start < 0 or v_end > n_t:
+                    continue
+                y_seg = y_full[v_start:v_end].copy()
+                m_seg = mask_full[v_start:v_end].copy()
+                stim_seg = np.zeros((trial_len, self.n_neurons), dtype=np.float32)
+                rel = int(pre_vols)
+                for target in self.stim_targets:
+                    stim_seg[rel:min(trial_len, rel + pulse_steps), target] = 1.0
+
+                if rebaseline_on_pre and pre_vols >= 3:
+                    for c in np.where(np.any(m_seg[:pre_vols], axis=0))[0]:
+                        pre = y_seg[:pre_vols, c][m_seg[:pre_vols, c]]
+                        if pre.size < 3:
+                            continue
+                        med = float(np.median(pre))
+                        if abs(med) > max_pre_abs:
+                            m_seg[:, c] = False
+                            y_seg[:, c] = 0.0
+                            continue
+                        y_seg[:, c] -= med
+                        if trial_clip_abs is not None:
+                            y_seg[:, c] = np.clip(y_seg[:, c], -trial_clip_abs, trial_clip_abs)
+                        y_seg[~m_seg[:, c], c] = 0.0
+
+                if int(np.sum(np.any(m_seg, axis=0))) < int(min_observed_neurons):
+                    continue
+
+                stim_list.append(torch.from_numpy(stim_seg))
+                y_list.append(torch.from_numpy(y_seg.astype(np.float32)))
+                mask_list.append(torch.from_numpy(m_seg.astype(bool)))
+                noise_list.append(torch.from_numpy(rec["noise_scale"].astype(np.float32)))
+                dt_list.append(dt)
+                meta_list.append({
+                    "rec_id": int(rec["rec_id"]),
+                    "event_idx": int(ev_idx),
+                    "stim_neuron": "NaCl",
+                    "stim_neuron_idx": int(self.stim_targets[0]),
+                    "source": str(rec["name"]),
+                })
+
+        if not y_list:
+            raise ValueError("No Toyoshima trials survived slicing/min-observation filters")
+        return RandiTrialDataset(
+            stim_inputs=torch.stack(stim_list),
+            y=torch.stack(y_list),
+            obs_mask=torch.stack(mask_list),
+            noise_scale=torch.stack(noise_list),
+            dts=torch.tensor(dt_list, dtype=torch.float32),
+            meta=meta_list,
+        )
+
+
 def resolve_default_data_path() -> str:
     """Resolve Randi exported_data directory via env var or standard local/Colab fallbacks."""
     env_path = os.environ.get("RANDI_DATA_DIR")
@@ -731,6 +935,22 @@ def resolve_default_data_path() -> str:
         if os.path.isdir(cand):
             return cand
     return "./data/exported_data"
+
+
+def resolve_default_toyoshima_path() -> str:
+    """Resolve the Toyoshima cleandata_smoothened2 directory."""
+    env_path = os.environ.get("TOYOSHIMA_DATA_DIR")
+    if env_path:
+        return env_path
+    candidates = [
+        "/content/drive/MyDrive/cleandata_smoothened2",
+        "./data/cleandata_smoothened2",
+        "/Users/yanlu/Google Drive/マイドライブ/cleandata_smoothened2",
+    ]
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return cand
+    return "./data/cleandata_smoothened2"
 
 
 def split_trial_dataset(

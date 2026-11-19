@@ -1,0 +1,28 @@
+{
+  "source": "/Users/yanlu/Google Drive/マイドライブ/cleandata_smoothened2",
+  "reference": "Toyoshima et al. (2022), Ensemble dynamics and information flow deduction from whole-brain imaging data, PLOS Computational Biology",
+  "timing_rows": 24,
+  "complete_recordings": 21,
+  "missing_ratio_samples": [2, 12, 13],
+  "frames_per_recording": 6000,
+  "mapped_neurons": {"min": 65, "max": 151, "mean": 127},
+  "stimulation_cycles_total": 679,
+  "native_frame_rate_hz": {"min": 3.69, "max": 5.72},
+  "resample_hz": 2.0,
+  "trial_geometry": {"pre_frames": 10, "post_frames": 50, "dt_s": 0.5},
+  "operational_targets": {
+    "requested": ["ASH", "AWC", "ASE"],
+    "canonical": ["ASHL", "ASHR", "AWCL", "AWCR", "ASEL", "ASER"],
+    "note": "NaCl is a sensory perturbation, not a targeted optogenetic input; this target set is an explicit modeling assumption."
+  },
+  "example_recording": {
+    "sample": 1,
+    "name": "180710a",
+    "mapped_neurons": 78,
+    "onsets": 48,
+    "surviving_trials": 47,
+    "mask_fraction": 0.26
+  },
+  "loader": "utils.ToyoshimaLoader",
+  "cli": "python pyro_svi_vae.py 10 5 --source toyoshima --toyoshima-path <dir> --dt-obs 0.5"
+}
