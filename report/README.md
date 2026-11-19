@@ -368,7 +368,20 @@ The next model changes must pass a fixed protocol before biological interpretati
 - **Evoked metric**: `compute_stratified_metrics` now emits `evoked_post_*`, `evoked_stim_*`, `evoked_hop1_*`, `evoked_hop2_*`, and `evoked_unconnected_*`. Each trial/neuron has its pre-stimulus mean removed from both truth and prediction before post-stimulus scoring; this is separate from the raw `hop1_r2`.
 - **Hard gate**: `evoked_hop1_r2` for intact versus shuffled connectomes. The gate passes only when `delta_mean > 0` and `delta_mean > pooled SEM` (one-sided ~84%). `tools/run_nested_protocol.py` writes `summary.json` with the gate and all seed/shuffle runs. No P1/P2 model change is promoted unless this gate passes.
 
-The protocol was smoke-tested end to end with a tiny cache and one outer fold; the full 5-fold × 3-seed × 3-shuffle run is intentionally a separate compute job, not silently reduced to a single seed.
+Full run completed: 5 outer folds × (3 intact training seeds + 3 shuffle groups) = 30 runs, 20 epochs, batch 128, 16 posterior samples.
+
+| Fold | intact evoked_hop1_R² | shuffle evoked_hop1_R² | Δ |
+|---|---:|---:|---:|
+| 0 | 0.03258 ± 0.00902 | 0.03091 ± 0.00493 | +0.00168 |
+| 1 | 0.02440 ± 0.00488 | 0.02560 ± 0.00216 | -0.00121 |
+| 2 | 0.02777 ± 0.00281 | 0.02715 ± 0.00423 | +0.00062 |
+| 3 | 0.05698 ± 0.00401 | 0.05705 ± 0.00232 | -0.00007 |
+| 4 | 0.02039 ± 0.00758 | 0.01143 ± 0.00919 | +0.00897 |
+| **Pooled** | **0.03242 ± 0.01433** | **0.03043 ± 0.01600** | **+0.00200** |
+
+Pooled SEM = 0.00555; `delta_mean = 0.00200 < SEM` → **gate FAIL**. Only fold 4 is positive; fold 3 is effectively zero and folds 0–2 are within noise. The full run JSON is `report/data/p0_full_gate.json`.
+
+This blocks P1/P2 promotion: the current v3 model does not establish that its 1-hop signal depends on the real connectome topology.
 
 ### 3.13 Statistical and causal caveats (review findings)
 
@@ -397,6 +410,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/v5_edge_2026-11-19/` | Per-edge release, historical best e2 checkpoint, edge-long negative result |
 | `glowing-journey_runs/current_2026-11-19/` | Current-code 20-epoch Randi and Toyoshima checkpoints, metrics, and 16-sample eval JSON |
 | `glowing-journey_runs/route_ab_2026-11-19/` | Corrected Toyoshima, causal Randi baseline, and connectome-shuffle checkpoints/metrics |
+| `glowing-journey_runs/p0_2026-11-20/` | Full 5-fold P0 gate summaries; `p0_partial` contains the discarded batch-16 run |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -422,7 +436,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
-- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`.
+- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
@@ -452,6 +466,7 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 6. Under the current symmetric-gap code, a fresh Randi 20-epoch model gives `post_inlier_R²=0.1007` and `hop1_R²=0.0676`; this is weaker than the historical v5 warm-start result. The gap fix itself costs about 5–6% on these metrics in the adapter comparison, and the rest is training-protocol difference.
 7. Toyoshima after the route-B loader rewrite is still weak (`post_inlier_R²=0.0236`, `hop1_R²=0.0356`, `unconn_r=0.141`), although polarity is directionally correct and `stim_r` rises to 0.286. It is not cross-dataset generalization.
 8. The route-A connectome shuffle does not degrade post-stim or 1-hop metrics (`post_inlier_R² 0.0891→0.0889`, `hop1_r 0.260→0.258`, `hop1_R² 0.0451→0.0547`), while stimulus correlation drops (`stim_r 0.402→0.249`). The evoked gate is also negative (`evoked_hop1_R² 0.0310→0.0378`, Δ=-0.0068). The observed 1-hop signal is therefore not established as topology-specific; it must not be interpreted as connectome propagation without a multi-seed permutation test.
+9. The full P0 gate also fails: across 5 folds, intact `evoked_hop1_R²=0.03242±0.01433` versus shuffle `0.03043±0.01600`, Δ=0.00200, pooled SEM=0.00555. P1/P2 structural changes are therefore blocked until a model beats this null convincingly.
 
 ### Recommended next round
 
