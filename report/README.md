@@ -11,7 +11,7 @@
 
 This project predicts whole-brain GCaMP ΔF/F0 in *C. elegans* from optogenetic stimulation and the connectome, using a biophysical membrane / calcium / GCaMP model. Evaluation is strictly post-stimulus (`t >= 10` frames / 5 s) and splits neurons by connectome distance into direct-stimulated, 1-hop, 2-hop, and unconnected groups. The test set contains 11 unseen worms and 329 trials.
 
-The current best combined model is **v5 edge e2**:
+The historical best combined model is **v5 edge e2** (pre-symmetric-gap code; see §3.10 for the current-code re-observation):
 
 - `post_inlier_R² = 0.1202`
 - `hop1_R² = 0.0736`
@@ -317,7 +317,31 @@ v5 edge residuals (e2):
 - `v_rest_edge_delta`: mean +0.9 mV, std 3.4 mV, range [-17.2, +15.8] mV
 - `v_slope` factor: 0.998 ± 0.0069, range [0.972, 1.022]
 
-### 3.10 Statistical and causal caveats (review findings)
+### 3.10 Current-code re-observation (2026-11-19)
+
+Both datasets below use the current code path: deduplicated symmetric gap junctions, recording-grouped split, test only at the final save, and 16 posterior samples. The Randi row is a fresh 20-epoch from-scratch model; the v5 adapter is a diagnostic that loads the old checkpoint and applies the symmetric-gap fix at evaluation time, not a retrain.
+
+#### Randi
+
+| Run | post_inlier_R² | post_inlier_RMSE | post_r | stim_r | hop1_r | hop1_R² | hop2_r | unconn_r |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| v5 edge e2, historical directed gap | 0.1202 | — | 0.347 | 0.388 | 0.291 | 0.0736 | 0.310 | 0.316 |
+| v5 checkpoint, symmetric adapter | 0.1145 | 0.1874 | 0.340 | 0.371 | 0.296 | 0.0723 | 0.313 | 0.319 |
+| v5 checkpoint, legacy directed | 0.1219 | 0.1866 | 0.349 | 0.409 | 0.294 | 0.0760 | 0.311 | 0.317 |
+| current 20-epoch from scratch | **0.1007** | 0.1888 | 0.324 | 0.349 | **0.306** | **0.0676** | 0.297 | 0.295 |
+
+The symmetric adapter lowers `post_inlier_R²` from 0.1219 to 0.1145 (−6.1%) and `hop1_R²` from 0.0760 to 0.0723 (−4.9%) relative to the legacy directed checkpoint. The from-scratch model reaches 0.1007/0.0676, lower than v5; it also has a different training protocol (no v4 warm start, no edge-only phase), so this is not a clean gap-fix effect. What is clear: the KCL-correct symmetric model remains in the same weak regime, not a collapse.
+
+#### Toyoshima
+
+| Run | post_inlier_R² | post_inlier_RMSE | post_r | stim_r | hop1_r | hop1_R² | hop2_r | unconn_r |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| current 20-epoch symmetric | **0.0165** | 0.9128 | 0.129 | 0.192 | 0.135 | 0.0171 | 0.144 | 0.112 |
+| zero baseline | 0.0000 | 0.9526 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+
+Toyoshima has 21 recordings, 585 NaCl-onset trials, 16 train / 3 validation / 5 test recordings. The current model explains 1.6% of post-stim variance, improves post-stim RMSE over zero only from 0.953 to 0.913, and predicts stimulated mean 0.038 versus true 0.174. All strata, including unconnected neurons, have similar correlations (0.11–0.19), so the model is fitting a weak global/mean component rather than a connectome-specific NaCl response. This is **not** evidence of cross-dataset generalization.
+
+### 3.11 Statistical and causal caveats (review findings)
 
 These are not fixed by the current report; they are constraints on how the numbers above may be interpreted.
 
@@ -325,9 +349,10 @@ These are not fixed by the current report; they are constraints on how the numbe
 2. **`--val-fraction=0` previously made `val_ds = test_ds`.** The training script now avoids this: with `val_fraction=0`, `val_ds=None`; test is evaluated only at the final save by default (`--eval-test-each-save` opt-in). The historical v3/v4/v5 runs predate this guard.
 3. **Preprocessing causality is now opt-in, not retrospective.** `preprocess_gcamp_recording(..., causal=True)` uses past-only Hampel/baseline/normalization and has a pre-stim invariance test. The historical v3/v4/v5 results used the old bidirectional/whole-recording path (`--causal-preprocess` is off by default for backward compatibility), so the old results must not be described as strictly causal forecasting.
 4. **The guide still uses a batch-mean global posterior.** `Encoder.forward` averages trials in a minibatch to produce global connectome/neuron posterior loc/scale, then an EMA is used at inference. This is an engineering approximation to `p(θ | Y_train)`, not a hierarchical global/local variational posterior. A proper worm-level latent hierarchy remains future work.
-5. **Gap-junction symmetry is fixed in the current code.** Electrical pairs are deduplicated, and `GeneralSynapse` symmetrizes its conductance matrix; a KCL/current-conservation test is included. Historical v3/v4/v5 results predate this fix and used directed currents; they should not be used to compare gap-junction topology effects.
+5. **Gap-junction symmetry is fixed in the current code.** Electrical pairs are deduplicated, and `GeneralSynapse` symmetrizes its conductance matrix; a KCL/current-conservation test is included. Historical v3/v4/v5 results predate this fix and used directed currents; they should not be used to compare gap-junction topology effects. The symmetric adapter in §3.10 is a post-hoc evaluation of the old v5 weights, not a retrain; the current 20-epoch model is a from-scratch control.
 6. **The optogenetic actuator is now optional.** `--stim-actuator` adds a first-order rise/decay state; `--per-neuron-stim-gain` adds constrained per-target gain. The historical results still use the original instantaneous `stim_gain × binary pulse`, so the old latency analysis remains phenomenological.
 7. **Global parameter identifiability is not established.** Strong synaptic conductance, high stimulus gain, and a low calcium threshold can compensate. A 3-neuron/1-edge synthetic probe (`report/data/identifiability_probe.json`) recovered `g_max=0.010` vs true `0.050`, `tau_ca=5.10 s` vs `7.0 s`, and `k_off=0.0399 s^-1` vs `0.045`, while `v_th_ca` stayed near the prior median. This is direct evidence for compensation; synthetic recovery, posterior calibration, and connectome-ablation/shuffle controls are required before treating individual parameters as identified.
+8. **Toyoshima is a negative current-protocol result, not a success.** The 20-epoch model reaches `post_inlier_R² = 0.0165` and `hop1_R² = 0.0171`; the stimulated prediction mean is 0.038 versus 0.174 true. Do not use this run as evidence for NaCl response generalization; the loader's ASH/AWC/ASE target mapping and the 2 Hz resampling/trial extraction are operational assumptions that need validation.
 
 ---
 
@@ -340,7 +365,8 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/ab_2026-11-19/` | First A/B, gate diagnostics, posterior variance, controlled-seed notes |
 | `glowing-journey_runs/v3_2026-11-19/` | v3 sequential ablation, 16-sample summary, two diagnostic figures |
 | `glowing-journey_runs/v4_kinetics_2026-11-19/` | Per-neuron `tau_ca/k_off`, opt1 e6 / opt2 e8 checkpoints, C/G probe |
-| `glowing-journey_runs/v5_edge_2026-11-19/` | Per-edge release, best e2 checkpoint, edge-long negative result |
+| `glowing-journey_runs/v5_edge_2026-11-19/` | Per-edge release, historical best e2 checkpoint, edge-long negative result |
+| `glowing-journey_runs/current_2026-11-19/` | Current-code 20-epoch Randi and Toyoshima checkpoints, metrics, and 16-sample eval JSON |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -349,7 +375,9 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `v3_2026-11-19/vae_opt2_ungated_v3/vae_epoch_20.pt`
 - `v4_kinetics_2026-11-19/checkpoints/opt1_vae_epoch_6.pt`
 - `v4_kinetics_2026-11-19/checkpoints/opt2_vae_epoch_8.pt`
-- `v5_edge_2026-11-19/checkpoints/edge_vae_epoch_2.pt` ← current best
+- `v5_edge_2026-11-19/checkpoints/edge_vae_epoch_2.pt` ← historical best (pre-gap-fix)
+- `current_2026-11-19/randi/vae_epoch_20.pt` ← current-code Randi control
+- `current_2026-11-19/toyo/vae_epoch_20.pt` ← current-code Toyoshima control
 
 ### 4.3 Code and tests
 
@@ -358,6 +386,8 @@ These are not fixed by the current report; they are constraints on how the numbe
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
 - Regression tests: `pytest tests` → **33 passed**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
+- `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
+- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
@@ -384,6 +414,8 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 3. Per-neuron calcium kinetics (v4) gives a small hop1 amplitude/R² gain but does not fix peak timing.
 4. Per-edge release residuals (v5 e2) push hop1_R² to 0.0736, but must be early-stopped at 2 epochs; further training degrades the result.
 5. The current bottleneck is **1-hop amplitude (~0.26×) and peak-time/phase errors in some neurons**, not another saturation wall.
+6. Under the current symmetric-gap code, a fresh Randi 20-epoch model gives `post_inlier_R²=0.1007` and `hop1_R²=0.0676`; this is weaker than the historical v5 warm-start result. The gap fix itself costs about 5–6% on these metrics in the adapter comparison, and the rest is training-protocol difference.
+7. The current model does **not** learn the Toyoshima NaCl data (`post_inlier_R²=0.0165`, `hop1_R²=0.0171`, stimulated mean 0.038 vs 0.174). The next Toyoshima step must be data/preprocessing and stimulus-input validation, not more epochs or parameter tuning.
 
 ### Recommended next round
 
