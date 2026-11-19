@@ -31,6 +31,9 @@ def main() -> None:
     p.add_argument("--source", default="randi", choices=["randi", "toyoshima"])
     p.add_argument("--out", required=True)
     p.add_argument("--epochs", default=20, type=int)
+    p.add_argument("--batch-size", default=128, type=int)
+    p.add_argument("--substeps", default=2, type=int)
+    p.add_argument("--lr", default=0.001, type=float)
     p.add_argument("--folds", default=5, type=int)
     p.add_argument("--fold-indices", default="0")
     p.add_argument("--seeds", default="42,43,44")
@@ -68,6 +71,9 @@ def main() -> None:
                 "--dataset-cache", args.cache,
                 "--split-file", fold_json,
                 "--seed", str(seed),
+                "--batch-size", str(args.batch_size),
+                "--substeps", str(args.substeps),
+                "--lr", str(args.lr),
                 "--use-prestim-encoder",
                 "--snapshot-dir", run_dir,
             ]
