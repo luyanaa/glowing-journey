@@ -29,6 +29,10 @@ def main() -> None:
     p.add_argument("--no-prestim-encoder", action="store_true")
     p.add_argument("--per-neuron-kinetics", action="store_true")
     p.add_argument("--per-edge-release", action="store_true")
+    p.add_argument("--per-neuron-stim-gain", action="store_true")
+    p.add_argument("--stim-actuator", action="store_true")
+    p.add_argument("--stim-tau-rise", default=0.08, type=float)
+    p.add_argument("--stim-tau-decay", default=0.4, type=float)
     p.add_argument("--num-samples", default=16, type=int)
     p.add_argument("--pre-vols", default=10, type=int)
     args = p.parse_args()
@@ -54,6 +58,10 @@ def main() -> None:
         prestim_rank=16,
         per_neuron_kinetics=args.per_neuron_kinetics,
         per_edge_release=args.per_edge_release,
+        per_neuron_stim_gain=args.per_neuron_stim_gain,
+        stim_actuator=args.stim_actuator,
+        stim_tau_rise=args.stim_tau_rise,
+        stim_tau_decay=args.stim_tau_decay,
     )
     model = vae.VAElegans(
         rec,

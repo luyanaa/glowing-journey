@@ -46,6 +46,12 @@ def main() -> None:
     p.add_argument("--shuffle-train-seed", default=42, type=int)
     p.add_argument("--per-neuron-kinetics", action="store_true")
     p.add_argument("--per-edge-release", action="store_true")
+    p.add_argument("--per-neuron-stim-gain", action="store_true")
+    p.add_argument("--stim-actuator", action="store_true")
+    p.add_argument("--stim-tau-rise", default=0.08, type=float)
+    p.add_argument("--stim-tau-decay", default=0.4, type=float)
+    p.add_argument("--hop1-loss-weight", default=1.0, type=float)
+    p.add_argument("--stim-loss-weight", default=1.0, type=float)
     p.add_argument("--causal-preprocess", action="store_true")
     p.add_argument("--python", default=sys.executable)
     args = p.parse_args()
@@ -90,6 +96,15 @@ def main() -> None:
                 cmd.append("--per-neuron-kinetics")
             if args.per_edge_release:
                 cmd.append("--per-edge-release")
+            if args.per_neuron_stim_gain:
+                cmd.append("--per-neuron-stim-gain")
+            if args.stim_actuator:
+                cmd.append("--stim-actuator")
+                cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])
+            if args.hop1_loss_weight != 1.0:
+                cmd.extend(["--hop1-loss-weight", str(args.hop1_loss_weight)])
+            if args.stim_loss_weight != 1.0:
+                cmd.extend(["--stim-loss-weight", str(args.stim_loss_weight)])
             if shuffle_seed is not None:
                 cmd.extend(["--shuffle-connectome", str(shuffle_seed)])
             log_path = os.path.join(run_dir, "train.log")
@@ -131,6 +146,11 @@ def main() -> None:
                 eval_cmd.append("--per-neuron-kinetics")
             if args.per_edge_release:
                 eval_cmd.append("--per-edge-release")
+            if args.per_neuron_stim_gain:
+                eval_cmd.append("--per-neuron-stim-gain")
+            if args.stim_actuator:
+                eval_cmd.append("--stim-actuator")
+                eval_cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])
             if shuffle_seed is not None:
                 eval_cmd.extend(["--shuffle-seed", str(shuffle_seed)])
             proc = subprocess.run(eval_cmd, cwd=REPO, capture_output=True, text=True)

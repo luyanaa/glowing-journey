@@ -47,18 +47,33 @@ def compute_drift_gate(stim: torch.Tensor, adjacency: torch.Tensor, mode: str) -
 
 
 def reweight_hop1_noise(
-    noise: torch.Tensor, stim: torch.Tensor, adjacency: torch.Tensor, weight: float
+    noise: torch.Tensor,
+    stim: torch.Tensor,
+    adjacency: torch.Tensor,
+    weight: float,
+    stim_weight: float = 1.0,
 ) -> torch.Tensor:
-    """Shrink the observation noise (increase likelihood weight) on 1-hop neurons."""
-    if weight <= 1.0:
-        return noise
+    """Shrink observation noise (increase likelihood weight) on 1-hop and stim targets.
+
+    ``weight`` controls the 1-hop factor; ``stim_weight`` independently controls
+    the direct stimulus targets, which are only ~1.4% of post-stim observations
+    and otherwise disappear into the background likelihood.
+    """
     stim_target = stim.sum(dim=1) > 0
     hop1 = (stim_target.to(dtype=stim.dtype) @ adjacency > 0) & (~stim_target)
-    factor = torch.where(
-        hop1,
-        torch.full_like(noise, 1.0 / float(weight)),
-        torch.ones_like(noise),
-    )
+    factor = torch.ones_like(noise)
+    if stim_weight > 1.0:
+        factor = torch.where(
+            stim_target,
+            torch.full_like(noise, 1.0 / float(stim_weight)),
+            factor,
+        )
+    if weight > 1.0:
+        factor = torch.where(
+            hop1,
+            torch.full_like(noise, 1.0 / float(weight)),
+            factor,
+        )
     return noise * factor
 
 
@@ -139,6 +154,8 @@ def main() -> None:
                         help="Gate pre-stimulus drift on direct/1-hop stimulus targets")
     parser.add_argument("--hop1-loss-weight", default=1.0, type=float,
                         help="Relative likelihood weight on 1-hop downstream neurons")
+    parser.add_argument("--stim-loss-weight", default=1.0, type=float,
+                        help="Relative likelihood weight on direct stimulus targets")
     parser.add_argument("--per-neuron-kinetics", action="store_true",
                         help="Learn per-neuron tau_ca and k_off (hierarchical around v3 global values)")
     parser.add_argument("--per-edge-release", action="store_true",
@@ -370,7 +387,9 @@ def main() -> None:
             bsz = max(1, int(stim.shape[0]))
             scale_factor = float(n_train_trials) / float(bsz) if n_train_trials > bsz else 1.0
             drift_gate = compute_drift_gate(stim, adj_t, args.drift_gate) if args.use_prestim_encoder else None
-            noise = reweight_hop1_noise(noise, stim, adj_t, args.hop1_loss_weight)
+            noise = reweight_hop1_noise(
+                noise, stim, adj_t, args.hop1_loss_weight, args.stim_loss_weight
+            )
             loss += svi.step(
                 ExternalInput=stim,
                 mask=mask,

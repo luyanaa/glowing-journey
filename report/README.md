@@ -365,7 +365,7 @@ The next model changes must pass a fixed protocol before biological interpretati
 - **Nested recording-grouped CV**: `tools/run_nested_protocol.py` uses `utils.nested_grouped_splits` (5 outer folds, grouped validation inside each outer train fold) and writes explicit `train/val/test` index JSON consumed by `pyro_svi_vae.py --split-file`. The outer test fold is never used for early stopping.
 - **Seeds and conditions**: main comparisons use at least three training seeds. The shuffle gate uses at least three fixed degree-preserving endpoint permutations.
 - **Forced current preprocessing**: Randi runs use the causal cache built with `preprocess_gcamp_recording(..., causal=True)` and the current symmetric gap-junction code; `--causal-preprocess` is passed explicitly even when a cache is loaded.
-- **Evoked metric**: `compute_stratified_metrics` emits `evoked_post_*`, `evoked_stim_*`, `evoked_hop1_*`, `evoked_hop2_*`, and `evoked_unconnected_*`. By default it removes a causal **linear pre-stimulus trend** (not just the constant mean) from both truth and prediction before post-stimulus scoring; `evoked_baseline="mean"` remains available for diagnostics.
+- **Evoked metric**: `evaluate_predictions` now computes a paired **counterfactual** prediction `y(stim) - y(0)` using the same guide samples, so a pre-stim encoder's injected drift cancels on both sides. Truth is scored against its frozen pre-stim mean; the default evoked window is the first 16 post frames (8 s). `compute_stratified_metrics` still supports `evoked_baseline="linear"` for diagnostics, but it is no longer the default evaluation ruler.
 - **Hard gate**: `evoked_hop1_r2` for intact versus shuffled connectomes. The gate passes only when `intact_mean > 0`, `delta_mean > 0`, and `delta_mean > pooled SEM` (one-sided ~84%). The absolute-positive requirement prevents a near-zero negative-vs-more-negative result from passing. `tools/run_nested_protocol.py` writes `summary.json` with the gate and all seed/shuffle runs. No P1/P2 model change is promoted unless this gate passes.
 
 ### P0-v1 is invalidated (do not use as a gate verdict)
@@ -382,32 +382,41 @@ The old table is retained only as provenance in `report/data/p0_full_gate.json`;
 
 - `--lr` default restored to **5e-3**.
 - `--save-every` default **5**; runner selects the best checkpoint by grouped validation (`--val-metric`, default `post_inlier_r2`), then evaluates that checkpoint on the locked outer test fold.
-- Evoked metrics use causal linear detrending by default.
+- `compute_stratified_metrics` retains causal linear/mean baselines for diagnostics; the primary evaluation uses paired counterfactual rollouts.
 - `--no-prestim-encoder` is implemented in both training/evaluation so the planned Fold-0 open-loop diagnostic can isolate the encoder's contribution.
+- `--per-neuron-stim-gain` and `--stim-actuator` are wired through the nested runner and checkpoint evaluator.
+- `reweight_hop1_noise` now has an independent `--stim-loss-weight` for the ~1.4% direct-stimulus observations, in addition to `--hop1-loss-weight`.
+- Evoked scoring uses paired counterfactual rollouts rather than subtracting a pre-window baseline from the prediction; the raw linear/mean baseline modes remain for diagnostics.
+- The next Fold-0 command now includes the direct-stim/1-hop weighting and a larger budget:
+  `--epochs 30-40 --save-every 5 --batch-size 64/128 --val-metric evoked_hop1_r2 --per-neuron-stim-gain --stim-actuator --stim-loss-weight 6 --hop1-loss-weight 3`.
 
-The Fold-0 smoke was run after these fixes (20 epochs, validation-selected checkpoint):
+The following Fold-0 numbers were collected **before** the counterfactual-evoked fix, using the linear-detrending ruler; they are retained as provenance and must be rerun with the new metric before any gate claim.
 
 | Condition | selected epochs | stim_r (3 seeds) | evoked_stim_R² (3 seeds) | evoked_hop1_R² (3 seeds) | gate |
 |---|---|---|---:|---:|---:|---|
 | pre-stim encoder | 10/15/10 | 0.259 / 0.289 / 0.257 | -0.060 / -0.052 / -0.067 | -0.041 / -0.034 / -0.043 | FAIL |
 | no pre-stim encoder | 15/15/20 | 0.281 / 0.280 / 0.246 | 0.004 / 0.016 / 0.015 | -0.001 / -0.001 / -0.0004 | FAIL after requiring positive intact mean |
 
-The `stim_r ≥ 0.38` threshold is **not met** even after lr restoration; no-prestim does not produce a credible positive evoked 1-hop signal. This is closer to Case B (current Wicks + uniform Gaussian likelihood is not learning the direct-stim/1-hop response), not Case A (connectome signal stolen by the pre-stim encoder). The full 5-fold gate and P1/P2 remain blocked.
+Even on the old ruler, the `stim_r ≥ 0.38` threshold is not met after lr restoration; no-prestim does not produce a credible positive evoked 1-hop signal. This points toward Case B, but the table must not be over-interpreted because the ruler has since changed. The full 5-fold gate and P1/P2 remain blocked pending a counterfactual Fold-0 rerun with a larger effective budget.
 
 The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
 
 ```bash
-# Step 1: corrected budget + validation-selected checkpoint
+# Step 1: corrected budget + counterfactual metric + direct-stim weighting
 python tools/run_nested_protocol.py --cache <causal.npz> --out <dir> \
   --folds 5 --fold-indices 0 --epochs 30 --save-every 5 \
-  --batch-size 128 --substeps 2 --lr 0.005 \
-  --val-metric stim_r2 --causal-preprocess
+  --batch-size 64 --substeps 2 --lr 0.005 \
+  --val-metric evoked_hop1_r2 --causal-preprocess \
+  --per-neuron-stim-gain --stim-actuator \
+  --stim-loss-weight 6 --hop1-loss-weight 3
 
 # Step 2: same Fold-0 intact/shuffle diagnostic without pre-stim encoder
 python tools/run_nested_protocol.py --cache <causal.npz> --out <dir_nopre> \
   --folds 5 --fold-indices 0 --epochs 30 --save-every 5 \
-  --batch-size 128 --substeps 2 --lr 0.005 --no-prestim-encoder \
-  --val-metric stim_r2 --causal-preprocess
+  --batch-size 64 --substeps 2 --lr 0.005 --no-prestim-encoder \
+  --val-metric evoked_hop1_r2 --causal-preprocess \
+  --per-neuron-stim-gain --stim-actuator \
+  --stim-loss-weight 6 --hop1-loss-weight 3
 ```
 
 ```bash
@@ -472,10 +481,10 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest tests` → **39 passed**.
+- Regression tests: `pytest tests` → **40 passed**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
-- P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`.
+- P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
 - Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.

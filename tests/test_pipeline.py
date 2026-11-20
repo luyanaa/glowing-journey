@@ -608,6 +608,30 @@ def test_evoked_metrics_remove_prestim_baseline():
     assert m["evoked_hop1_r"] > 0.99
 
 
+def test_evoked_metrics_use_paired_counterfactual_prediction():
+    syn = c302.synapseLayer(
+        {"General": ([], [], []), "Wicks": ([0], [1], [1.0]), "Generic": ([], [], [])}
+    )
+    adj = syn.adjacency_matrix(3)
+    stim = np.zeros((1, 20, 3), dtype=np.float32)
+    stim[0, 10, 0] = 1.0
+    y_true = np.zeros((1, 20, 3), dtype=np.float32)
+    y_true[:, :10, 1] = 4.0
+    y_true[0, 10:, 1] = 4.0 + np.linspace(0.1, 1.0, 10)
+    y_pred = np.zeros((1, 20, 3), dtype=np.float32)
+    y_pred[:, :, 1] = 1.0  # unremoved pre-stim offset in the prediction
+    y_pred[0, 10:, 1] += np.linspace(0.1, 1.0, 10)
+    y_cf = np.zeros((1, 20, 3), dtype=np.float32)
+    y_cf[:, :, 1] = 1.0
+    mask = np.ones((1, 20, 3), dtype=bool)
+    m = compute_stratified_metrics(
+        y_true, y_pred, mask, stim=stim, pre_vols=10, adjacency=adj,
+        evoked_baseline="mean", y_pred_counterfactual=y_cf,
+    )
+    assert m["evoked_hop1_r2"] > 0.99
+    assert m["evoked_hop1_r"] > 0.99
+
+
 def test_evoked_metrics_remove_linear_prestim_drift():
     syn = c302.synapseLayer(
         {"General": ([], [], []), "Wicks": ([0], [1], [1.0]), "Generic": ([], [], [])}
@@ -763,6 +787,10 @@ def test_hop1_noise_reweighting_only_touches_hop1():
     assert out[0, 1] == 0.5  # 1-hop neighbor down-weighted
     assert out[0, 2] == 1.0 and out[0, 3] == 1.0
     assert torch.allclose(reweight_hop1_noise(noise, stim, adj, 1.0), noise)
+    out_stim = reweight_hop1_noise(noise, stim, adj, 2.0, stim_weight=4.0)
+    assert out_stim[0, 0] == 0.25
+    assert out_stim[0, 1] == 0.5
+    assert out_stim[0, 2] == 1.0 and out_stim[0, 3] == 1.0
 
 
 def test_train_validation_split_is_grouped_and_disjoint():

@@ -87,6 +87,8 @@ def compute_stratified_metrics(
     pre_vols: int = 10,
     adjacency: Optional[np.ndarray] = None,
     evoked_baseline: str = "linear",
+    evoked_window_vols: int = 16,
+    y_pred_counterfactual: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Compute overall, inlier (|y|<=3), direct-stimulated, and connectome hop-stratified metrics."""
     valid = mask.astype(bool)
@@ -130,18 +132,27 @@ def compute_stratified_metrics(
             out["post_inlier_rmse"] = float(np.sqrt(mean_squared_error(yt_pi, yp_pi)))
             out["post_inlier_r"] = _safe_pearson_r(yt_pi, yp_pi)
 
-    # Baseline-subtracted "evoked" signals: remove each trial/neuron's
-    # pre-stimulus trend before comparing post-stimulus responses.  A linear
-    # extrapolation removes the slow drift that otherwise survives a constant
-    # pre-mean subtraction.
+    # Evoked response definition.  If a paired zero-stimulus prediction is
+    # supplied, use the counterfactual difference y(stim) - y(0) for the
+    # prediction.  This is essential for models with a pre-stim encoder: their
+    # pre-stimulus input is injected only at t=pre_vols, so subtracting a
+    # pre-window baseline from the prediction would not remove the injected
+    # drift.  The truth retains the explicitly frozen pre-stim mean (or linear
+    # trend) baseline.
+    t0 = int(pre_vols)
+    t_ev_end = min(y_true.shape[1], t0 + max(1, int(evoked_window_vols)))
     yt_ev = yp_ev = None
-    if y_true.ndim == 3 and 0 < int(pre_vols) < y_true.shape[1]:
-        base_true = _prestim_baseline(y_true, valid, int(pre_vols), evoked_baseline)
-        base_pred = _prestim_baseline(y_pred, valid, int(pre_vols), evoked_baseline)
-        yt_ev = y_true - base_true
-        yp_ev = y_pred - base_pred
+    if y_true.ndim == 3 and 0 < t0 < y_true.shape[1]:
+        base_true = _prestim_baseline(y_true, valid, t0, evoked_baseline)
+        if y_pred_counterfactual is not None:
+            yt_ev = y_true - base_true
+            yp_ev = y_pred - y_pred_counterfactual
+        else:
+            base_pred = _prestim_baseline(y_pred, valid, t0, evoked_baseline)
+            yt_ev = y_true - base_true
+            yp_ev = y_pred - base_pred
         post_ev = np.zeros_like(valid)
-        post_ev[:, int(pre_vols):, :] = valid[:, int(pre_vols):, :]
+        post_ev[:, t0:t_ev_end, :] = valid[:, t0:t_ev_end, :]
         if np.any(post_ev):
             yt_e, yp_e = yt_ev[post_ev], yp_ev[post_ev]
             out["evoked_post_r2"] = float(r2_score(yt_e, yp_e))
@@ -150,6 +161,8 @@ def compute_stratified_metrics(
     if stim is not None and y_true.ndim == 3:
         n_trials, n_t, n_neurons = y_true.shape
         t0 = min(max(0, int(pre_vols)), max(0, n_t - 1))
+        ev_window = np.zeros_like(valid)
+        ev_window[:, t0:t_ev_end, :] = True
         # Cover full nuclear GCaMP6s rise + peak (~10.5s) + early decay (~17.5s post-stim at 2 Hz)
         t1_stim = min(n_t, t0 + 35)
         t1_down = min(n_t, t0 + 35)
@@ -167,9 +180,11 @@ def compute_stratified_metrics(
             out["stim_true_mean"] = float(yt_s.mean())
             out["stim_pred_mean"] = float(yp_s.mean())
             if yt_ev is not None:
-                yt_se, yp_se = yt_ev[evoked_stim], yp_ev[evoked_stim]
-                out["evoked_stim_r2"] = float(r2_score(yt_se, yp_se))
-                out["evoked_stim_r"] = _safe_pearson_r(yt_se, yp_se)
+                evoked_stim_e = evoked_stim & ev_window
+                if np.any(evoked_stim_e):
+                    yt_se, yp_se = yt_ev[evoked_stim_e], yp_ev[evoked_stim_e]
+                    out["evoked_stim_r2"] = float(r2_score(yt_se, yp_se))
+                    out["evoked_stim_r"] = _safe_pearson_r(yt_se, yp_se)
             evoked_stim_in = evoked_stim & (np.abs(y_true) <= 3.0)
             if np.any(evoked_stim_in):
                 out["stim_inlier_r"] = _safe_pearson_r(y_true[evoked_stim_in], y_pred[evoked_stim_in])
@@ -199,9 +214,11 @@ def compute_stratified_metrics(
                     out[f"{prefix}_rmse"] = float(np.sqrt(mean_squared_error(yt_d, yp_d)))
                     out[f"{prefix}_r"] = _safe_pearson_r(yt_d, yp_d)
                     if yt_ev is not None:
-                        yt_de, yp_de = yt_ev[sub_mask], yp_ev[sub_mask]
-                        out[f"evoked_{prefix}_r2"] = float(r2_score(yt_de, yp_de))
-                        out[f"evoked_{prefix}_r"] = _safe_pearson_r(yt_de, yp_de)
+                        sub_ev = sub_mask & ev_window
+                        if np.any(sub_ev):
+                            yt_de, yp_de = yt_ev[sub_ev], yp_ev[sub_ev]
+                            out[f"evoked_{prefix}_r2"] = float(r2_score(yt_de, yp_de))
+                            out[f"evoked_{prefix}_r"] = _safe_pearson_r(yt_de, yp_de)
                     sub_in = sub_mask & (np.abs(y_true) <= 3.0)
                     if np.any(sub_in):
                         out[f"{prefix}_inlier_r"] = _safe_pearson_r(y_true[sub_in], y_pred[sub_in])
@@ -230,8 +247,16 @@ def evaluate_predictions(
     pre_vols: int = 10,
     adjacency: Optional[np.ndarray] = None,
     drift_gate_mode: str = "none",
+    counterfactual_evoked: bool = True,
+    evoked_window_vols: int = 16,
 ) -> Dict[str, float]:
-    """Evaluate posterior predictive GCaMP fit with overall, stimulated, and downstream metrics."""
+    """Evaluate posterior predictive GCaMP fit with overall, stimulated, and downstream metrics.
+
+    When ``counterfactual_evoked`` is true, the evoked prediction is the paired
+    difference between the actual-stimulus and zero-stimulus rollouts with the
+    same sampled model parameters.  This removes the pre-stim encoder drift
+    from the prediction without relying on a noisy linear extrapolation.
+    """
     if posterior_samples is not None:
         predictive = Predictive(model, posterior_samples=posterior_samples, return_sites=("_RETURN",))
     else:
@@ -249,15 +274,16 @@ def evaluate_predictions(
     )
     y_trues = []
     y_preds = []
+    y_pred_cfs = []
     masks = []
     stims = []
     with torch.no_grad():
         for batch in data_loader:
             stim, y, mask, noise = [b.to(device) for b in batch]
+            t_cut = min(int(pre_vols), y.shape[1])
             if has_prestim:
-                t_cut = min(int(pre_vols), y.shape[1])
                 gate = compute_drift_gate(stim, adj_t, drift_gate_mode) if adj_t is not None else None
-                samples = predictive(
+                guide_kwargs = dict(
                     ExternalInput=stim,
                     mask=None,
                     y=None,
@@ -266,11 +292,54 @@ def evaluate_predictions(
                     pre_stim_mask=mask[:, :t_cut, :],
                     drift_gate=gate,
                 )
+                model_kwargs = dict(guide_kwargs)
+                model_kwargs_zero = dict(model_kwargs)
+                model_kwargs_zero["ExternalInput"] = torch.zeros_like(stim)
             else:
-                samples = predictive(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
-            pred_mean = samples["_RETURN"].mean(dim=0)
+                guide_kwargs = dict(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
+                model_kwargs = dict(guide_kwargs)
+                model_kwargs_zero = dict(model_kwargs)
+                model_kwargs_zero["ExternalInput"] = torch.zeros_like(stim)
+
+            if counterfactual_evoked:
+                stim_returns = []
+                zero_returns = []
+                n_draws = 1 if posterior_samples is not None else int(num_samples)
+                for draw in range(n_draws):
+                    if posterior_samples is not None:
+                        ps = posterior_samples
+                    else:
+                        gtrace = pyro.poutine.trace(guide).get_trace(**guide_kwargs)
+                        ps = {
+                            name: site["value"]
+                            for name, site in gtrace.nodes.items()
+                            if site["type"] == "sample"
+                        }
+                    # Condition the model directly so scalar guide samples
+                    # remain scalars; Predictive would treat their leading
+                    # neuron dimension as a sample dimension.
+                    conditioned = pyro.condition(model, data=ps)
+                    s_out = conditioned(**model_kwargs)
+                    z_out = conditioned(**model_kwargs_zero)
+                    if s_out.dim() == 4:
+                        s_out = s_out.mean(dim=0)
+                    if z_out.dim() == 4:
+                        z_out = z_out.mean(dim=0)
+                    stim_returns.append(s_out)
+                    zero_returns.append(z_out)
+                pred_mean = torch.stack(stim_returns).mean(dim=0)
+                pred_cf = torch.stack(zero_returns).mean(dim=0)
+            else:
+                if has_prestim:
+                    samples = predictive(**guide_kwargs)
+                else:
+                    samples = predictive(**guide_kwargs)
+                pred_mean = samples["_RETURN"].mean(dim=0)
+                pred_cf = None
             y_trues.append(y.cpu().numpy())
             y_preds.append(pred_mean.cpu().numpy())
+            if pred_cf is not None:
+                y_pred_cfs.append(pred_cf.cpu().numpy())
             masks.append(mask.bool().cpu().numpy())
             stims.append(stim.cpu().numpy())
 
@@ -284,6 +353,9 @@ def evaluate_predictions(
         stim=np.concatenate(stims, axis=0),
         pre_vols=pre_vols,
         adjacency=adj,
+        evoked_baseline="mean" if counterfactual_evoked else "linear",
+        evoked_window_vols=evoked_window_vols,
+        y_pred_counterfactual=np.concatenate(y_pred_cfs, axis=0) if y_pred_cfs else None,
     )
 
 
