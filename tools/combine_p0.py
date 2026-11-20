@@ -35,8 +35,8 @@ def main() -> None:
         "shuffle_std": ss,
         "delta_mean": delta,
         "pooled_sem": sem,
-        "pass": bool(delta > 0.0 and delta > sem),
-        "rule": "delta_mean > 0 and delta_mean > pooled SEM",
+        "pass": bool(mi > 0.0 and delta > 0.0 and delta > sem),
+        "rule": "intact_mean > 0 and delta_mean > 0 and delta_mean > pooled SEM",
     }
     out = {"gate": gate, "runs": runs}
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

@@ -163,8 +163,8 @@ def main() -> None:
             "shuffle_std": ss,
             "delta_mean": delta,
             "pooled_sem": pooled_sem,
-            "pass": bool(delta > 0.0 and delta > pooled_sem),
-            "rule": "delta_mean > 0 and delta_mean > pooled SEM (one-sided ~84%)",
+            "pass": bool(mi > 0.0 and delta > 0.0 and delta > pooled_sem),
+            "rule": "intact_mean > 0 and delta_mean > 0 and delta_mean > pooled SEM (one-sided ~84%)",
         }
     else:
         gate = {"metric": "evoked_hop1_r2", "pass": False, "reason": "no paired runs"}

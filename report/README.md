@@ -366,7 +366,7 @@ The next model changes must pass a fixed protocol before biological interpretati
 - **Seeds and conditions**: main comparisons use at least three training seeds. The shuffle gate uses at least three fixed degree-preserving endpoint permutations.
 - **Forced current preprocessing**: Randi runs use the causal cache built with `preprocess_gcamp_recording(..., causal=True)` and the current symmetric gap-junction code; `--causal-preprocess` is passed explicitly even when a cache is loaded.
 - **Evoked metric**: `compute_stratified_metrics` emits `evoked_post_*`, `evoked_stim_*`, `evoked_hop1_*`, `evoked_hop2_*`, and `evoked_unconnected_*`. By default it removes a causal **linear pre-stimulus trend** (not just the constant mean) from both truth and prediction before post-stimulus scoring; `evoked_baseline="mean"` remains available for diagnostics.
-- **Hard gate**: `evoked_hop1_r2` for intact versus shuffled connectomes. The gate passes only when `delta_mean > 0` and `delta_mean > pooled SEM` (one-sided ~84%). `tools/run_nested_protocol.py` writes `summary.json` with the gate and all seed/shuffle runs. No P1/P2 model change is promoted unless this gate passes.
+- **Hard gate**: `evoked_hop1_r2` for intact versus shuffled connectomes. The gate passes only when `intact_mean > 0`, `delta_mean > 0`, and `delta_mean > pooled SEM` (one-sided ~84%). The absolute-positive requirement prevents a near-zero negative-vs-more-negative result from passing. `tools/run_nested_protocol.py` writes `summary.json` with the gate and all seed/shuffle runs. No P1/P2 model change is promoted unless this gate passes.
 
 ### P0-v1 is invalidated (do not use as a gate verdict)
 
@@ -385,7 +385,44 @@ The old table is retained only as provenance in `report/data/p0_full_gate.json`;
 - Evoked metrics use causal linear detrending by default.
 - `--no-prestim-encoder` is implemented in both training/evaluation so the planned Fold-0 open-loop diagnostic can isolate the encoder's contribution.
 
-The mandatory next run is only **Fold 0**: verify `stim_r ≥ 0.38` and positive `evoked_stim_r2`, then run the no-prestim intact-vs-shuffle diagnostic before any 5-fold gate or P1/P2 change.
+The Fold-0 smoke was run after these fixes (20 epochs, validation-selected checkpoint):
+
+| Condition | selected epochs | stim_r (3 seeds) | evoked_stim_R² (3 seeds) | evoked_hop1_R² (3 seeds) | gate |
+|---|---|---|---:|---:|---:|---|
+| pre-stim encoder | 10/15/10 | 0.259 / 0.289 / 0.257 | -0.060 / -0.052 / -0.067 | -0.041 / -0.034 / -0.043 | FAIL |
+| no pre-stim encoder | 15/15/20 | 0.281 / 0.280 / 0.246 | 0.004 / 0.016 / 0.015 | -0.001 / -0.001 / -0.0004 | FAIL after requiring positive intact mean |
+
+The `stim_r ≥ 0.38` threshold is **not met** even after lr restoration; no-prestim does not produce a credible positive evoked 1-hop signal. This is closer to Case B (current Wicks + uniform Gaussian likelihood is not learning the direct-stim/1-hop response), not Case A (connectome signal stolen by the pre-stim encoder). The full 5-fold gate and P1/P2 remain blocked.
+
+The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
+
+```bash
+# Step 1: corrected budget + validation-selected checkpoint
+python tools/run_nested_protocol.py --cache <causal.npz> --out <dir> \
+  --folds 5 --fold-indices 0 --epochs 30 --save-every 5 \
+  --batch-size 128 --substeps 2 --lr 0.005 \
+  --val-metric stim_r2 --causal-preprocess
+
+# Step 2: same Fold-0 intact/shuffle diagnostic without pre-stim encoder
+python tools/run_nested_protocol.py --cache <causal.npz> --out <dir_nopre> \
+  --folds 5 --fold-indices 0 --epochs 30 --save-every 5 \
+  --batch-size 128 --substeps 2 --lr 0.005 --no-prestim-encoder \
+  --val-metric stim_r2 --causal-preprocess
+```
+
+```bash
+# Step 1: corrected budget + validation-selected checkpoint
+python tools/run_nested_protocol.py --cache <causal.npz> --out <dir> \
+  --folds 5 --fold-indices 0 --epochs 20 --save-every 5 \
+  --batch-size 128 --substeps 2 --lr 0.005 \
+  --val-metric post_inlier_r2 --causal-preprocess
+
+# Step 2: same Fold-0 intact/shuffle diagnostic without pre-stim encoder
+python tools/run_nested_protocol.py --cache <causal.npz> --out <dir_nopre> \
+  --folds 5 --fold-indices 0 --epochs 20 --save-every 5 \
+  --batch-size 128 --substeps 2 --lr 0.005 --no-prestim-encoder \
+  --val-metric post_inlier_r2 --causal-preprocess
+```
 
 ### 3.13 Statistical and causal caveats (review findings)
 
@@ -470,7 +507,7 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 6. Under the current symmetric-gap code, a fresh Randi 20-epoch model gives `post_inlier_R²=0.1007` and `hop1_R²=0.0676`; this is weaker than the historical v5 warm-start result. The gap fix itself costs about 5–6% on these metrics in the adapter comparison, and the rest is training-protocol difference.
 7. Toyoshima after the route-B loader rewrite is still weak (`post_inlier_R²=0.0236`, `hop1_R²=0.0356`, `unconn_r=0.141`), although polarity is directionally correct and `stim_r` rises to 0.286. It is not cross-dataset generalization.
 8. The route-A connectome shuffle does not degrade post-stim or 1-hop metrics (`post_inlier_R² 0.0891→0.0889`, `hop1_r 0.260→0.258`, `hop1_R² 0.0451→0.0547`), while stimulus correlation drops (`stim_r 0.402→0.249`). The evoked gate is also negative (`evoked_hop1_R² 0.0310→0.0378`, Δ=-0.0068). The observed 1-hop signal is therefore not established as topology-specific; it must not be interpreted as connectome propagation without a multi-seed permutation test.
-9. The P0-v1 30-run gate is **invalidated** by the lr/save/val-selection and constant-baseline defects above. Its numbers are provenance only. P0-v2 must rerun Fold 0 with lr 5e-3, save every 5 epochs, validation-selected checkpoints, and linear detrending; P1/P2 remain blocked until that single-fold smoke shows credible direct-stimulus fit and a topology-specific evoked delta.
+9. The P0-v1 30-run gate is **invalidated** by the lr/save/val-selection and constant-baseline defects above. Its numbers are provenance only. P0-v2 Fold 0 was run with lr 5e-3, save every 5, validation-selected checkpoints, and linear detrending: `stim_r` remained 0.246–0.289 (target ≥0.38), and the no-prestim diagnostic did not produce a credible positive evoked 1-hop signal. P1/P2 remain blocked; the next test must increase the effective budget (30–35 epochs) and/or select on `stim_r2`.
 
 ### Recommended next round
 
