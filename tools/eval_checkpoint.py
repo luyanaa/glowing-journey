@@ -47,6 +47,7 @@ def main() -> None:
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
         per_edge_release=args.per_edge_release,
+        per_neuron_stim_gain=args.per_neuron_stim_gain,
         shuffle_seed=args.shuffle_seed,
     )
     rec = c302.RecurrentNematode(
@@ -58,7 +59,6 @@ def main() -> None:
         prestim_rank=16,
         per_neuron_kinetics=args.per_neuron_kinetics,
         per_edge_release=args.per_edge_release,
-        per_neuron_stim_gain=args.per_neuron_stim_gain,
         stim_actuator=args.stim_actuator,
         stim_tau_rise=args.stim_tau_rise,
         stim_tau_decay=args.stim_tau_decay,
