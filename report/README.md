@@ -365,23 +365,27 @@ The next model changes must pass a fixed protocol before biological interpretati
 - **Nested recording-grouped CV**: `tools/run_nested_protocol.py` uses `utils.nested_grouped_splits` (5 outer folds, grouped validation inside each outer train fold) and writes explicit `train/val/test` index JSON consumed by `pyro_svi_vae.py --split-file`. The outer test fold is never used for early stopping.
 - **Seeds and conditions**: main comparisons use at least three training seeds. The shuffle gate uses at least three fixed degree-preserving endpoint permutations.
 - **Forced current preprocessing**: Randi runs use the causal cache built with `preprocess_gcamp_recording(..., causal=True)` and the current symmetric gap-junction code; `--causal-preprocess` is passed explicitly even when a cache is loaded.
-- **Evoked metric**: `compute_stratified_metrics` now emits `evoked_post_*`, `evoked_stim_*`, `evoked_hop1_*`, `evoked_hop2_*`, and `evoked_unconnected_*`. Each trial/neuron has its pre-stimulus mean removed from both truth and prediction before post-stimulus scoring; this is separate from the raw `hop1_r2`.
+- **Evoked metric**: `compute_stratified_metrics` emits `evoked_post_*`, `evoked_stim_*`, `evoked_hop1_*`, `evoked_hop2_*`, and `evoked_unconnected_*`. By default it removes a causal **linear pre-stimulus trend** (not just the constant mean) from both truth and prediction before post-stimulus scoring; `evoked_baseline="mean"` remains available for diagnostics.
 - **Hard gate**: `evoked_hop1_r2` for intact versus shuffled connectomes. The gate passes only when `delta_mean > 0` and `delta_mean > pooled SEM` (one-sided ~84%). `tools/run_nested_protocol.py` writes `summary.json` with the gate and all seed/shuffle runs. No P1/P2 model change is promoted unless this gate passes.
 
-Full run completed: 5 outer folds × (3 intact training seeds + 3 shuffle groups) = 30 runs, 20 epochs, batch 128, 16 posterior samples.
+### P0-v1 is invalidated (do not use as a gate verdict)
 
-| Fold | intact evoked_hop1_R² | shuffle evoked_hop1_R² | Δ |
-|---|---:|---:|---:|
-| 0 | 0.03258 ± 0.00902 | 0.03091 ± 0.00493 | +0.00168 |
-| 1 | 0.02440 ± 0.00488 | 0.02560 ± 0.00216 | -0.00121 |
-| 2 | 0.02777 ± 0.00281 | 0.02715 ± 0.00423 | +0.00062 |
-| 3 | 0.05698 ± 0.00401 | 0.05705 ± 0.00232 | -0.00007 |
-| 4 | 0.02039 ± 0.00758 | 0.01143 ± 0.00919 | +0.00897 |
-| **Pooled** | **0.03242 ± 0.01433** | **0.03043 ± 0.01600** | **+0.00200** |
+The first 30-run P0 attempt had three implementation defects found by line-level audit:
 
-Pooled SEM = 0.00555; `delta_mean = 0.00200 < SEM` → **gate FAIL**. Only fold 4 is positive; fold 3 is effectively zero and folds 0–2 are within noise. The full run JSON is `report/data/p0_full_gate.json`.
+1. `run_nested_protocol.py` defaulted to `--lr 1e-3` while the main training default is `5e-3`; combined with ~64% training data per fold, direct-stimulus targets were underfit (`stim_pred_mean` 0.23–0.26 vs 0.37–0.43).
+2. The runner passed `save_every=epochs` and always evaluated the final checkpoint, so the grouped validation fold was never used for checkpoint selection.
+3. `evoked_*` subtracted only the constant pre-stimulus mean, leaving the slow linear drift that `CausalPreStimEncoder` reproduces; `evoked_unconnected_r2` was often above `evoked_hop1_r2`.
 
-This blocks P1/P2 promotion: the current v3 model does not establish that its 1-hop signal depends on the real connectome topology.
+The old table is retained only as provenance in `report/data/p0_full_gate.json`; it is **not** evidence that the connectome hypothesis is false.
+
+### P0-v2 code fixes (rerun pending)
+
+- `--lr` default restored to **5e-3**.
+- `--save-every` default **5**; runner selects the best checkpoint by grouped validation (`--val-metric`, default `post_inlier_r2`), then evaluates that checkpoint on the locked outer test fold.
+- Evoked metrics use causal linear detrending by default.
+- `--no-prestim-encoder` is implemented in both training/evaluation so the planned Fold-0 open-loop diagnostic can isolate the encoder's contribution.
+
+The mandatory next run is only **Fold 0**: verify `stim_r ≥ 0.38` and positive `evoked_stim_r2`, then run the no-prestim intact-vs-shuffle diagnostic before any 5-fold gate or P1/P2 change.
 
 ### 3.13 Statistical and causal caveats (review findings)
 
@@ -431,7 +435,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest tests` → **38 passed**.
+- Regression tests: `pytest tests` → **39 passed**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`.
@@ -466,7 +470,7 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 6. Under the current symmetric-gap code, a fresh Randi 20-epoch model gives `post_inlier_R²=0.1007` and `hop1_R²=0.0676`; this is weaker than the historical v5 warm-start result. The gap fix itself costs about 5–6% on these metrics in the adapter comparison, and the rest is training-protocol difference.
 7. Toyoshima after the route-B loader rewrite is still weak (`post_inlier_R²=0.0236`, `hop1_R²=0.0356`, `unconn_r=0.141`), although polarity is directionally correct and `stim_r` rises to 0.286. It is not cross-dataset generalization.
 8. The route-A connectome shuffle does not degrade post-stim or 1-hop metrics (`post_inlier_R² 0.0891→0.0889`, `hop1_r 0.260→0.258`, `hop1_R² 0.0451→0.0547`), while stimulus correlation drops (`stim_r 0.402→0.249`). The evoked gate is also negative (`evoked_hop1_R² 0.0310→0.0378`, Δ=-0.0068). The observed 1-hop signal is therefore not established as topology-specific; it must not be interpreted as connectome propagation without a multi-seed permutation test.
-9. The full P0 gate also fails: across 5 folds, intact `evoked_hop1_R²=0.03242±0.01433` versus shuffle `0.03043±0.01600`, Δ=0.00200, pooled SEM=0.00555. P1/P2 structural changes are therefore blocked until a model beats this null convincingly.
+9. The P0-v1 30-run gate is **invalidated** by the lr/save/val-selection and constant-baseline defects above. Its numbers are provenance only. P0-v2 must rerun Fold 0 with lr 5e-3, save every 5 epochs, validation-selected checkpoints, and linear detrending; P1/P2 remain blocked until that single-fold smoke shows credible direct-stimulus fit and a topology-specific evoked delta.
 
 ### Recommended next round
 

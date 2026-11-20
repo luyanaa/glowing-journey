@@ -10,7 +10,8 @@
     "delta_mean": 0.0019986692004731153,
     "pooled_sem": 0.0055464537657778186,
     "pass": false,
-    "rule": "delta_mean > 0 and delta_mean > pooled SEM"
+    "rule": "delta_mean > 0 and delta_mean > pooled SEM",
+    "provisional_invalid": true
   },
   "runs": [
     {
@@ -1933,5 +1934,11 @@
       "tag": "shuffle9",
       "train_seed": 42
     }
+  ],
+  "valid": false,
+  "invalid_reasons": [
+    "runner lr default 1e-3 instead of main 5e-3",
+    "save_every=epochs and no validation-selected checkpoint",
+    "evoked metrics subtracted constant pre-mean only (no linear drift)"
   ]
 }

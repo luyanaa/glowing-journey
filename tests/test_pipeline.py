@@ -608,6 +608,28 @@ def test_evoked_metrics_remove_prestim_baseline():
     assert m["evoked_hop1_r"] > 0.99
 
 
+def test_evoked_metrics_remove_linear_prestim_drift():
+    syn = c302.synapseLayer(
+        {"General": ([], [], []), "Wicks": ([0], [1], [1.0]), "Generic": ([], [], [])}
+    )
+    adj = syn.adjacency_matrix(3)
+    stim = np.zeros((1, 20, 3), dtype=np.float32)
+    stim[0, 10, 0] = 1.0
+    y_true = np.zeros((1, 20, 3), dtype=np.float32)
+    y_pred = np.zeros((1, 20, 3), dtype=np.float32)
+    # Pre-stimulus linear drift continues into the post window.
+    y_true[0, :10, 1] = np.linspace(0.0, 1.0, 10)
+    y_pred[0, :10, 1] = np.linspace(0.0, 1.0, 10)
+    y_true[0, 10:, 1] = 1.0 + np.linspace(0.1, 1.0, 10)
+    y_pred[0, 10:, 1] = y_true[0, 10:, 1]
+    mask = np.ones((1, 20, 3), dtype=bool)
+    m = compute_stratified_metrics(
+        y_true, y_pred, mask, stim=stim, pre_vols=10, adjacency=adj, evoked_baseline="linear"
+    )
+    assert m["evoked_hop1_r2"] > 0.99
+    assert abs(m["evoked_post_r2"] - 1.0) < 1e-6
+
+
 def test_randi_trial_dataset_save_load(tmp_path):
     stim = torch.zeros(2, 5, 10)
     stim[0, 1, 3] = 1.0

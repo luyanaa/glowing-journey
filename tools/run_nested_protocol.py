@@ -9,6 +9,7 @@ compares evoked 1-hop R² against 3 degree-preserving permutations.
 import argparse
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -33,7 +34,11 @@ def main() -> None:
     p.add_argument("--epochs", default=20, type=int)
     p.add_argument("--batch-size", default=128, type=int)
     p.add_argument("--substeps", default=2, type=int)
-    p.add_argument("--lr", default=0.001, type=float)
+    p.add_argument("--lr", default=0.005, type=float)
+    p.add_argument("--save-every", default=5, type=int)
+    p.add_argument("--val-metric", default="post_inlier_r2", type=str,
+                   help="Validation metric used to select the checkpoint (e.g. post_inlier_r2, evoked_hop1_r2, stim_r2)")
+    p.add_argument("--no-prestim-encoder", action="store_true")
     p.add_argument("--folds", default=5, type=int)
     p.add_argument("--fold-indices", default="0")
     p.add_argument("--seeds", default="42,43,44")
@@ -65,8 +70,9 @@ def main() -> None:
         for tag, seed, shuffle_seed in runs:
             run_dir = os.path.join(args.out, f"fold{fi}", f"{tag}_seed{seed}")
             os.makedirs(run_dir, exist_ok=True)
+            save_every = max(1, min(int(args.save_every), int(args.epochs)))
             cmd = [
-                args.python, "pyro_svi_vae.py", str(args.epochs), str(args.epochs),
+                args.python, "pyro_svi_vae.py", str(args.epochs), str(save_every),
                 "--source", args.source,
                 "--dataset-cache", args.cache,
                 "--split-file", fold_json,
@@ -74,9 +80,10 @@ def main() -> None:
                 "--batch-size", str(args.batch_size),
                 "--substeps", str(args.substeps),
                 "--lr", str(args.lr),
-                "--use-prestim-encoder",
                 "--snapshot-dir", run_dir,
             ]
+            if not args.no_prestim_encoder:
+                cmd.append("--use-prestim-encoder")
             if args.causal_preprocess:
                 cmd.append("--causal-preprocess")
             if args.per_neuron_kinetics:
@@ -90,7 +97,25 @@ def main() -> None:
                 proc = subprocess.run(cmd, cwd=REPO, stdout=log, stderr=subprocess.STDOUT, text=True)
             if proc.returncode != 0:
                 raise RuntimeError(f"training failed: {tag} seed={seed}; see {log_path}")
-            ckpt = os.path.join(run_dir, f"vae_epoch_{args.epochs}.pt")
+            # Select the best validation checkpoint, not blindly the last
+            # epoch.  The outer test fold is never read here.
+            candidates = []
+            for metric_path in Path(run_dir).glob("metrics_epoch_*.json"):
+                with open(metric_path) as mf:
+                    md = json.load(mf)
+                epoch = int(md.get("epoch", 0))
+                val = md.get("val", {}) or {}
+                score = val.get(args.val_metric)
+                if score is None:
+                    score = val.get("evoked_hop1_r2", val.get("post_inlier_r2", val.get("r2")))
+                if score is not None and np.isfinite(float(score)):
+                    candidates.append((float(score), epoch, metric_path))
+            if not candidates:
+                raise RuntimeError(f"no validation metrics in {run_dir}")
+            _, best_epoch, _ = max(candidates, key=lambda x: (x[0], x[1]))
+            ckpt = os.path.join(run_dir, f"vae_epoch_{best_epoch}.pt")
+            if not os.path.isfile(ckpt):
+                raise RuntimeError(f"selected checkpoint missing: {ckpt}")
             eval_path = os.path.join(run_dir, "eval16.json")
             eval_cmd = [
                 args.python, "tools/eval_checkpoint.py",
@@ -100,6 +125,8 @@ def main() -> None:
                 "--out", eval_path,
                 "--num-samples", "16",
             ]
+            if args.no_prestim_encoder:
+                eval_cmd.append("--no-prestim-encoder")
             if args.per_neuron_kinetics:
                 eval_cmd.append("--per-neuron-kinetics")
             if args.per_edge_release:
@@ -113,6 +140,8 @@ def main() -> None:
                 ev = json.load(fh)
             ev["tag"] = tag
             ev["train_seed"] = seed
+            ev["selected_epoch"] = best_epoch
+            ev["selected_val_metric"] = args.val_metric
             records.append(ev)
         # End run loop
     # End fold loop

@@ -55,6 +55,30 @@ def _extract_adjacency(model) -> Optional[np.ndarray]:
     return step.synapse.adjacency_matrix(n_neurons)
 
 
+def _prestim_baseline(
+    y: np.ndarray, valid: np.ndarray, pre_vols: int, mode: str = "linear"
+) -> np.ndarray:
+    """Causal pre-stimulus baseline: constant mean or linear extrapolation."""
+    t0 = int(pre_vols)
+    n_t = y.shape[1]
+    w = valid[:, :t0, :].astype(np.float64)
+    count = w.sum(axis=1)
+    denom = np.maximum(count, 1.0)
+    pre_t = np.arange(t0, dtype=np.float64)[None, :, None]
+    mean_t = (w * pre_t).sum(axis=1) / denom
+    mean_y = (w * y[:, :t0, :]).sum(axis=1) / denom
+    if mode == "mean":
+        return mean_y[:, None, :] * np.ones((1, n_t, 1), dtype=y.dtype)
+    if mode != "linear":
+        raise ValueError(f"Unknown evoked baseline mode={mode!r}")
+    cov = (w * (pre_t - mean_t[:, None, :]) * (y[:, :t0, :] - mean_y[:, None, :])).sum(axis=1)
+    var = (w * (pre_t - mean_t[:, None, :]) ** 2).sum(axis=1)
+    slope = np.where(var > 1e-8, cov / np.maximum(var, 1e-12), 0.0)
+    intercept = mean_y - slope * mean_t
+    t_all = np.arange(n_t, dtype=np.float64)[None, :, None]
+    return intercept[:, None, :] + slope[:, None, :] * t_all
+
+
 def compute_stratified_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -62,6 +86,7 @@ def compute_stratified_metrics(
     stim: Optional[np.ndarray] = None,
     pre_vols: int = 10,
     adjacency: Optional[np.ndarray] = None,
+    evoked_baseline: str = "linear",
 ) -> Dict[str, float]:
     """Compute overall, inlier (|y|<=3), direct-stimulated, and connectome hop-stratified metrics."""
     valid = mask.astype(bool)
@@ -106,16 +131,15 @@ def compute_stratified_metrics(
             out["post_inlier_r"] = _safe_pearson_r(yt_pi, yp_pi)
 
     # Baseline-subtracted "evoked" signals: remove each trial/neuron's
-    # pre-stimulus mean before comparing post-stimulus responses.  This avoids
-    # rewarding a model that merely reproduces the slow pre-stimulus baseline.
+    # pre-stimulus trend before comparing post-stimulus responses.  A linear
+    # extrapolation removes the slow drift that otherwise survives a constant
+    # pre-mean subtraction.
     yt_ev = yp_ev = None
     if y_true.ndim == 3 and 0 < int(pre_vols) < y_true.shape[1]:
-        pre_valid = valid[:, :int(pre_vols), :]
-        pre_count = np.maximum(pre_valid.sum(axis=1), 1)
-        base_true = (y_true[:, :int(pre_vols), :] * pre_valid).sum(axis=1) / pre_count
-        base_pred = (y_pred[:, :int(pre_vols), :] * pre_valid).sum(axis=1) / pre_count
-        yt_ev = y_true - base_true[:, None, :]
-        yp_ev = y_pred - base_pred[:, None, :]
+        base_true = _prestim_baseline(y_true, valid, int(pre_vols), evoked_baseline)
+        base_pred = _prestim_baseline(y_pred, valid, int(pre_vols), evoked_baseline)
+        yt_ev = y_true - base_true
+        yp_ev = y_pred - base_pred
         post_ev = np.zeros_like(valid)
         post_ev[:, int(pre_vols):, :] = valid[:, int(pre_vols):, :]
         if np.any(post_ev):

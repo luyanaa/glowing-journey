@@ -26,6 +26,7 @@ def main() -> None:
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--shuffle-seed", default=None, type=int)
+    p.add_argument("--no-prestim-encoder", action="store_true")
     p.add_argument("--per-neuron-kinetics", action="store_true")
     p.add_argument("--per-edge-release", action="store_true")
     p.add_argument("--num-samples", default=16, type=int)
@@ -48,7 +49,7 @@ def main() -> None:
         step,
         dt_obs=0.5,
         substeps=2,
-        use_prestim_encoder=True,
+        use_prestim_encoder=not args.no_prestim_encoder,
         pre_vols=args.pre_vols,
         prestim_rank=16,
         per_neuron_kinetics=args.per_neuron_kinetics,
