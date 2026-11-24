@@ -397,7 +397,21 @@ The following Fold-0 numbers were collected **before** the counterfactual-evoked
 | pre-stim encoder | 10/15/10 | 0.259 / 0.289 / 0.257 | -0.060 / -0.052 / -0.067 | -0.041 / -0.034 / -0.043 | FAIL |
 | no pre-stim encoder | 15/15/20 | 0.281 / 0.280 / 0.246 | 0.004 / 0.016 / 0.015 | -0.001 / -0.001 / -0.0004 | FAIL after requiring positive intact mean |
 
-Even on the old ruler, the `stim_r ≥ 0.38` threshold is not met after lr restoration; no-prestim does not produce a credible positive evoked 1-hop signal. This points toward Case B, but the table must not be over-interpreted because the ruler has since changed. The full 5-fold gate and P1/P2 remain blocked pending a counterfactual Fold-0 rerun with a larger effective budget.
+Even on the old ruler, the `stim_r ≥ 0.38` threshold is not met after lr restoration; no-prestim does not produce a credible positive evoked 1-hop signal. This points toward Case B, but the table must not be over-interpreted because the ruler has since changed.
+
+#### Completed 5-fold counterfactual P0 run (`report/data/p0_counterfactual_5fold.json`, 2026-11-20)
+
+All 5 folds × (3 intact + 3 shuffle seeds, 40 epochs, `--batch-size 64 --substeps 2 --lr 0.005 --per-neuron-stim-gain --val-metric evoked_hop1_r2`, paired counterfactual rollout) were executed on Colab L4:
+
+| Group (15 runs each) | `evoked_hop1_r2` | `evoked_hop1_r` | `evoked_stim_r2` | `evoked_stim_r` | `evoked_hop2_r` | `evoked_unconn_r` | `stim_pred_mean / true` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Intact connectome** | **`-0.00679 ± 0.00298`** | **`+0.09875 ± 0.02757`** | `+0.04643` | `+0.3004` | `+0.04133` | `+0.02013` | `0.234 / 0.384` (61%) |
+| **Shuffled connectome** | `-0.01594 ± 0.00448` | `+0.02914 ± 0.02491` | `+0.03025` | `+0.2821` | `+0.01770` | `+0.00989` | `0.229 / 0.384` (60%) |
+| **Intact − Shuffle** | **`+0.00915` (`6.59× SEM`)** | **`+0.06961`** | `+0.01618` | `+0.0183` | `+0.02363` | `+0.01024` | 5/5 folds won |
+
+- **Gate status**: **FAIL** solely because `intact_mean = -0.00679 <= 0` (`delta = +0.00915` clears `pooled_sem = 0.00139` across 5/5 folds, and correlation decays monotonically with distance `0.300 → 0.099 → 0.041 → 0.020`).
+- **Mechanism**: True 1-hop evoked responses have a non-zero positive mean (`+0.0358`, zero-predictor `R² ≈ -0.016` to `-0.027`). Because direct-stim amplitude reaches only 61% of truth (`0.234 / 0.384`), residual mean bias keeps `evoked_hop1_r2` just below zero.
+- **Targeted Option 1 next run (Fold 0)**: Add `--wide-amp-priors` (`stim_gain` prior `2.0`, `std 0.6`; wider `g_max`/`gap` spans and dual-action ACh/Glu `E_rev` spans) alongside `--stim-loss-weight 6 --hop1-loss-weight 3`.
 
 The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
 
@@ -419,19 +433,14 @@ python tools/run_nested_protocol.py --cache <causal.npz> --out <dir_nopre> \
   --stim-loss-weight 6 --hop1-loss-weight 3
 ```
 
-```bash
-# Step 1: corrected budget + validation-selected checkpoint
-python tools/run_nested_protocol.py --cache <causal.npz> --out <dir> \
-  --folds 5 --fold-indices 0 --epochs 20 --save-every 5 \
-  --batch-size 128 --substeps 2 --lr 0.005 \
-  --val-metric post_inlier_r2 --causal-preprocess
+> Note on precision weighting: `reweight_hop1_noise` divides Gaussian `noise_scale` by `weight`, so `--stim-loss-weight 6 --hop1-loss-weight 3` applies `36×` / `9×` squared-error precision weight. If over-weighting destabilizes ELBO or degrades background fit, try `2.5` / `1.7` (`~6×` / `~3×` MSE weight).
 
-# Step 2: same Fold-0 intact/shuffle diagnostic without pre-stim encoder
-python tools/run_nested_protocol.py --cache <causal.npz> --out <dir_nopre> \
-  --folds 5 --fold-indices 0 --epochs 20 --save-every 5 \
-  --batch-size 128 --substeps 2 --lr 0.005 --no-prestim-encoder \
-  --val-metric post_inlier_r2 --causal-preprocess
-```
+#### Fold-0 failure decision tree (if the counterfactual gate fails)
+
+- **Case 1 — Direct-stim underfit (`stim_r < 0.35` or `evoked_stim_r2 <= 0`)**: Check whether `weight=6` (`36×` MSE) destabilized SVI or caused premature checkpoint selection (`val-metric` vs `stim_r2`), widen `stim_gain_vec` prior std (`0.3 -> 0.6`) to match Randi Chrimson expression heterogeneity, tune `stim_loss_weight` to `2.5–4.0`, and inspect `stim_tau_rise`/`stim_tau_decay`.
+- **Case 2 — Topology separates (`intact > shuffle` with `evoked_hop1_r > 0`), yet `evoked_hop1_r2 <= 0`** (already hinted in `fold0_nopre_summary.json`, where `delta = +0.00176` was `10.9× SEM` while `intact_mean = -0.00064`): Run a 0-GPU diagnostic decomposition on saved checkpoints (bias² vs variance vs correlation, inlier `|y| <= 3` `evoked_hop1_r2`, evoked windows `8 s / 12 s / 17.5 s`, per-edge sign accuracy & amplitude ratio). If polarity inversions dominate, relax `E_rev` prior scale on dual-action ACh/Glu synapses (ionotropic GluCl / ACC inhibition); if amplitude attenuation dominates (`amp < 0.3×`), widen chemical `g_max` prior or enable `use_extrasynaptic=True` (`edgelist_NP.csv`).
+- **Case 3 — `no-prestim` passes or clearly beats shuffle, while `with pre-stim` fails**: `CausalPreStimEncoder` is starving synaptic gradients via a baseline shortcut. Fix with **two-stage decoupled training** (Stage 1: open-loop `--no-prestim-encoder` to learn evoked connectome weights; Stage 2: freeze or apply `0.1×` LR to connectome weights while fitting `CausalPreStimEncoder` on residuals) or add an explicit paired counterfactual evoked loss term during training.
+- **Case 4 — Even `no-prestim` has `intact ≈ shuffle` despite strong direct drive (`evoked_stim_r2 > 0.05` and `stim_r >= 0.38`)**: Audit `g_max`/`g_syn` posteriors for TCN `Encoder` prior collapse; benchmark non-amortized direct SVI (`AutoNormal` / `c302_bio`-style global posterior without the trial-averaged TCN `Encoder`) on Fold-0; stratify `evoked_hop1` by anatomical synapse weight (e.g. `Weight >= 5` vs `Weight == 1`) and test extrasynaptic (`edgelist_NP.csv`) paths to separate model optimization limits from the anatomical 1-hop SNR ceiling.
 
 ### 3.13 Statistical and causal caveats (review findings)
 
@@ -461,6 +470,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/current_2026-11-19/` | Current-code 20-epoch Randi and Toyoshima checkpoints, metrics, and 16-sample eval JSON |
 | `glowing-journey_runs/route_ab_2026-11-19/` | Corrected Toyoshima, causal Randi baseline, and connectome-shuffle checkpoints/metrics |
 | `glowing-journey_runs/p0_2026-11-20/` | Full 5-fold P0 gate summaries; `p0_partial` contains the discarded batch-16 run |
+| `glowing-journey_runs/full_2026-11-20_resume_partial/` | Completed 30-run 5-fold counterfactual run archived as `report/data/p0_counterfactual_5fold.json` |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -486,7 +496,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
-- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`.
+- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`, `report/data/p0_counterfactual_5fold.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.

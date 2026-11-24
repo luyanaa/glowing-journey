@@ -30,9 +30,13 @@ def main() -> None:
     p.add_argument("--per-neuron-kinetics", action="store_true")
     p.add_argument("--per-edge-release", action="store_true")
     p.add_argument("--per-neuron-stim-gain", action="store_true")
+    p.add_argument("--wide-amp-priors", action="store_true")
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
+    p.add_argument("--substeps", default=2, type=int)
+    p.add_argument("--eval-seed", default=42, type=int,
+                   help="RNG seed for deterministic posterior predictive draws")
     p.add_argument("--num-samples", default=16, type=int)
     p.add_argument("--pre-vols", default=10, type=int)
     args = p.parse_args()
@@ -48,12 +52,13 @@ def main() -> None:
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
+        wide_amp_priors=args.wide_amp_priors,
         shuffle_seed=args.shuffle_seed,
     )
     rec = c302.RecurrentNematode(
         step,
         dt_obs=0.5,
-        substeps=2,
+        substeps=args.substeps,
         use_prestim_encoder=not args.no_prestim_encoder,
         pre_vols=args.pre_vols,
         prestim_rank=16,
@@ -78,6 +83,11 @@ def main() -> None:
     # control, not a new connectome definition.
     intact = c302.readConnectome(os.path.join(REPO, "data/CElegansNeuronTables.xls"))
     adjacency = intact.synapse.adjacency_matrix(intact.neuronSize)
+    np.random.seed(args.eval_seed)
+    torch.manual_seed(args.eval_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.eval_seed)
+    pyro.set_rng_seed(args.eval_seed)
     metrics = evaluate_predictions(
         model,
         loader,
@@ -92,6 +102,9 @@ def main() -> None:
         "checkpoint": args.checkpoint,
         "split_file": args.split_file,
         "shuffle_seed": args.shuffle_seed,
+        "wide_amp_priors": bool(args.wide_amp_priors),
+        "substeps": args.substeps,
+        "eval_seed": args.eval_seed,
         "num_samples": args.num_samples,
         "test_trials": len(test_idx),
     }

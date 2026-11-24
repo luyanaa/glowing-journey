@@ -331,6 +331,7 @@ class WicksSynapse(PyroModule):
         E_rev=None,
         neuron_size: Optional[int] = None,
         per_edge_release: bool = False,
+        wide_amp_priors: bool = False,
     ):
         super().__init__()
         src = np.asarray(synapseInput, dtype=np.int64).reshape(-1)
@@ -340,6 +341,7 @@ class WicksSynapse(PyroModule):
         self.neuron_size = None if neuron_size is None else int(neuron_size)
         self.share_presynaptic = self.neuron_size is not None
         self.per_edge_release = bool(per_edge_release)
+        self.wide_amp_priors = bool(wide_amp_priors)
         self.register_buffer("synapseInput", torch.as_tensor(src, dtype=torch.long))
         self.register_buffer("synapseOutput", torch.as_tensor(dst, dtype=torch.long))
         self.register_buffer("synapseWeight", torch.as_tensor(w, dtype=torch.float32))
@@ -359,9 +361,10 @@ class WicksSynapse(PyroModule):
 
             pre_param_dim = self.neuron_size if self.share_presynaptic else self.inputSize
             # Keep prior median at 0.01 nS so high-degree hubs avoid resting tonic depolarization,
-            # while widening log-std to 0.85 so sparse functional edges can strengthen freely.
+            # while widening log-std so sparse functional edges can strengthen freely.
+            g_max_scale = 1.1 if self.wide_amp_priors else 0.85
             self.g_max = (
-                _sample_lognormal(self, math.log(0.01), 0.85, shape=(self.inputSize,), to_event=1)
+                _sample_lognormal(self, math.log(0.01), g_max_scale, shape=(self.inputSize,), to_event=1)
                 if g_max is None
                 else g_max
             )
@@ -514,9 +517,11 @@ class synapseLayer(PyroModule):
         use_extrasynaptic: bool = False,
         neuron_size: Optional[int] = None,
         per_edge_release: bool = False,
+        wide_amp_priors: bool = False,
     ):
         super().__init__()
         self.per_edge_release = bool(per_edge_release)
+        self.wide_amp_priors = bool(wide_amp_priors)
         wicks_tuple = synapseList["Wicks"]
         self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight = wicks_tuple[:3]
         e_rev_loc = wicks_tuple[3] if len(wicks_tuple) > 3 else None
@@ -534,6 +539,7 @@ class synapseLayer(PyroModule):
             e_rev_scale=e_rev_scale,
             neuron_size=neuron_size,
             per_edge_release=per_edge_release,
+            wide_amp_priors=wide_amp_priors,
         )
         self.general = GeneralSynapse(
             self.Gap_Junction_SRC,
@@ -900,28 +906,34 @@ class NematodeForStep(PyroModule):
         bnn_hidden_dim: int = 16,
         per_edge_release: bool = False,
         per_neuron_stim_gain: bool = False,
+        wide_amp_priors: bool = False,
     ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.neuronSize = neuronSize
         self.per_neuron_stim_gain = bool(per_neuron_stim_gain)
+        self.wide_amp_priors = bool(wide_amp_priors)
         self.Neuron = neuronLayer(neuronSize, NeuronList)
         self.synapse = synapseLayer(
             synapseList,
             use_extrasynaptic=use_extrasynaptic,
             neuron_size=neuronSize,
             per_edge_release=per_edge_release,
+            wide_amp_priors=wide_amp_priors,
         )
         # Optogenetic Chrimson cation-channel conductance (nS) with physiological reversal E_opt = 0 V
         # (and inhibitory reversal E_inh = -85 mV if negative stimulation is supplied).
         self.stim_e_rev = 0.0
         self.stim_e_inh = -0.085
+        stim_loc = math.log(2.0) if self.wide_amp_priors else math.log(1.2)
         if self.per_neuron_stim_gain:
+            stim_scale = 0.6 if self.wide_amp_priors else 0.3
             self.stim_gain_vec = _sample_lognormal(
-                self, math.log(1.2), 0.3, shape=(neuronSize,), to_event=1
+                self, stim_loc, stim_scale, shape=(neuronSize,), to_event=1
             )
         else:
-            self.stim_gain = _sample_lognormal(self, math.log(1.2), 0.5)
+            stim_scale = 0.6 if self.wide_amp_priors else 0.5
+            self.stim_gain = _sample_lognormal(self, stim_loc, stim_scale)
         self.bnn_residual = (
             BayesianNNResidual(neuronSize, hidden_dim=bnn_hidden_dim) if use_bnn_residual else None
         )
@@ -1358,16 +1370,16 @@ def _normalize_neuron_name(name: str) -> str:
     return s
 
 
-def _nt_to_reversal_prior(nt_str: str) -> Tuple[float, float]:
+def _nt_to_reversal_prior(nt_str: str, wide_amp_priors: bool = False) -> Tuple[float, float]:
     """Map neurotransmitter annotation to chemical synapse reversal potential prior (Volts)."""
     nt = str(nt_str).strip()
     if "GABA" in nt:
         return -0.075, 0.015
     if "Acetylcholine" in nt:
-        return 0.0, 0.020
+        return (-0.010, 0.035) if wide_amp_priors else (0.0, 0.020)
     if "Glutamate" in nt:
         # C. elegans glutamate can be excitatory (NMDA/AMPA) or inhibitory (GluCl)
-        return -0.035, 0.035
+        return (-0.035, 0.040) if wide_amp_priors else (-0.035, 0.035)
     return -0.025, 0.035
 
 
@@ -1380,6 +1392,7 @@ def readConnectome(
     bnn_hidden_dim: int = 16,
     per_edge_release: bool = False,
     per_neuron_stim_gain: bool = False,
+    wide_amp_priors: bool = False,
     aconnectome_ids_path: str = "./pumpprobe/pumpprobe/aconnectome_ids.txt",
     edgelist_path: str = "./data/herm_full_edgelist.csv",
     np_path: str = "./data/edgelist_NP.csv",
@@ -1442,7 +1455,10 @@ def readConnectome(
             wicks_src.append(src_idx)
             wicks_dst.append(dst_idx)
             wicks_w.append(weight)
-            loc_v, scale_v = _nt_to_reversal_prior(nt_lookup.get((origin, target), "unknown"))
+            loc_v, scale_v = _nt_to_reversal_prior(
+                nt_lookup.get((origin, target), "unknown"),
+                wide_amp_priors=wide_amp_priors,
+            )
             wicks_erev_loc.append(loc_v)
             wicks_erev_scale.append(scale_v)
 
@@ -1492,6 +1508,7 @@ def readConnectome(
             bnn_hidden_dim=bnn_hidden_dim,
             per_edge_release=per_edge_release,
             per_neuron_stim_gain=per_neuron_stim_gain,
+            wide_amp_priors=wide_amp_priors,
         )
     model.register_buffer("sensory_mask", torch.from_numpy(sensory_mask))
     return model

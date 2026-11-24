@@ -1217,6 +1217,71 @@ def test_nested_grouped_cv_has_disjoint_worm_splits():
         assert set(fold["train"]).isdisjoint(fold["val"])
 
 
+def test_wide_amp_priors_expands_stim_gain_and_ach_reversal_range():
+    import math
+
+    pyro.clear_param_store()
+    step = c302.readConnectome(
+        "./data/CElegansNeuronTables.xls",
+        per_neuron_stim_gain=True,
+        wide_amp_priors=True,
+    )
+    assert step.wide_amp_priors is True
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2)
+    vm = vae.VAElegans(
+        rec,
+        step.neuronSize,
+        len(step.synapse.Wicks_SRC),
+        len(step.synapse.Gap_Junction_SRC),
+    )
+    assert vm.wide_amp_priors is True
+    assert vm.guide.wide_amp_priors is True
+    assert vm.encoder.wide_amp_priors is True
+    assert abs(float(vm.guide.stim_gain_vec_loc.detach().mean()) - math.log(2.0)) < 1e-5
+    ach_mask = torch.isclose(step.synapse.wicks.e_rev_loc_buf, torch.tensor(-0.010), atol=1e-5)
+    assert ach_mask.any()
+    assert torch.allclose(
+        step.synapse.wicks.e_rev_scale_buf[ach_mask],
+        torch.full((int(ach_mask.sum()),), 0.035),
+        atol=1e-5,
+    )
+
+    e_rev_prior = torch.tensor([-0.010, -0.010])
+    enc = vae.Encoder(4, 2, 2, e_rev_prior=e_rev_prior, wide_amp_priors=True)
+    enc.eval()
+    with torch.no_grad():
+        for tcn in (enc.neuron, enc.wick, enc.gap):
+            tcn.linear.weight.zero_()
+            tcn.linear.bias.fill_(10.0)
+        x = torch.zeros(2, 5, 4)
+        _, _, wicks_loc, _, gap_loc, _ = enc(x)
+        assert torch.exp(wicks_loc[0]).max() > 0.12
+        assert torch.exp(gap_loc).max() > 0.16
+
+        enc.wick.linear.bias.fill_(-10.0)
+        _, _, wicks_loc_neg, _, _, _ = enc(x)
+        assert wicks_loc_neg[1].min() < -0.065
+
+
+def test_nested_protocol_eval_wiring_and_seed_flags():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    eval_src = Path("tools/eval_checkpoint.py").read_text()
+    runner_src = Path("tools/run_nested_protocol.py").read_text()
+    assert '"--substeps"' in eval_src and "substeps=args.substeps" in eval_src
+    assert '"--eval-seed"' in eval_src and "pyro.set_rng_seed(args.eval_seed)" in eval_src
+    assert '"--substeps", str(args.substeps)' in runner_src
+
+    proc = subprocess.run(
+        [sys.executable, "tools/eval_checkpoint.py", "--help"],
+        capture_output=True, text=True, check=True,
+    )
+    assert "--substeps" in proc.stdout
+    assert "--eval-seed" in proc.stdout
+
+
 def test_all_python_modules_compile():
     for fname in [
         "c302.py",
@@ -1227,5 +1292,7 @@ def test_all_python_modules_compile():
         "DMM.py",
         "lightning_c302.py",
         "AutoRegress.py",
+        "tools/eval_checkpoint.py",
+        "tools/run_nested_protocol.py",
     ]:
         py_compile.compile(fname, doraise=True)

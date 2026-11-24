@@ -58,11 +58,13 @@ class Encoder(PyroModule):
         wicks_dim: int,
         gap_dim: int,
         e_rev_prior: Optional[torch.Tensor] = None,
+        wide_amp_priors: bool = False,
     ):
         super().__init__()
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
+        self.wide_amp_priors = bool(wide_amp_priors)
 
         if e_rev_prior is not None and self.wicks_dim > 0:
             e_prior = torch.as_tensor(e_rev_prior, dtype=torch.float32).detach().clone().reshape(self.wicks_dim)
@@ -114,13 +116,15 @@ class Encoder(PyroModule):
         )
 
         if self.wicks_dim > 0:
+            gmax_span = 2.8 if self.wide_amp_priors else 2.2
+            erev_span = 0.075 if self.wide_amp_priors else 0.045
             wick_raw = self.wick(x).mean(dim=0).view(4, self.wicks_dim)
             wicks_loc = torch.stack(
                 [
-                    # Centered on calm 0.01 nS resting prior with wide [0.0011, 0.090] nS dynamic range
-                    math.log(0.01) + 2.2 * torch.tanh(wick_raw[0]),
-                    # Centered per-edge on neurotransmitter prior (GABA -75 mV, Glu -35 mV, ACh 0 mV)
-                    self.e_rev_prior.to(device=x.device, dtype=x.dtype) + 0.045 * torch.tanh(wick_raw[1]),
+                    # Centered on calm 0.01 nS resting prior with wide dynamic range
+                    math.log(0.01) + gmax_span * torch.tanh(wick_raw[0]),
+                    # Centered per-edge on neurotransmitter prior (expanded span when wide_amp_priors)
+                    self.e_rev_prior.to(device=x.device, dtype=x.dtype) + erev_span * torch.tanh(wick_raw[1]),
                 ],
                 dim=0,
             )
@@ -136,9 +140,10 @@ class Encoder(PyroModule):
             wicks_scale = torch.empty(2, 0, device=x.device, dtype=x.dtype)
 
         if self.gap_dim > 0:
+            gap_span = 2.6 if self.wide_amp_priors else 2.2
             gap_raw = self.gap(x).mean(dim=0).view(2, self.gap_dim)
-            # Centered on 0.015 nS prior with wide [0.0017, 0.135] nS dynamic range
-            gap_loc = math.log(0.015) + 2.2 * torch.tanh(gap_raw[0])
+            # Centered on 0.015 nS prior with wide dynamic range
+            gap_loc = math.log(0.015) + gap_span * torch.tanh(gap_raw[0])
             gap_scale = 0.02 + 0.5 * torch.sigmoid(gap_raw[1])
         else:
             gap_loc = torch.empty(0, device=x.device, dtype=x.dtype)
@@ -164,9 +169,15 @@ class VAEGuide(PyroModule):
         per_neuron_kinetics: bool = False,
         per_edge_release: bool = False,
         per_neuron_stim_gain: bool = False,
+        wide_amp_priors: bool = False,
     ):
         super().__init__()
-        self.encoder = Encoder(neuron_dim, wicks_dim, gap_dim, e_rev_prior=e_rev_prior)
+        self.wide_amp_priors = bool(wide_amp_priors)
+        self.encoder = Encoder(
+            neuron_dim, wicks_dim, gap_dim,
+            e_rev_prior=e_rev_prior,
+            wide_amp_priors=self.wide_amp_priors,
+        )
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
@@ -184,7 +195,8 @@ class VAEGuide(PyroModule):
         self.register_buffer("_ema_gap_scale", torch.ones(self.gap_dim))
 
         # Variational parameters for shared/GCaMP parameters in RecurrentNematode
-        self.stim_gain_loc = PyroParam(torch.tensor(math.log(1.2)))
+        stim_init = math.log(2.0) if self.wide_amp_priors else math.log(1.2)
+        self.stim_gain_loc = PyroParam(torch.tensor(stim_init))
         self.stim_gain_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
         self.obs_sigma_loc = PyroParam(torch.tensor(math.log(0.15)))
         self.obs_sigma_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
@@ -218,11 +230,12 @@ class VAEGuide(PyroModule):
             self.k_off_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
 
         if self.per_neuron_stim_gain:
+            stim_vec_scale = 0.35 if self.wide_amp_priors else 0.3
             self.stim_gain_vec_loc = PyroParam(
-                torch.full((self.neuron_dim,), math.log(1.2))
+                torch.full((self.neuron_dim,), stim_init)
             )
             self.stim_gain_vec_scale = PyroParam(
-                torch.full((self.neuron_dim,), 0.3), constraint=constraints.positive
+                torch.full((self.neuron_dim,), stim_vec_scale), constraint=constraints.positive
             )
 
         if self.per_edge_release and self.wicks_dim > 0:
@@ -381,12 +394,16 @@ class VAElegans(PyroModule):
         per_neuron_stim_gain = bool(
             getattr(getattr(model, "model", None), "per_neuron_stim_gain", False)
         )
+        wide_amp_priors = bool(
+            getattr(getattr(model, "model", None), "wide_amp_priors", False)
+        )
         self.guide = VAEGuide(
             neuron_dim, wicks_dim, gap_dim,
             e_rev_prior=e_rev_prior,
             per_neuron_kinetics=per_neuron_kinetics,
             per_edge_release=per_edge_release,
             per_neuron_stim_gain=per_neuron_stim_gain,
+            wide_amp_priors=wide_amp_priors,
         )
         self.decoder = model
         self.neuron_dim = int(neuron_dim)
@@ -395,6 +412,7 @@ class VAElegans(PyroModule):
         self.per_neuron_kinetics = per_neuron_kinetics
         self.per_edge_release = per_edge_release
         self.per_neuron_stim_gain = per_neuron_stim_gain
+        self.wide_amp_priors = wide_amp_priors
 
     @property
     def encoder(self) -> Encoder:

@@ -162,6 +162,8 @@ def main() -> None:
                         help="Learn per-edge V_rest/V_slope residuals on top of per-neuron release values")
     parser.add_argument("--per-neuron-stim-gain", action="store_true",
                         help="Learn a constrained stimulus gain per neuron")
+    parser.add_argument("--wide-amp-priors", action="store_true",
+                        help="Widen stim_gain, chemical g_max/gap spans, and dual-action ACh/Glu E_rev priors")
     parser.add_argument("--stim-actuator", action="store_true",
                         help="Apply a first-order rise/decay actuator before the membrane")
     parser.add_argument("--stim-tau-rise", default=0.08, type=float)
@@ -320,6 +322,7 @@ def main() -> None:
         "./data/CElegansNeuronTables.xls",
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
+        wide_amp_priors=args.wide_amp_priors,
         shuffle_seed=args.shuffle_connectome,
     )
     adj_t = torch.as_tensor(
