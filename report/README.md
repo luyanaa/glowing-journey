@@ -465,6 +465,21 @@ Completed all 5 recording-grouped outer folds × (3 intact + 3 degree-preserving
 | Fold 3 | `+0.01030 ± 0.00169` | `-0.02121 ± 0.00223` | `+0.03151` (`19.54×`) | `+0.1793` | `+0.0666` | `+0.1126` | `+0.1174` |
 | Fold 4 | `+0.00688 ± 0.00088` | `-0.00854 ± 0.00314` | `+0.01543` (`8.19×`) | `+0.1068` | `+0.0996` | `+0.0718` | `+0.0983` |
 
+#### Route B Fold-0 head-to-head comparison: `--evoked-syn-priors` in Two-Stage Decoupled (`report/data/routeB_fold0_stage1_summary.json`, `report/data/routeB_fold0_stage2_summary.json`, 2026-11-25)
+
+Tested Route B (`--wide-amp-priors --evoked-syn-priors`: `V_rest = -42 mV`, `V_slope = 8 mV`, `g_max = 0.015 nS`, `std 0.95`) inside the identical Fold-0 two-stage decoupled protocol (`3 intact + 3 shuffle`):
+- **Passes P0 gate in both stages** with tighter seed variance (`std 0.00059 / 0.00056`), confirming `--evoked-syn-priors` is viable once decoupled from pre-stim shortcutting:
+  - Stage-1: `evoked_hop1_r2 = +0.00617 ± 0.00059` vs `-0.01428` (`Δ = +0.02045`, `9.59× SEM`, **PASS**)
+  - Stage-2: `evoked_hop1_r2 = +0.00643 ± 0.00056` vs `-0.01402` (`Δ = +0.02045`, `9.55× SEM`, **PASS**)
+- **Verdict vs Route A on Fold 0**: Route A outperforms Route B across all evoked propagation metrics (`evoked_hop1_r2`: `+0.00885` vs `+0.00643`, +38%; `Δ`: `+0.02330` vs `+0.02045`; `evoked_hop1_r`: `+0.1309` vs `+0.1222`; `evoked_hop2_r`: `+0.0682` vs `+0.0549`; `evoked_stim_r2`: `+0.0532` vs `+0.0438`; `hop1_r2`: `+0.0918` vs `+0.0893`) while matching `post_inlier_r2` (`+0.1064` vs `+0.1065`). Raising resting release conductance likely increases tonic damping of evoked propagation, so **Route A is retained as the locked 5-fold benchmark** rather than expanding Route B to Folds 1–4.
+
+| Fold-0 Head-to-Head | `evoked_hop1_r2` (intact \| shuffle) | `Δ` (`× SEM`) | `evoked_hop1_r` | `evoked_stim_r2` | `evoked_hop2_r` | `hop1_r2` | `post_inlier_r2` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Route A Stage-1** (`--wide-amp-priors`) | **`+0.00809 ± 0.00195`** \| `-0.01471` | `+0.02281` (`10.36×`) | **`+0.1272`** | **`+0.0534`** | **`+0.0662`** | `+0.0108` | `+0.0308` |
+| Route B Stage-1 (`+ --evoked-syn-priors`) | `+0.00617 ± 0.00059` \| `-0.01428` | `+0.02045` (`9.59×`) | `+0.1188` | `+0.0433` | `+0.0517` | `+0.0065` | `+0.0284` |
+| **Route A Stage-2** (`+ --freeze-non-prestim`) | **`+0.00885 ± 0.00219`** \| `-0.01445` | **`+0.02330` (`10.32×`)** | **`+0.1309`** | **`+0.0532`** | **`+0.0682`** | **`+0.0918`** | `+0.1064` |
+| Route B Stage-2 (`+ --evoked-syn-priors`) | `+0.00643 ± 0.00056` \| `-0.01402` | `+0.02045` (`9.55×`) | `+0.1222` | `+0.0438` | `+0.0549` | `+0.0893` | **`+0.1065`** |
+
 The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
 
 ```bash
@@ -528,6 +543,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/fold0_nopre_gate_2026-11-24/` | Fold-0 3+3 open-loop PASS summary and all 6 Stage-1 `.pt` checkpoints |
 | `glowing-journey_runs/fold0_stage2_2026-11-24/` | Fold-0 3+3 Stage-2 decoupled summary and key checkpoints (`intact_seed42`, `shuffle7_seed42`) |
 | `glowing-journey_runs/routeA_5fold_2026-11-24/` | Route A Folds 1–4 Stage-1 & Stage-2 bundles, summaries, evals, and key checkpoints |
+| `glowing-journey_runs/routeB_evokedsyn_fold0_2026-11-24/` | Route B Fold-0 (`--evoked-syn-priors`) Stage-1 & Stage-2 bundle, summaries, evals, and key checkpoints |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -553,7 +569,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
-- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`, `report/data/p0_counterfactual_5fold.json`, `report/data/fold0_opt1_summary.json`, `report/data/fold0_armA_nopre_summary.json`, `report/data/fold0_armB_evokedsyn_summary.json`, `report/data/fold0_nopre_gate_summary.json`, `report/data/fold0_stage2_decoupled_summary.json`, `report/data/routeA_5fold_stage1_summary.json`, `report/data/routeA_5fold_stage2_summary.json`.
+- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`, `report/data/p0_counterfactual_5fold.json`, `report/data/fold0_opt1_summary.json`, `report/data/fold0_armA_nopre_summary.json`, `report/data/fold0_armB_evokedsyn_summary.json`, `report/data/fold0_nopre_gate_summary.json`, `report/data/fold0_stage2_decoupled_summary.json`, `report/data/routeA_5fold_stage1_summary.json`, `report/data/routeA_5fold_stage2_summary.json`, `report/data/routeB_fold0_stage1_summary.json`, `report/data/routeB_fold0_stage2_summary.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
