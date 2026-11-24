@@ -445,6 +445,26 @@ All 5 folds × (3 intact + 3 shuffle seeds, 40 epochs, `--batch-size 64 --subste
 | Stage-1 Open-Loop (`--no-prestim-encoder`) | `+0.00809 ± 0.00195` \| `-0.01471` | **PASS** (`10.36× SEM`) | `+0.1272` | **`+0.0534`** | `+0.0108` | `+0.0308` |
 | **Stage-2 Decoupled (`--freeze-non-prestim`)** | **`+0.00885 ± 0.00219`** \| `-0.01445` | **PASS** (`10.32× SEM`) | **`+0.1309`** | `+0.0532` | **`+0.0918`** | **`+0.1064`** |
 
+#### Route A full 5-fold (30-run) Two-Stage Decoupled P0 gate PASS (`report/data/routeA_5fold_stage1_summary.json`, `report/data/routeA_5fold_stage2_summary.json`, 2026-11-25)
+
+Completed all 5 recording-grouped outer folds × (3 intact + 3 degree-preserving shuffle runs = 30 runs per stage) using the two-stage decoupled protocol (`--batch-size 64 --substeps 2 --lr 0.005 --wide-amp-priors --per-neuron-stim-gain --stim-actuator --causal-preprocess`):
+- **Stage-1 Open-Loop** (`--no-prestim-encoder`, 35 epochs, `--stim-loss-weight 6 --hop1-loss-weight 3`, `--val-metric evoked_hop1_r2`): **5/5 folds independently PASS**; pooled **`evoked_hop1_r2 = +0.00865 ± 0.00165`** vs shuffled `-0.01378 ± 0.00497` (**`Δ = +0.02243`**, **`16.59× pooled SEM`**, **PASS**).
+- **Stage-2 Decoupled** (`--freeze-non-prestim`, 15 epochs, `--val-metric post_inlier_r2`): **5/5 folds independently PASS** and outperform Stage-1 on every fold; pooled **`evoked_hop1_r2 = +0.00928 ± 0.00182`** vs shuffled `-0.01371 ± 0.00491` (**`Δ = +0.02298`**, **`17.00× pooled SEM`**, **PASS**), with Stage-2 full-trial `post_inlier_r2 = +0.10949 ± 0.00726` (+31% over Nov 20 Joint) and `hop1_r2 = +0.08581 ± 0.01588` (+63% over Nov 20 Joint; vs shuffled `+0.06232`).
+
+| 5-Fold Pooled Model (15 intact vs 15 shuffle) | `evoked_hop1_r2` (intact \| shuffle) | Gate (`Δ / SEM`) | `evoked_hop1_r` | `evoked_stim_r2` | `evoked_hop2_r` | `hop1_r2` (full) | `post_inlier_r2` (full) |
+|---|---:|---|---:|---:|---:|---:|---:|
+| Nov 20 Joint Baseline | `-0.00679 ± 0.00298` \| `-0.01594` | **FAIL** (`+0.00915`, `6.59×`) | `+0.0988` | `+0.0464` | `+0.0413` | `+0.0526` | `+0.0835` |
+| Route A Stage-1 Open-Loop | `+0.00865 ± 0.00165` \| `-0.01378` | **PASS** (`+0.02243`, `16.59×`) | `+0.1323` | `+0.0837` | `+0.0676` | `+0.0104` | `+0.0325` |
+| **Route A Stage-2 Decoupled** | **`+0.00928 ± 0.00182`** \| `-0.01371` | **PASS** (**`+0.02298`**, **`17.00×`**) | **`+0.1366`** | **`+0.0841`** | **`+0.0714`** | **`+0.0858`** | **`+0.1095`** |
+
+| Stage-2 Per-Fold Breakdown | `evoked_hop1_r2` intact | `evoked_hop1_r2` shuffle | `Δ` (`× SEM`) | `evoked_hop1_r` | `evoked_stim_r2` | `hop1_r2` | `post_inlier_r2` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Fold 0 | `+0.00885 ± 0.00219` | `-0.01445 ± 0.00324` | `+0.02330` (`10.32×`) | `+0.1309` | `+0.0532` | `+0.0918` | `+0.1064` |
+| Fold 1 | `+0.01046 ± 0.00047` | `-0.01188 ± 0.00054` | `+0.02235` (`54.07×`) | `+0.1336` | `+0.1025` | `+0.0761` | `+0.1157` |
+| Fold 2 | `+0.00989 ± 0.00124` | `-0.01245 ± 0.00322` | `+0.02233` (`11.20×`) | `+0.1322` | `+0.0988` | `+0.0767` | `+0.1096` |
+| Fold 3 | `+0.01030 ± 0.00169` | `-0.02121 ± 0.00223` | `+0.03151` (`19.54×`) | `+0.1793` | `+0.0666` | `+0.1126` | `+0.1174` |
+| Fold 4 | `+0.00688 ± 0.00088` | `-0.00854 ± 0.00314` | `+0.01543` (`8.19×`) | `+0.1068` | `+0.0996` | `+0.0718` | `+0.0983` |
+
 The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
 
 ```bash
@@ -507,6 +527,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/fold0_ablation_2026-11-24/` | Fold-0 single-seed Arm A (`nopre`) and Arm B (`evokedsyn`) checkpoints/evals |
 | `glowing-journey_runs/fold0_nopre_gate_2026-11-24/` | Fold-0 3+3 open-loop PASS summary and all 6 Stage-1 `.pt` checkpoints |
 | `glowing-journey_runs/fold0_stage2_2026-11-24/` | Fold-0 3+3 Stage-2 decoupled summary and key checkpoints (`intact_seed42`, `shuffle7_seed42`) |
+| `glowing-journey_runs/routeA_5fold_2026-11-24/` | Route A Folds 1–4 Stage-1 & Stage-2 bundles, summaries, evals, and key checkpoints |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -532,7 +553,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
-- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`, `report/data/p0_counterfactual_5fold.json`, `report/data/fold0_opt1_summary.json`, `report/data/fold0_armA_nopre_summary.json`, `report/data/fold0_armB_evokedsyn_summary.json`, `report/data/fold0_nopre_gate_summary.json`, `report/data/fold0_stage2_decoupled_summary.json`.
+- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`, `report/data/p0_counterfactual_5fold.json`, `report/data/fold0_opt1_summary.json`, `report/data/fold0_armA_nopre_summary.json`, `report/data/fold0_armB_evokedsyn_summary.json`, `report/data/fold0_nopre_gate_summary.json`, `report/data/fold0_stage2_decoupled_summary.json`, `report/data/routeA_5fold_stage1_summary.json`, `report/data/routeA_5fold_stage2_summary.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
