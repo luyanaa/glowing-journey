@@ -1367,6 +1367,24 @@ def test_nested_protocol_eval_wiring_and_seed_flags():
     assert "--eval-seed" in proc.stdout
 
 
+def test_resolve_init_checkpoint_handles_multifold_without_collision(tmp_path):
+    from tools.run_nested_protocol import _resolve_init_checkpoint
+
+    c0 = tmp_path / "fold0" / "intact_seed42" / "vae_epoch_25.pt"
+    c1 = tmp_path / "fold1" / "intact_seed42" / "vae_epoch_35.pt"
+    c0.parent.mkdir(parents=True)
+    c1.parent.mkdir(parents=True)
+    c0.write_bytes(b"f0")
+    c1.write_bytes(b"f1")
+
+    init_runs = [
+        {"tag": "intact", "train_seed": 42, "split_file": "/remote/fold_0.json", "checkpoint": "/remote/fold0/intact_seed42/vae_epoch_25.pt"},
+        {"tag": "intact", "train_seed": 42, "split_file": "/remote/fold_1.json", "checkpoint": "/remote/fold1/intact_seed42/vae_epoch_35.pt"},
+    ]
+    assert _resolve_init_checkpoint(str(tmp_path), init_runs, 0, "intact", 42) == str(c0)
+    assert _resolve_init_checkpoint(str(tmp_path), init_runs, 1, "intact", 42) == str(c1)
+
+
 def test_all_python_modules_compile():
     for fname in [
         "c302.py",

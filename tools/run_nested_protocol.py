@@ -26,6 +26,33 @@ def mean_std(values):
     return float(arr.mean()), float(arr.std(ddof=1)) if arr.size > 1 else 0.0
 
 
+def _resolve_init_checkpoint(init_from_dir: str, init_runs: list, fi: int, tag: str, seed: int) -> str:
+    """Resolve the Stage-1 checkpoint for `(fi, tag, seed)` without multi-fold key collisions."""
+    same_pair = [r for r in init_runs if r.get("tag") == tag and int(r.get("train_seed", -1)) == int(seed)]
+    fold_matches = [
+        r for r in same_pair
+        if r.get("fold") == fi
+        or os.path.basename(str(r.get("split_file", ""))) == f"fold_{fi}.json"
+        or f"/fold{fi}/" in str(r.get("checkpoint", "")).replace("\\", "/")
+    ]
+    if len(fold_matches) == 1:
+        ckpt_ref = fold_matches[0]["checkpoint"]
+    elif not fold_matches and len(same_pair) == 1:
+        ckpt_ref = same_pair[0]["checkpoint"]
+    elif not same_pair:
+        raise RuntimeError(f"No Stage-1 checkpoint entry for fold={fi} {(tag, int(seed))} in {init_from_dir}")
+    else:
+        raise RuntimeError(
+            f"Ambiguous Stage-1 checkpoint entries ({len(fold_matches) or len(same_pair)}) "
+            f"for fold={fi} {(tag, int(seed))} in {init_from_dir}"
+        )
+    cand = os.path.join(init_from_dir, f"fold{fi}", f"{tag}_seed{seed}", os.path.basename(ckpt_ref))
+    stage1_ckpt = cand if os.path.isfile(cand) else ckpt_ref
+    if not os.path.isfile(stage1_ckpt):
+        raise FileNotFoundError(f"Resolved Stage-1 checkpoint missing: {stage1_ckpt}")
+    return stage1_ckpt
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--cache", required=True)
@@ -67,14 +94,13 @@ def main() -> None:
     seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
     shuffle_seeds = [int(x) for x in args.shuffle_seeds.split(",") if x.strip()]
     fold_indices = [int(x) for x in args.fold_indices.split(",") if x.strip()]
-    init_map = {}
+    init_runs = []
     if args.init_from_dir:
         init_summary = os.path.join(args.init_from_dir, "summary.json")
         if not os.path.isfile(init_summary):
             raise FileNotFoundError(f"Stage-1 summary not found: {init_summary}")
         with open(init_summary) as fh:
-            for r in json.load(fh).get("runs", []):
-                init_map[(r["tag"], int(r["train_seed"]))] = r["checkpoint"]
+            init_runs = json.load(fh).get("runs", [])
     records = []
 
     for fi in fold_indices:
@@ -116,13 +142,7 @@ def main() -> None:
             if args.evoked_syn_priors:
                 cmd.append("--evoked-syn-priors")
             if args.init_from_dir:
-                ckpt_ref = init_map.get((tag, int(seed)))
-                if not ckpt_ref:
-                    raise RuntimeError(f"No Stage-1 checkpoint entry for {(tag, int(seed))} in {args.init_from_dir}")
-                cand = os.path.join(args.init_from_dir, f"fold{fi}", f"{tag}_seed{seed}", os.path.basename(ckpt_ref))
-                stage1_ckpt = cand if os.path.isfile(cand) else ckpt_ref
-                if not os.path.isfile(stage1_ckpt):
-                    raise FileNotFoundError(f"Resolved Stage-1 checkpoint missing: {stage1_ckpt}")
+                stage1_ckpt = _resolve_init_checkpoint(args.init_from_dir, init_runs, fi, tag, int(seed))
                 cmd.extend(["--init-from", stage1_ckpt])
             if args.freeze_non_prestim:
                 cmd.append("--freeze-non-prestim")
@@ -191,6 +211,7 @@ def main() -> None:
                 raise RuntimeError(f"evaluation failed: {tag} seed={seed}\n{proc.stderr[-4000:]}")
             with open(eval_path) as fh:
                 ev = json.load(fh)
+            ev["fold"] = fi
             ev["tag"] = tag
             ev["train_seed"] = seed
             ev["selected_epoch"] = best_epoch
