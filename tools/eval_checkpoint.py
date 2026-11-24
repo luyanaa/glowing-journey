@@ -31,6 +31,7 @@ def main() -> None:
     p.add_argument("--per-edge-release", action="store_true")
     p.add_argument("--per-neuron-stim-gain", action="store_true")
     p.add_argument("--wide-amp-priors", action="store_true")
+    p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -53,6 +54,7 @@ def main() -> None:
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,
+        evoked_syn_priors=args.evoked_syn_priors,
         shuffle_seed=args.shuffle_seed,
     )
     rec = c302.RecurrentNematode(
@@ -103,6 +105,7 @@ def main() -> None:
         "split_file": args.split_file,
         "shuffle_seed": args.shuffle_seed,
         "wide_amp_priors": bool(args.wide_amp_priors),
+        "evoked_syn_priors": bool(args.evoked_syn_priors),
         "substeps": args.substeps,
         "eval_seed": args.eval_seed,
         "num_samples": args.num_samples,

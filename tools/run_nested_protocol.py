@@ -48,6 +48,7 @@ def main() -> None:
     p.add_argument("--per-edge-release", action="store_true")
     p.add_argument("--per-neuron-stim-gain", action="store_true")
     p.add_argument("--wide-amp-priors", action="store_true")
+    p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -101,6 +102,8 @@ def main() -> None:
                 cmd.append("--per-neuron-stim-gain")
             if args.wide_amp_priors:
                 cmd.append("--wide-amp-priors")
+            if args.evoked_syn_priors:
+                cmd.append("--evoked-syn-priors")
             if args.stim_actuator:
                 cmd.append("--stim-actuator")
                 cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])
@@ -154,6 +157,8 @@ def main() -> None:
                 eval_cmd.append("--per-neuron-stim-gain")
             if args.wide_amp_priors:
                 eval_cmd.append("--wide-amp-priors")
+            if args.evoked_syn_priors:
+                eval_cmd.append("--evoked-syn-priors")
             if args.stim_actuator:
                 eval_cmd.append("--stim-actuator")
                 eval_cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])

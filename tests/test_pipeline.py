@@ -1263,6 +1263,45 @@ def test_wide_amp_priors_expands_stim_gain_and_ach_reversal_range():
         assert wicks_loc_neg[1].min() < -0.065
 
 
+def test_evoked_syn_priors_sharpens_release_and_stays_calm_at_rest():
+    import math
+
+    pyro.clear_param_store()
+    step = c302.readConnectome(
+        "./data/CElegansNeuronTables.xls",
+        per_neuron_stim_gain=True,
+        wide_amp_priors=True,
+        evoked_syn_priors=True,
+    )
+    assert step.evoked_syn_priors is True
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2)
+    vm = vae.VAElegans(
+        rec,
+        step.neuronSize,
+        len(step.synapse.Wicks_SRC),
+        len(step.synapse.Gap_Junction_SRC),
+    )
+    assert vm.evoked_syn_priors is True
+    assert vm.guide.evoked_syn_priors is True
+    assert vm.encoder.evoked_syn_priors is True
+
+    vm.encoder.eval()
+    with torch.no_grad():
+        for tcn in (vm.encoder.neuron, vm.encoder.wick, vm.encoder.gap):
+            tcn.linear.weight.zero_()
+            tcn.linear.bias.zero_()
+        n_loc, _, w_loc, _, _, _ = vm.encoder(torch.zeros(1, 5, step.neuronSize))
+        assert torch.allclose(n_loc[3], torch.full_like(n_loc[3], -0.042), atol=1e-5)
+        assert torch.allclose(n_loc[4], torch.full_like(n_loc[4], math.log(0.008)), atol=1e-5)
+        assert torch.allclose(w_loc[0], torch.full_like(w_loc[0], math.log(0.015)), atol=1e-5)
+
+        pyro.set_rng_seed(7)
+        stim0 = torch.zeros(1, 20, step.neuronSize)
+        y0, v0, _ = rec.simulate(stim0, dt_obs=0.5)
+        assert torch.isfinite(y0).all() and torch.isfinite(v0).all()
+        assert float(v0[:, -1, :].mean()) < -0.045
+
+
 def test_nested_protocol_eval_wiring_and_seed_flags():
     import subprocess
     import sys

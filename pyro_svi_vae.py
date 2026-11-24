@@ -164,6 +164,8 @@ def main() -> None:
                         help="Learn a constrained stimulus gain per neuron")
     parser.add_argument("--wide-amp-priors", action="store_true",
                         help="Widen stim_gain, chemical g_max/gap spans, and dual-action ACh/Glu E_rev priors")
+    parser.add_argument("--evoked-syn-priors", action="store_true",
+                        help="Keep V_rest=-42 mV while sharpening V_slope (8 mV) and setting g_max median to 0.015 nS (std 0.95)")
     parser.add_argument("--stim-actuator", action="store_true",
                         help="Apply a first-order rise/decay actuator before the membrane")
     parser.add_argument("--stim-tau-rise", default=0.08, type=float)
@@ -323,6 +325,7 @@ def main() -> None:
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,
+        evoked_syn_priors=args.evoked_syn_priors,
         shuffle_seed=args.shuffle_connectome,
     )
     adj_t = torch.as_tensor(

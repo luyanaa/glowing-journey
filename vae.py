@@ -59,12 +59,14 @@ class Encoder(PyroModule):
         gap_dim: int,
         e_rev_prior: Optional[torch.Tensor] = None,
         wide_amp_priors: bool = False,
+        evoked_syn_priors: bool = False,
     ):
         super().__init__()
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
         self.wide_amp_priors = bool(wide_amp_priors)
+        self.evoked_syn_priors = bool(evoked_syn_priors)
 
         if e_rev_prior is not None and self.wicks_dim > 0:
             e_prior = torch.as_tensor(e_rev_prior, dtype=torch.float32).detach().clone().reshape(self.wicks_dim)
@@ -94,13 +96,15 @@ class Encoder(PyroModule):
 
         # Pool across batch so global connectome variational parameters match (D,) shapes
         neuron_raw = self.neuron(x).mean(dim=0).view(10, self.neuron_dim)
+        v_rest_center = -0.042
+        v_slope_center = math.log(0.008) if self.evoked_syn_priors else math.log(0.015)
         neuron_loc = torch.stack(
             [
                 -0.065 + 0.02 * torch.tanh(neuron_raw[0]),
                 math.log(0.5) + 0.8 * torch.tanh(neuron_raw[1]),
                 math.log(0.05) + 0.8 * torch.tanh(neuron_raw[2]),
-                -0.042 + 0.02 * torch.tanh(neuron_raw[3]),
-                math.log(0.015) + 0.5 * torch.tanh(neuron_raw[4]),
+                v_rest_center + 0.02 * torch.tanh(neuron_raw[3]),
+                v_slope_center + 0.5 * torch.tanh(neuron_raw[4]),
             ],
             dim=0,
         )
@@ -116,13 +120,14 @@ class Encoder(PyroModule):
         )
 
         if self.wicks_dim > 0:
+            gmax_center = math.log(0.015) if self.evoked_syn_priors else math.log(0.01)
             gmax_span = 2.8 if self.wide_amp_priors else 2.2
             erev_span = 0.075 if self.wide_amp_priors else 0.045
             wick_raw = self.wick(x).mean(dim=0).view(4, self.wicks_dim)
             wicks_loc = torch.stack(
                 [
-                    # Centered on calm 0.01 nS resting prior with wide dynamic range
-                    math.log(0.01) + gmax_span * torch.tanh(wick_raw[0]),
+                    # Centered on 0.01 nS (or 0.015 nS with evoked_syn_priors) with wide dynamic range
+                    gmax_center + gmax_span * torch.tanh(wick_raw[0]),
                     # Centered per-edge on neurotransmitter prior (expanded span when wide_amp_priors)
                     self.e_rev_prior.to(device=x.device, dtype=x.dtype) + erev_span * torch.tanh(wick_raw[1]),
                 ],
@@ -170,13 +175,16 @@ class VAEGuide(PyroModule):
         per_edge_release: bool = False,
         per_neuron_stim_gain: bool = False,
         wide_amp_priors: bool = False,
+        evoked_syn_priors: bool = False,
     ):
         super().__init__()
         self.wide_amp_priors = bool(wide_amp_priors)
+        self.evoked_syn_priors = bool(evoked_syn_priors)
         self.encoder = Encoder(
             neuron_dim, wicks_dim, gap_dim,
             e_rev_prior=e_rev_prior,
             wide_amp_priors=self.wide_amp_priors,
+            evoked_syn_priors=self.evoked_syn_priors,
         )
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
@@ -397,6 +405,9 @@ class VAElegans(PyroModule):
         wide_amp_priors = bool(
             getattr(getattr(model, "model", None), "wide_amp_priors", False)
         )
+        evoked_syn_priors = bool(
+            getattr(getattr(model, "model", None), "evoked_syn_priors", False)
+        )
         self.guide = VAEGuide(
             neuron_dim, wicks_dim, gap_dim,
             e_rev_prior=e_rev_prior,
@@ -404,6 +415,7 @@ class VAElegans(PyroModule):
             per_edge_release=per_edge_release,
             per_neuron_stim_gain=per_neuron_stim_gain,
             wide_amp_priors=wide_amp_priors,
+            evoked_syn_priors=evoked_syn_priors,
         )
         self.decoder = model
         self.neuron_dim = int(neuron_dim)
@@ -413,6 +425,7 @@ class VAElegans(PyroModule):
         self.per_edge_release = per_edge_release
         self.per_neuron_stim_gain = per_neuron_stim_gain
         self.wide_amp_priors = wide_amp_priors
+        self.evoked_syn_priors = evoked_syn_priors
 
     @property
     def encoder(self) -> Encoder:

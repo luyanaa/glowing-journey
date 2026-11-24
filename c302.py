@@ -332,6 +332,7 @@ class WicksSynapse(PyroModule):
         neuron_size: Optional[int] = None,
         per_edge_release: bool = False,
         wide_amp_priors: bool = False,
+        evoked_syn_priors: bool = False,
     ):
         super().__init__()
         src = np.asarray(synapseInput, dtype=np.int64).reshape(-1)
@@ -342,6 +343,7 @@ class WicksSynapse(PyroModule):
         self.share_presynaptic = self.neuron_size is not None
         self.per_edge_release = bool(per_edge_release)
         self.wide_amp_priors = bool(wide_amp_priors)
+        self.evoked_syn_priors = bool(evoked_syn_priors)
         self.register_buffer("synapseInput", torch.as_tensor(src, dtype=torch.long))
         self.register_buffer("synapseOutput", torch.as_tensor(dst, dtype=torch.long))
         self.register_buffer("synapseWeight", torch.as_tensor(w, dtype=torch.float32))
@@ -360,21 +362,25 @@ class WicksSynapse(PyroModule):
             self.register_buffer("e_rev_scale_buf", e_rev_scale_t)
 
             pre_param_dim = self.neuron_size if self.share_presynaptic else self.inputSize
-            # Keep prior median at 0.01 nS so high-degree hubs avoid resting tonic depolarization,
-            # while widening log-std so sparse functional edges can strengthen freely.
-            g_max_scale = 1.1 if self.wide_amp_priors else 0.85
+            # Keep prior median calm (0.01 nS, or 0.015 nS with sharper V_slope=8 mV for evoked_syn_priors)
+            # so high-degree hubs avoid resting tonic depolarization while evoked release remains responsive.
+            g_max_med = 0.015 if self.evoked_syn_priors else 0.01
+            g_max_scale = 0.95 if self.evoked_syn_priors else (1.1 if self.wide_amp_priors else 0.85)
+            v_rest_loc = -0.042
+            v_slope_loc = math.log(0.008) if self.evoked_syn_priors else math.log(0.015)
+            v_slope_scale = 0.35 if self.evoked_syn_priors else 0.3
             self.g_max = (
-                _sample_lognormal(self, math.log(0.01), g_max_scale, shape=(self.inputSize,), to_event=1)
+                _sample_lognormal(self, math.log(g_max_med), g_max_scale, shape=(self.inputSize,), to_event=1)
                 if g_max is None
                 else g_max
             )
             self.V_rest = (
-                _sample_normal(self, -0.042, 0.008, shape=(pre_param_dim,), to_event=1)
+                _sample_normal(self, v_rest_loc, 0.008, shape=(pre_param_dim,), to_event=1)
                 if V_rest is None
                 else V_rest
             )
             self.V_slope = (
-                _sample_lognormal(self, math.log(0.015), 0.3, shape=(pre_param_dim,), to_event=1)
+                _sample_lognormal(self, v_slope_loc, v_slope_scale, shape=(pre_param_dim,), to_event=1)
                 if V_slope is None
                 else V_slope
             )
@@ -518,10 +524,12 @@ class synapseLayer(PyroModule):
         neuron_size: Optional[int] = None,
         per_edge_release: bool = False,
         wide_amp_priors: bool = False,
+        evoked_syn_priors: bool = False,
     ):
         super().__init__()
         self.per_edge_release = bool(per_edge_release)
         self.wide_amp_priors = bool(wide_amp_priors)
+        self.evoked_syn_priors = bool(evoked_syn_priors)
         wicks_tuple = synapseList["Wicks"]
         self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight = wicks_tuple[:3]
         e_rev_loc = wicks_tuple[3] if len(wicks_tuple) > 3 else None
@@ -540,6 +548,7 @@ class synapseLayer(PyroModule):
             neuron_size=neuron_size,
             per_edge_release=per_edge_release,
             wide_amp_priors=wide_amp_priors,
+            evoked_syn_priors=evoked_syn_priors,
         )
         self.general = GeneralSynapse(
             self.Gap_Junction_SRC,
@@ -907,12 +916,14 @@ class NematodeForStep(PyroModule):
         per_edge_release: bool = False,
         per_neuron_stim_gain: bool = False,
         wide_amp_priors: bool = False,
+        evoked_syn_priors: bool = False,
     ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.neuronSize = neuronSize
         self.per_neuron_stim_gain = bool(per_neuron_stim_gain)
         self.wide_amp_priors = bool(wide_amp_priors)
+        self.evoked_syn_priors = bool(evoked_syn_priors)
         self.Neuron = neuronLayer(neuronSize, NeuronList)
         self.synapse = synapseLayer(
             synapseList,
@@ -920,6 +931,7 @@ class NematodeForStep(PyroModule):
             neuron_size=neuronSize,
             per_edge_release=per_edge_release,
             wide_amp_priors=wide_amp_priors,
+            evoked_syn_priors=evoked_syn_priors,
         )
         # Optogenetic Chrimson cation-channel conductance (nS) with physiological reversal E_opt = 0 V
         # (and inhibitory reversal E_inh = -85 mV if negative stimulation is supplied).
@@ -1393,6 +1405,7 @@ def readConnectome(
     per_edge_release: bool = False,
     per_neuron_stim_gain: bool = False,
     wide_amp_priors: bool = False,
+    evoked_syn_priors: bool = False,
     aconnectome_ids_path: str = "./pumpprobe/pumpprobe/aconnectome_ids.txt",
     edgelist_path: str = "./data/herm_full_edgelist.csv",
     np_path: str = "./data/edgelist_NP.csv",
@@ -1509,6 +1522,7 @@ def readConnectome(
             per_edge_release=per_edge_release,
             per_neuron_stim_gain=per_neuron_stim_gain,
             wide_amp_priors=wide_amp_priors,
+            evoked_syn_priors=evoked_syn_priors,
         )
     model.register_buffer("sensory_mask", torch.from_numpy(sensory_mask))
     return model
