@@ -128,6 +128,16 @@ def _set_edge_only_trainable(module, edge_only: bool):
             param.requires_grad_(True)
 
 
+def _set_prestim_only_trainable(module, prestim_only: bool, train_obs_sigma: bool = True):
+    """Freeze all non-prestim parameters for Stage-2 residual spontaneous drift fitting."""
+    for name, param in module.named_parameters():
+        if prestim_only:
+            keep = ("prestim_encoder" in name) or (train_obs_sigma and "obs_sigma" in name)
+            param.requires_grad_(keep)
+        else:
+            param.requires_grad_(True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train VAElegans amortized variational connectome model")
     parser.add_argument("total_epochs", nargs="?", type=int, default=10, help="Total epochs to train")
@@ -176,6 +186,8 @@ def main() -> None:
                         help="Warm-start checkpoint; scalar tau_ca/k_off are expanded to per-neuron vectors")
     parser.add_argument("--freeze-nonkinetics-epochs", default=0, type=int,
                         help="Freeze all parameters except guide tau_ca/k_off for this many epochs")
+    parser.add_argument("--freeze-non-prestim", action="store_true",
+                        help="Stage-2 decoupled mode: freeze connectome/stim/GCaMP params and train only prestim_encoder (+ obs_sigma)")
     parser.add_argument("--trial-split", action="store_true", help="Disable recording-level grouping in split")
     parser.add_argument("--seed", default=42, type=int, help="Training RNG seed")
     parser.add_argument("--split-seed", default=42, type=int, help="Fixed data split seed")
@@ -363,6 +375,16 @@ def main() -> None:
             f"expanded_kinetics={expanded}",
             flush=True,
         )
+    if args.freeze_non_prestim:
+        if not args.use_prestim_encoder:
+            raise ValueError("--freeze-non-prestim requires --use-prestim-encoder")
+        _set_prestim_only_trainable(model, True)
+        n_train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        print(
+            f"Stage-2 prestim-only mode: trainable={n_train_p} params, frozen={n_frozen_p} params",
+            flush=True,
+        )
     summary(model)
 
     optim = pyro.optim.ClippedAdam({"lr": args.lr, "clip_norm": 10.0})
@@ -372,7 +394,9 @@ def main() -> None:
     freeze_epochs = max(0, int(args.freeze_nonkinetics_epochs))
     edge_freeze_epochs = max(0, int(args.freeze_nonedge_epochs))
     for epoch in range(args.total_epochs):
-        if freeze_epochs:
+        if args.freeze_non_prestim:
+            _set_prestim_only_trainable(model, True)
+        elif freeze_epochs:
             frozen = epoch < freeze_epochs
             _set_kinetics_only_trainable(model, frozen)
             if epoch == freeze_epochs:

@@ -19,6 +19,7 @@ from pyro_svi_c302 import (
 from pyro_svi_vae import (
     _expand_scalar_kinetics,
     _load_compatible_state_dict,
+    _set_prestim_only_trainable,
     compute_drift_gate,
     reweight_hop1_noise,
 )
@@ -1300,6 +1301,51 @@ def test_evoked_syn_priors_sharpens_release_and_stays_calm_at_rest():
         y0, v0, _ = rec.simulate(stim0, dt_obs=0.5)
         assert torch.isfinite(y0).all() and torch.isfinite(v0).all()
         assert float(v0[:, -1, :].mean()) < -0.045
+
+
+def test_stage2_freeze_non_prestim_preserves_connectome_and_updates_prestim():
+    pyro.clear_param_store()
+    tiny_syn = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    stim = torch.zeros(2, 12, 3)
+    stim[:, 5, 0] = 1.0
+    y = torch.randn(2, 12, 3) * 0.2
+    y[:, 5:, 0] += 0.3
+    mask = torch.ones(2, 12, 3, dtype=torch.bool)
+    noise = torch.full((2, 3), 0.05)
+
+    step1 = c302.NematodeForStep(3, {}, tiny_syn)
+    rec1 = c302.RecurrentNematode(step1, dt_obs=0.5, substeps=2, use_prestim_encoder=False)
+    vm1 = vae.VAElegans(rec1, 3, 1, 0)
+    svi1 = SVI(vm1, vm1.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+    svi1.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+    assert bool(vm1._has_amortized_post.item()) is True
+    s1_state = {k: v.detach().clone() for k, v in vm1.state_dict().items()}
+
+    pyro.clear_param_store()
+    step2 = c302.NematodeForStep(3, {}, tiny_syn)
+    rec2 = c302.RecurrentNematode(step2, dt_obs=0.5, substeps=2, use_prestim_encoder=True, pre_vols=5, prestim_rank=2)
+    vm2 = vae.VAElegans(rec2, 3, 1, 0)
+    _load_compatible_state_dict(vm2, s1_state)
+    _set_prestim_only_trainable(vm2, True)
+
+    wicks_before = vm2._ema_wicks_loc.detach().clone()
+    stim_gain_before = vm2.guide.stim_gain_loc.detach().clone()
+    gcamp_gain_before = vm2.guide.gcamp_gain_loc.detach().clone()
+    prestim_w_before = vm2.decoder.prestim_encoder.local_fc1.weight.detach().clone()
+
+    svi2 = SVI(vm2, vm2.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+    for _ in range(2):
+        loss = svi2.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+        assert np.isfinite(loss)
+
+    assert torch.equal(vm2._ema_wicks_loc.detach(), wicks_before)
+    assert torch.equal(vm2.guide.stim_gain_loc.detach(), stim_gain_before)
+    assert torch.equal(vm2.guide.gcamp_gain_loc.detach(), gcamp_gain_before)
+    assert not torch.allclose(vm2.decoder.prestim_encoder.local_fc1.weight.detach(), prestim_w_before)
 
 
 def test_nested_protocol_eval_wiring_and_seed_flags():

@@ -49,6 +49,9 @@ def main() -> None:
     p.add_argument("--per-neuron-stim-gain", action="store_true")
     p.add_argument("--wide-amp-priors", action="store_true")
     p.add_argument("--evoked-syn-priors", action="store_true")
+    p.add_argument("--init-from-dir", default=None, type=str,
+                   help="Directory with Stage-1 summary.json and fold{fi}/{tag}_seed{seed}/ checkpoints for Stage-2 warm start")
+    p.add_argument("--freeze-non-prestim", action="store_true")
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -64,6 +67,14 @@ def main() -> None:
     seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
     shuffle_seeds = [int(x) for x in args.shuffle_seeds.split(",") if x.strip()]
     fold_indices = [int(x) for x in args.fold_indices.split(",") if x.strip()]
+    init_map = {}
+    if args.init_from_dir:
+        init_summary = os.path.join(args.init_from_dir, "summary.json")
+        if not os.path.isfile(init_summary):
+            raise FileNotFoundError(f"Stage-1 summary not found: {init_summary}")
+        with open(init_summary) as fh:
+            for r in json.load(fh).get("runs", []):
+                init_map[(r["tag"], int(r["train_seed"]))] = r["checkpoint"]
     records = []
 
     for fi in fold_indices:
@@ -104,6 +115,17 @@ def main() -> None:
                 cmd.append("--wide-amp-priors")
             if args.evoked_syn_priors:
                 cmd.append("--evoked-syn-priors")
+            if args.init_from_dir:
+                ckpt_ref = init_map.get((tag, int(seed)))
+                if not ckpt_ref:
+                    raise RuntimeError(f"No Stage-1 checkpoint entry for {(tag, int(seed))} in {args.init_from_dir}")
+                cand = os.path.join(args.init_from_dir, f"fold{fi}", f"{tag}_seed{seed}", os.path.basename(ckpt_ref))
+                stage1_ckpt = cand if os.path.isfile(cand) else ckpt_ref
+                if not os.path.isfile(stage1_ckpt):
+                    raise FileNotFoundError(f"Resolved Stage-1 checkpoint missing: {stage1_ckpt}")
+                cmd.extend(["--init-from", stage1_ckpt])
+            if args.freeze_non_prestim:
+                cmd.append("--freeze-non-prestim")
             if args.stim_actuator:
                 cmd.append("--stim-actuator")
                 cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])

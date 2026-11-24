@@ -279,7 +279,12 @@ class VAEGuide(PyroModule):
     ) -> None:
         # VAEGuide is a PyroModule: PyroModule.__call__ automatically registers both self.encoder
         # and all 20 variational PyroParams without touching sibling VAElegans.decoder.
-        if y is not None:
+        encoder_frozen = not any(p.requires_grad for p in self.encoder.parameters())
+        if encoder_frozen and bool(self._has_amortized_post.item()):
+            neuron_loc, neuron_scale = self._ema_neuron_loc, self._ema_neuron_scale
+            wicks_loc, wicks_scale = self._ema_wicks_loc, self._ema_wicks_scale
+            gap_loc, gap_scale = self._ema_gap_loc, self._ema_gap_scale
+        elif y is not None:
             neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale = self.encoder(y)
             with torch.no_grad():
                 mom = 0.9 if bool(self._has_amortized_post.item()) else 0.0

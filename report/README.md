@@ -424,6 +424,13 @@ All 5 folds × (3 intact + 3 shuffle seeds, 40 epochs, `--batch-size 64 --subste
 - **Arm A (`report/data/fold0_armA_nopre_summary.json`)**: `--no-prestim-encoder --wide-amp-priors` (`intact_seed42` vs `shuffle7_seed42`, 35 epochs) pushed `evoked_hop1_r2` cleanly positive to **`+0.00866`** vs shuffle **`-0.01098`** (`Δ = +0.01964`), `evoked_hop1_r = +0.1266` vs `+0.0699`, `evoked_stim_r2 = +0.0546`, doubling `hop1` predicted mean (`+0.0064 → +0.0139`) and std (`0.0148 → 0.0274`) with calibration slope `1.18` (8 s) / `1.03` (17.5 s).
 - **Arm B (`report/data/fold0_armB_evokedsyn_summary.json`)**: `--wide-amp-priors --evoked-syn-priors` (with pre-stim encoder) lifted `g_max > 0.0165` to `24.2%` and `post_inlier_r2` to `0.0998`, but `CausalPreStimEncoder` still starved evoked gradients (`evoked_hop1_r2 = -0.00385` vs `-0.01594`, FAIL).
 
+#### Fold-0 3+3 open-loop P0 gate PASS (`report/data/fold0_nopre_gate_summary.json`, 2026-11-24)
+
+- Completed all 3 training seeds (`42, 43, 44`) and 3 degree-preserving shuffles (`7, 8, 9`) under `--no-prestim-encoder --wide-amp-priors` (35 epochs, Fold 0):
+  - **Intact (3 seeds)**: `evoked_hop1_r2 = +0.00809 ± 0.00195` (all 3 seeds positive: `+0.00866 / +0.00970 / +0.00593`), `evoked_hop1_r = +0.1272 ± 0.0078`, `evoked_stim_r2 = +0.0534`, `evoked_hop2_r = +0.0662`, `post_inlier_r2 = +0.0308`.
+  - **Shuffled (3 perms)**: `evoked_hop1_r2 = -0.01471 ± 0.00328` (`-0.01098 / -0.01606 / -0.01710`), `evoked_hop1_r = +0.0373 ± 0.0285`.
+  - **Gate**: `delta_mean = +0.02281` vs `pooled_sem = 0.00220` (**`10.36× SEM`**, **PASS**). Next step: freeze Stage-1 connectome weights and train `CausalPreStimEncoder` on residual spontaneous drift (Stage-2 decoupled training).
+
 The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
 
 ```bash
@@ -484,6 +491,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/full_2026-11-20_resume_partial/` | Completed 30-run 5-fold counterfactual run archived as `report/data/p0_counterfactual_5fold.json` |
 | `glowing-journey_runs/fold0_opt1_2026-11-24/` | Fold-0 Option 1 (`--wide-amp-priors`) checkpoints/evals archived as `report/data/fold0_opt1_summary.json` |
 | `glowing-journey_runs/fold0_ablation_2026-11-24/` | Fold-0 single-seed Arm A (`nopre`) and Arm B (`evokedsyn`) checkpoints/evals |
+| `glowing-journey_runs/fold0_nopre_gate_2026-11-24/` | Fold-0 3+3 open-loop PASS summary and all 6 Stage-1 `.pt` checkpoints |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -509,7 +517,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.
 - P1/P2 audit fixes: electrical self-loops are filtered, `_expand_scalar_kinetics` writes `*_unconstrained` PyroParams, the stimulus actuator uses an exact signed exponential update, and causal preprocessing uses first-5-s noise plus invalid-F0 masking and `delta_f` MAD scaling.
-- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`, `report/data/p0_counterfactual_5fold.json`, `report/data/fold0_opt1_summary.json`, `report/data/fold0_armA_nopre_summary.json`, `report/data/fold0_armB_evokedsyn_summary.json`.
+- Current re-observation JSON: `report/data/current_randi_toyoshima_eval16.json`; legacy v5 adapter JSON: `report/data/current_randi_v5_legacy_adapter.json`; route A/B JSON: `report/data/routeA_causal_eval16.json`, `report/data/toyoshima_v2_eval16.json`; P0 gate JSON: `report/data/p0_full_gate.json`, `report/data/p0_counterfactual_5fold.json`, `report/data/fold0_opt1_summary.json`, `report/data/fold0_armA_nopre_summary.json`, `report/data/fold0_armB_evokedsyn_summary.json`, `report/data/fold0_nopre_gate_summary.json`.
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
