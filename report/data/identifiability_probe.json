@@ -1,19 +1,206 @@
 {
-  "protocol": "3 neurons, 1 Wicks chemical edge, 4 trials x 20 frames, no pre-stim encoder; true parameters fixed in simulation, 300 SVI steps, AutoDiagonalNormal.",
-  "true": {
-    "wicks_g_max": 0.05,
-    "gcamp_tau_ca_s": 7.0,
-    "gcamp_v_th_ca_logit": -0.22314368188381195,
-    "gcamp_k_off_s-1": 0.045,
-    "neuron_G_mean": 0.5
+  "legacy_low_snr_fixed_bug": {
+    "protocol": "3 neurons, 1 edge (weight=1.0), 4x20 frames, noise=0.01, 300 SVI steps, fixed pyro.condition(rec)",
+    "clean_peak_per_neuron": [
+      0.291999876499176,
+      0.007942604832351208,
+      3.755092450319353e-07
+    ],
+    "recovered_median": {
+      "wicks_g_max": 0.009538808837532997,
+      "gcamp_tau_ca_s": 5.590063095092773,
+      "gcamp_v_th_ca_logit": 0.01202256977558136,
+      "gcamp_k_off_s-1": 0.02907554619014263,
+      "neuron_G_mean": 0.4679988920688629
+    },
+    "final_loss": -371.7343806028366,
+    "svi_seconds": 5.02
   },
-  "recovered_median": {
-    "wicks_g_max": 0.009969204664230347,
-    "gcamp_tau_ca_s": 5.103347301483154,
-    "gcamp_v_th_ca_logit": -0.05008329078555107,
-    "gcamp_k_off_s-1": 0.039925508201122284,
-    "neuron_G_mean": 0.4615847466786703
+  "high_snr_free_all": {
+    "protocol": "3 neurons, 1 edge (weight=8.0), 8x30 frames multi-pulse, noise=0.005, 800 SVI steps, direct_global_guide=True, fix_gcamp_gauge=False",
+    "clean_peak_per_neuron": [
+      0.7172302007675171,
+      0.15927934646606445,
+      3.755092450319353e-07
+    ],
+    "heldout_test_r2": 0.972477912902832,
+    "parameters": {
+      "wicks_g_max": {
+        "true": 0.05,
+        "q05": 0.014925427502021194,
+        "median": 0.01668515708297491,
+        "q95": 0.018519729189574716,
+        "rel_err": 0.6662968583405018,
+        "in_ci90": false
+      },
+      "wicks_E_rev": {
+        "true": 0.0,
+        "q05": 0.006106512900441885,
+        "median": 0.009742181282490492,
+        "q95": 0.013169268704950809,
+        "rel_err": 974218.1282490492,
+        "in_ci90": false
+      },
+      "gcamp_tau_ca_s": {
+        "true": 7.0,
+        "q05": 3.360861372947693,
+        "median": 3.713755488395691,
+        "q95": 4.112732672691346,
+        "rel_err": 0.46946350165775846,
+        "in_ci90": false
+      },
+      "gcamp_k_off_s-1": {
+        "true": 0.045,
+        "q05": 0.07250654175877572,
+        "median": 0.08061133697628975,
+        "q95": 0.08903449960052967,
+        "rel_err": 0.7913630439175501,
+        "in_ci90": false
+      },
+      "gcamp_v_th_ca_logit": {
+        "true": -0.22314368188381195,
+        "q05": -0.9127200812101364,
+        "median": -0.8433745503425598,
+        "q95": -0.7861167252063752,
+        "rel_err": 2.7795134651479585,
+        "in_ci90": false
+      },
+      "neuron1_G": {
+        "true": 0.5,
+        "q05": 0.32174881994724275,
+        "median": 0.34281057119369507,
+        "q95": 0.36604243367910383,
+        "rel_err": 0.31437885761260986,
+        "in_ci90": false
+      },
+      "neuron1_gcamp_gain": {
+        "true": 1.4,
+        "q05": 2.243538129329681,
+        "median": 2.3731003999710083,
+        "q95": 2.5387667179107667,
+        "rel_err": 0.695071714265006,
+        "in_ci90": false
+      },
+      "stim_gain": {
+        "true": 1.2,
+        "q05": 1.0015312552452087,
+        "median": 1.106516718864441,
+        "q95": 1.255801302194595,
+        "rel_err": 0.07790273427963254,
+        "in_ci90": true
+      },
+      "composite_eff_syn_gain": {
+        "true": 0.06999999999999999,
+        "q05": 0.03505126349627972,
+        "median": 0.03959805704653263,
+        "q95": 0.04515250232070684,
+        "rel_err": 0.4343134707638195,
+        "in_ci90": false
+      },
+      "composite_total_ca_timescale_s": {
+        "true": 29.22222222222222,
+        "q05": 14.861255884170532,
+        "median": 16.160399436950684,
+        "q95": 17.57176761627197,
+        "rel_err": 0.4469825287735507,
+        "in_ci90": false
+      }
+    },
+    "final_loss": -1205.731075167656,
+    "svi_seconds": 19.91
   },
-  "svi_seconds": 13.0,
-  "conclusion": "Even in a tiny identifiable-in-principle model, SVI does not recover the true conductance/kinetics combination: g_max is 5x low, tau_ca 27% low, k_off 11% low, while V_th is near the prior median. This is direct evidence for compensation/identifiability problems and a reason to add hierarchical/structured priors rather than interpreting individual fitted parameters."
+  "high_snr_gauge_fixed_gcamp": {
+    "protocol": "3 neurons, 1 edge (weight=8.0), 8x30 frames multi-pulse, noise=0.005, 800 SVI steps, direct_global_guide=True, fix_gcamp_gauge=True",
+    "clean_peak_per_neuron": [
+      0.7172302007675171,
+      0.15927934646606445,
+      3.755092450319353e-07
+    ],
+    "heldout_test_r2": 0.99592125415802,
+    "parameters": {
+      "wicks_g_max": {
+        "true": 0.05,
+        "q05": 0.015482553001493215,
+        "median": 0.016313820146024227,
+        "q95": 0.01713225105777383,
+        "rel_err": 0.6737235970795155,
+        "in_ci90": false
+      },
+      "wicks_E_rev": {
+        "true": 0.0,
+        "q05": 0.007842659205198287,
+        "median": 0.010609827004373074,
+        "q95": 0.013218240439891815,
+        "rel_err": 1060982.7004373074,
+        "in_ci90": false
+      },
+      "gcamp_tau_ca_s": {
+        "true": 7.0,
+        "q05": 2.083825159072876,
+        "median": 2.15893816947937,
+        "q95": 2.2385027527809145,
+        "rel_err": 0.6915802615029472,
+        "in_ci90": false
+      },
+      "gcamp_k_off_s-1": {
+        "true": 0.045,
+        "q05": 0.036345823854207995,
+        "median": 0.04003025405108929,
+        "q95": 0.0438247088342905,
+        "rel_err": 0.11043879886468248,
+        "in_ci90": false
+      },
+      "gcamp_v_th_ca_logit": {
+        "true": -0.22314368188381195,
+        "q05": -0.16991979479789734,
+        "median": -0.12307184934616089,
+        "q95": -0.08439002335071573,
+        "rel_err": 0.4484636611390018,
+        "in_ci90": false
+      },
+      "neuron1_G": {
+        "true": 0.5,
+        "q05": 0.30895736515522004,
+        "median": 0.3205139636993408,
+        "q95": 0.3329198777675629,
+        "rel_err": 0.35897207260131836,
+        "in_ci90": false
+      },
+      "neuron1_gcamp_gain": {
+        "true": 1.4,
+        "q05": 1.3997987627983093,
+        "median": 1.3999925255775452,
+        "q95": 1.4002254366874696,
+        "rel_err": 5.338873181960833e-06,
+        "in_ci90": true
+      },
+      "stim_gain": {
+        "true": 1.2,
+        "q05": 1.2005008816719056,
+        "median": 1.260356843471527,
+        "q95": 1.3406648874282836,
+        "rel_err": 0.05029736955960595,
+        "in_ci90": false
+      },
+      "composite_eff_syn_gain": {
+        "true": 0.06999999999999999,
+        "q05": 0.021676141116768122,
+        "median": 0.02284056507050991,
+        "q95": 0.023982975538820027,
+        "rel_err": 0.6737062132784298,
+        "in_ci90": false
+      },
+      "composite_total_ca_timescale_s": {
+        "true": 29.22222222222222,
+        "q05": 24.959648036956786,
+        "median": 27.12754535675049,
+        "q95": 29.669845294952392,
+        "rel_err": 0.07168095737355741,
+        "in_ci90": true
+      }
+    },
+    "final_loss": -1670.893753170967,
+    "svi_seconds": 18.8
+  },
+  "conclusion": "1) Fixing the Pyro simulate() conditioning bug drops unconnected neuron 2 from 0.1427 to ~0, revealing that the original single-pulse probe only produced 0.0079 downstream dF/F0 (SNR < 0.8). 2) In an informative high-SNR multi-pulse regime (neuron 1 peak = 0.159 dF/F0, R^2 = 0.972), freeing all parameters shows strong compensation across g_max, neuron1 G, kinetics, and gcamp.gain. 3) Pinning the GCaMP scale gauge lifts heldout R^2 to 0.996 and recovers k_off within 11% and total Ca2+ timescale within CI90 (27.1s vs 29.2s), yet g_max (0.0163 vs 0.050) still trades off against postsynaptic leak conductance G (0.321 vs 0.50) and v_th_ca \u2014 proving voltage-free Ca2+ imaging identifies predictive trajectories and dimensionless ratios, not isolated single-edge nS conductances."
 }

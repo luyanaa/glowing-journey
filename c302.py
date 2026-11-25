@@ -820,30 +820,24 @@ class CausalPreStimEncoder(PyroModule):
             self.global_out.weight.zero_()
             self.global_out.bias.zero_()
 
-    def forward(
-        self,
+    @staticmethod
+    def extract_global_features(
         y_pre: torch.Tensor,
         mask_pre: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (delta_v0, delta_ca0, i_bg0, drift_fast0, drift_slow0, tau_bg, tau_fast, tau_slow)."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Strictly causal artifact-safe summary features extracted solely from ``y[:, :pre_vols]``."""
         if y_pre.dim() == 2:
             y_pre = y_pre.unsqueeze(0)
             if mask_pre is not None and mask_pre.dim() == 2:
                 mask_pre = mask_pre.unsqueeze(0)
-        bsz, t_pre, n_neu = y_pre.shape
+        _, t_pre, _ = y_pre.shape
         dtype = y_pre.dtype
         device = y_pre.device
 
-        if mask_pre is None:
-            m = torch.ones_like(y_pre, dtype=dtype)
-        else:
-            m = mask_pre.to(device=device, dtype=dtype)
+        m = torch.ones_like(y_pre, dtype=dtype) if mask_pre is None else mask_pre.to(device=device, dtype=dtype)
 
-        # Strictly causal artifact rejection + smooth saturation:
-        # 1. Reject pre-stimulus windows with extreme bimodal spikes (max |y_pre| > 2.0), which
-        #    otherwise create massive wrong-sign drift predictions on corrupted traces.
-        # 2. Smoothly compress remaining pre-stim values via 0.8 * tanh(y / 0.8) so normal
-        #    physiological deviations (+/-0.1..0.4) pass ~linearly while residual outliers saturate.
+        # Reject pre-stimulus windows with extreme bimodal spikes (max |y_pre| > 2.0) and smoothly
+        # saturate remaining observations via 0.8 * tanh(y / 0.8).
         y_raw_masked = torch.where(m > 0.5, torch.nan_to_num(y_pre, nan=0.0, posinf=0.0, neginf=0.0), torch.zeros_like(y_pre))
         pre_abs_max = y_raw_masked.abs().max(dim=1).values  # (B, N)
         clean_pre = (pre_abs_max <= 2.0).to(dtype=dtype)
@@ -871,6 +865,19 @@ class CausalPreStimEncoder(PyroModule):
         else:
             y_slope = torch.zeros_like(y_last)
 
+        global_in = torch.cat([y_last, y_slope, obs_any], dim=-1)  # (B, 3*N)
+        return global_in, y_last, y_recent, y_slope, obs_any
+
+    def forward(
+        self,
+        y_pre: torch.Tensor,
+        mask_pre: Optional[torch.Tensor] = None,
+        z_bg: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (delta_v0, delta_ca0, i_bg0, drift_fast0, drift_slow0, tau_bg, tau_fast, tau_slow)."""
+        global_in, y_last, y_recent, y_slope, obs_any = self.extract_global_features(y_pre, mask_pre)
+        n_neu = self.neuron_size
+
         feat_local = torch.stack([y_last, y_recent, y_slope, obs_any], dim=-1)  # (B, N, 4)
         h_local = F.silu(self.local_fc1(feat_local))
         raw_local = self.local_fc2(h_local) * obs_any.unsqueeze(-1)
@@ -881,9 +888,9 @@ class CausalPreStimEncoder(PyroModule):
         drift_fast0 = torch.clamp(self.fast_gain, -1.5, 1.5) * y_last + 0.5 * torch.tanh(raw_local[..., 3]) * obs_any
         drift_slow_local = torch.clamp(self.slow_gain, -1.5, 1.5) * y_recent + 0.5 * torch.tanh(raw_local[..., 4]) * obs_any
 
-        global_in = torch.cat([y_last, y_slope, obs_any], dim=-1)  # (B, 3*N)
-        z_h = F.silu(self.global_ln(self.global_fc1(global_in)))
-        z_bg = self.global_fc2(z_h)
+        if z_bg is None:
+            z_h = F.silu(self.global_ln(self.global_fc1(global_in)))
+            z_bg = self.global_fc2(z_h)
         global_out = self.global_out(z_bg)
         i_bg_global = 0.015 * torch.tanh(global_out[:, :n_neu])
         drift_slow_global = 0.25 * torch.tanh(global_out[:, n_neu:])
@@ -1064,6 +1071,7 @@ class RecurrentNematode(PyroModule):
         use_prestim_encoder: bool = False,
         pre_vols: int = 10,
         prestim_rank: int = 16,
+        variational_prestim: bool = False,
         per_neuron_kinetics: bool = False,
         per_edge_release: bool = False,
         stim_actuator: bool = False,
@@ -1083,13 +1091,15 @@ class RecurrentNematode(PyroModule):
         self.student_t_df = float(student_t_df)
         self.use_prestim_encoder = bool(use_prestim_encoder)
         self.pre_vols = int(pre_vols)
+        self.prestim_rank = int(prestim_rank)
+        self.variational_prestim = bool(variational_prestim)
 
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         neuron_size = getattr(model, "neuronSize", 300)
         self.per_neuron_kinetics = bool(per_neuron_kinetics)
         self.gcamp = CalciumGCaMPLayer(neuron_size, per_neuron_kinetics=self.per_neuron_kinetics)
         self.prestim_encoder = (
-            CausalPreStimEncoder(neuron_size, rank=prestim_rank) if self.use_prestim_encoder else None
+            CausalPreStimEncoder(neuron_size, rank=self.prestim_rank) if self.use_prestim_encoder else None
         )
         # Dimensionless observation noise multiplier (when noise_scale is provided) or base std
         self.obs_sigma = _sample_lognormal(self, math.log(0.15), 0.5)
@@ -1102,6 +1112,7 @@ class RecurrentNematode(PyroModule):
         pre_stim_obs: Optional[torch.Tensor] = None,
         pre_stim_mask: Optional[torch.Tensor] = None,
         drift_gate: Optional[torch.Tensor] = None,
+        prestim_z: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, n_t, n_neurons = stim_input.shape
         dt_sim = dt_obs / max(1, self.substeps)
@@ -1138,7 +1149,7 @@ class RecurrentNematode(PyroModule):
             # Structural causality guarantee: never read any frame at t >= pre_vols
             y_pre_slice = pre_stim_obs[:, :inject_t, :]
             m_pre_slice = None if pre_stim_mask is None else pre_stim_mask[:, :inject_t, :]
-            prestim_state = self.prestim_encoder(y_pre_slice, m_pre_slice)
+            prestim_state = self.prestim_encoder(y_pre_slice, m_pre_slice, z_bg=prestim_z)
             if drift_gate is not None:
                 g = drift_gate.to(device=stim_input.device, dtype=stim_input.dtype)
                 values = list(prestim_state)
@@ -1296,6 +1307,23 @@ class RecurrentNematode(PyroModule):
             pre_obs = y_obs[:, :t_cut, :]
             pre_msk = None if obs_mask is None else obs_mask[:, :t_cut, :]
 
+        batch_size = ext.shape[0]
+        if dataset_size is not None and int(dataset_size) > batch_size:
+            batch_plate = pyro.plate("batch", size=int(dataset_size), subsample_size=batch_size)
+        else:
+            batch_plate = pyro.plate("batch", batch_size)
+
+        # Sample per-trial/worm latent state inside `batch_plate` BEFORE `_rollout` so
+        # global connectome/GCaMP parameters inside `_rollout` remain outside the plate.
+        prestim_z = None
+        if self.prestim_encoder is not None and self.variational_prestim:
+            with batch_plate:
+                z_zeros = torch.zeros(batch_size, self.prestim_rank, device=ext.device, dtype=ext.dtype)
+                prestim_z = pyro.sample(
+                    "prestim_z",
+                    dist.Normal(z_zeros, torch.ones_like(z_zeros)).to_event(1),
+                )
+
         y_pred, _, _ = self._rollout(
             ext,
             v_clamp,
@@ -1303,9 +1331,10 @@ class RecurrentNematode(PyroModule):
             pre_stim_obs=pre_obs,
             pre_stim_mask=pre_msk,
             drift_gate=d_gate,
+            prestim_z=prestim_z,
         )
-        batch_size, n_t, _ = y_pred.shape
         obs_sigma = torch.clamp(self.obs_sigma, min=1e-3)
+        n_t = y_pred.shape[1]
 
         if n_scale is not None:
             # When empirical per-neuron noise_scale (B, N) or (B, T, N) is passed,
@@ -1313,11 +1342,6 @@ class RecurrentNematode(PyroModule):
             scale_t = torch.sqrt((obs_sigma * 0.5) ** 2 + n_scale ** 2)
         else:
             scale_t = obs_sigma
-
-        if dataset_size is not None and int(dataset_size) > batch_size:
-            batch_plate = pyro.plate("batch", size=int(dataset_size), subsample_size=batch_size)
-        else:
-            batch_plate = pyro.plate("batch", batch_size)
 
         with batch_plate:
             for t in range(n_t):

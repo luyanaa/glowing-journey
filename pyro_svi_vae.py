@@ -132,7 +132,11 @@ def _set_prestim_only_trainable(module, prestim_only: bool, train_obs_sigma: boo
     """Freeze all non-prestim parameters for Stage-2 residual spontaneous drift fitting."""
     for name, param in module.named_parameters():
         if prestim_only:
-            keep = ("prestim_encoder" in name) or (train_obs_sigma and "obs_sigma" in name)
+            keep = (
+                ("prestim_encoder" in name)
+                or ("prestim_q" in name)
+                or (train_obs_sigma and "obs_sigma" in name)
+            )
             param.requires_grad_(keep)
         else:
             param.requires_grad_(True)
@@ -176,6 +180,8 @@ def main() -> None:
                         help="Widen stim_gain, chemical g_max/gap spans, and dual-action ACh/Glu E_rev priors")
     parser.add_argument("--evoked-syn-priors", action="store_true",
                         help="Keep V_rest=-42 mV while sharpening V_slope (8 mV) and setting g_max median to 0.015 nS (std 0.95)")
+    parser.add_argument("--direct-global-guide", action="store_true",
+                        help="Use non-amortized PyroParam q(theta_global) and restrict amortization to q_phi(z | y_pre)")
     parser.add_argument("--stim-actuator", action="store_true",
                         help="Apply a first-order rise/decay actuator before the membrane")
     parser.add_argument("--stim-tau-rise", default=0.08, type=float)
@@ -352,6 +358,7 @@ def main() -> None:
         use_prestim_encoder=args.use_prestim_encoder,
         pre_vols=args.pre_vols,
         prestim_rank=args.prestim_rank,
+        variational_prestim=bool(args.direct_global_guide and args.use_prestim_encoder),
         per_neuron_kinetics=args.per_neuron_kinetics,
         per_edge_release=args.per_edge_release,
         stim_actuator=args.stim_actuator,
@@ -363,6 +370,7 @@ def main() -> None:
         rec_model.model.Neuron.neuronSize,
         len(rec_model.model.synapse.Wicks_SRC),
         len(rec_model.model.synapse.Gap_Junction_SRC),
+        direct_global_guide=args.direct_global_guide,
     ).to(device)
     if args.init_from:
         snap = torch.load(args.init_from, map_location=device, weights_only=False)

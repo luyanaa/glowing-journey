@@ -1385,6 +1385,133 @@ def test_resolve_init_checkpoint_handles_multifold_without_collision(tmp_path):
     assert _resolve_init_checkpoint(str(tmp_path), init_runs, 1, "intact", 42) == str(c1)
 
 
+def test_direct_global_guide_elbo_plates_and_train_test_invariance():
+    pyro.clear_param_store()
+    pyro.set_rng_seed(0)
+    tiny_syn = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    step = c302.NematodeForStep(3, {}, tiny_syn, wide_amp_priors=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=True, pre_vols=4, prestim_rank=3, variational_prestim=True
+    )
+    vm = vae.VAElegans(rec, 3, 1, 1, direct_global_guide=True)
+    assert vm.encoder is None and vm.guide.encoder is None and vm.guide.prestim_q is not None
+
+    stim = torch.zeros(2, 10, 3)
+    stim[:, 4, 0] = 1.0
+    y = torch.randn(2, 10, 3) * 0.2
+    mask = torch.ones(2, 10, 3, dtype=torch.bool)
+    noise = torch.full((2, 3), 0.05)
+
+    gtr = pyro.poutine.trace(vm.guide).get_trace(
+        ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=10
+    )
+    mtr = pyro.poutine.trace(pyro.poutine.replay(vm, gtr)).get_trace(
+        ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=10
+    )
+    assert float(mtr.nodes["decoder.model.synapse.wicks.g_max"]["scale"]) == 1.0
+    assert float(mtr.nodes["prestim_z"]["scale"]) == 5.0
+    assert float(mtr.nodes["obs_0"]["scale"]) == 5.0
+    assert torch.equal(gtr.nodes["prestim_z"]["value"], mtr.nodes["prestim_z"]["value"])
+
+    # Global parameter distributions must not depend on `y` vs `y=None`.
+    pyro.set_rng_seed(11)
+    tr_y = pyro.poutine.trace(vm.guide).get_trace(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+    pyro.set_rng_seed(11)
+    tr_none = pyro.poutine.trace(vm.guide).get_trace(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
+    assert torch.equal(
+        tr_y.nodes["decoder.model.synapse.wicks.g_max"]["value"],
+        tr_none.nodes["decoder.model.synapse.wicks.g_max"]["value"],
+    )
+
+    gmax_before = vm.guide.wicks_g_max_loc.detach().clone()
+    svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+    loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=10)
+    assert np.isfinite(loss)
+    assert not torch.allclose(vm.guide.wicks_g_max_loc.detach(), gmax_before)
+
+
+def test_direct_global_guide_stage2_freezes_connectome_and_trains_variational_prestim():
+    pyro.clear_param_store()
+    tiny_syn = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    stim = torch.zeros(2, 10, 3)
+    stim[:, 5, 0] = 1.0
+    y = torch.randn(2, 10, 3) * 0.2
+    mask = torch.ones(2, 10, 3, dtype=torch.bool)
+    noise = torch.full((2, 3), 0.05)
+
+    step1 = c302.NematodeForStep(3, {}, tiny_syn)
+    rec1 = c302.RecurrentNematode(step1, dt_obs=0.5, substeps=2, use_prestim_encoder=False)
+    vm1 = vae.VAElegans(rec1, 3, 1, 1, direct_global_guide=True)
+    svi1 = SVI(vm1, vm1.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+    svi1.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+    s1_state = {k: v.detach().clone() for k, v in vm1.state_dict().items()}
+
+    pyro.clear_param_store()
+    step2 = c302.NematodeForStep(3, {}, tiny_syn)
+    rec2 = c302.RecurrentNematode(
+        step2, dt_obs=0.5, substeps=2, use_prestim_encoder=True, pre_vols=5, prestim_rank=3, variational_prestim=True
+    )
+    vm2 = vae.VAElegans(rec2, 3, 1, 1, direct_global_guide=True)
+    _load_compatible_state_dict(vm2, s1_state)
+    _set_prestim_only_trainable(vm2, True)
+
+    gmax_before = vm2.guide.wicks_g_max_loc.detach().clone()
+    erev_before = vm2.guide.wicks_E_rev_z.detach().clone()
+    gsyn_before = vm2.guide.gap_g_syn_loc.detach().clone()
+    prestim_q_before = vm2.guide.prestim_q.fc2.weight.detach().clone()
+    prestim_enc_before = vm2.decoder.prestim_encoder.global_out.weight.detach().clone()
+
+    svi2 = SVI(vm2, vm2.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+    for _ in range(3):
+        loss = svi2.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+        assert np.isfinite(loss)
+
+    assert torch.equal(vm2.guide.wicks_g_max_loc.detach(), gmax_before)
+    assert torch.equal(vm2.guide.wicks_E_rev_z.detach(), erev_before)
+    assert torch.equal(vm2.guide.gap_g_syn_loc.detach(), gsyn_before)
+    assert not torch.allclose(vm2.guide.prestim_q.fc2.weight.detach(), prestim_q_before)
+    assert not torch.allclose(vm2.decoder.prestim_encoder.global_out.weight.detach(), prestim_enc_before)
+
+
+def test_pair_evoked_hop1_metrics_reported():
+    from pyro_svi_c302 import compute_stratified_metrics
+
+    rng = np.random.default_rng(7)
+    b, t, n = 4, 28, 4
+    stim = np.zeros((b, t, n), dtype=np.float32)
+    stim[:, 10:12, 0] = 1.0
+    adj = np.zeros((n, n), dtype=bool)
+    adj[0, 1] = True  # neuron 1 is excitatory hop1
+    adj[0, 2] = True  # neuron 2 is inhibitory hop1
+    y_true = rng.normal(scale=0.01, size=(b, t, n)).astype(np.float32)
+    y_true[:, 10:26, 0] += 0.4
+    y_true[:, 10:26, 1] += 0.20
+    y_true[:, 10:26, 2] -= 0.15
+    y_pred = np.zeros_like(y_true)
+    y_pred[:, 10:26, 0] = 0.25
+    y_pred[:, 10:26, 1] = 0.08
+    y_pred[:, 10:26, 2] = -0.06
+    y_cf = np.zeros_like(y_true)
+    mask = np.ones_like(y_true, dtype=bool)
+
+    m = compute_stratified_metrics(
+        y_true, y_pred, mask, stim=stim, pre_vols=10, adjacency=adj,
+        evoked_baseline="mean", evoked_window_vols=16, y_pred_counterfactual=y_cf,
+    )
+    assert m["pair_evoked_hop1_count"] == 2
+    assert m["pair_evoked_hop1_r"] > 0.99
+    assert m["pair_evoked_hop1_sign_acc"] == 1.0
+    assert 0.35 < m["pair_evoked_hop1_amp_ratio"] < 0.45
+
+
 def test_all_python_modules_compile():
     for fname in [
         "c302.py",

@@ -32,6 +32,7 @@ def main() -> None:
     p.add_argument("--per-neuron-stim-gain", action="store_true")
     p.add_argument("--wide-amp-priors", action="store_true")
     p.add_argument("--evoked-syn-priors", action="store_true")
+    p.add_argument("--direct-global-guide", action="store_true")
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -57,13 +58,15 @@ def main() -> None:
         evoked_syn_priors=args.evoked_syn_priors,
         shuffle_seed=args.shuffle_seed,
     )
+    use_prestim = not args.no_prestim_encoder
     rec = c302.RecurrentNematode(
         step,
         dt_obs=0.5,
         substeps=args.substeps,
-        use_prestim_encoder=not args.no_prestim_encoder,
+        use_prestim_encoder=use_prestim,
         pre_vols=args.pre_vols,
         prestim_rank=16,
+        variational_prestim=bool(args.direct_global_guide and use_prestim),
         per_neuron_kinetics=args.per_neuron_kinetics,
         per_edge_release=args.per_edge_release,
         stim_actuator=args.stim_actuator,
@@ -75,6 +78,7 @@ def main() -> None:
         rec.model.Neuron.neuronSize,
         len(rec.model.synapse.Wicks_SRC),
         len(rec.model.synapse.Gap_Junction_SRC),
+        direct_global_guide=args.direct_global_guide,
     ).to(device)
     snap = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(snap["MODEL_STATE"])
@@ -106,6 +110,7 @@ def main() -> None:
         "shuffle_seed": args.shuffle_seed,
         "wide_amp_priors": bool(args.wide_amp_priors),
         "evoked_syn_priors": bool(args.evoked_syn_priors),
+        "direct_global_guide": bool(args.direct_global_guide),
         "substeps": args.substeps,
         "eval_seed": args.eval_seed,
         "num_samples": args.num_samples,

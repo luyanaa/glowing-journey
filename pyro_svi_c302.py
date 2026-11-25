@@ -219,6 +219,43 @@ def compute_stratified_metrics(
                             yt_de, yp_de = yt_ev[sub_ev], yp_ev[sub_ev]
                             out[f"evoked_{prefix}_r2"] = float(r2_score(yt_de, yp_de))
                             out[f"evoked_{prefix}_r"] = _safe_pearson_r(yt_de, yp_de)
+                            if prefix == "hop1":
+                                t_std = float(np.std(yt_de))
+                                p_std = float(np.std(yp_de))
+                                out["evoked_hop1_true_std"] = t_std
+                                out["evoked_hop1_pred_std"] = p_std
+                                out["evoked_hop1_amp_ratio"] = float(p_std / t_std) if t_std > 1e-12 else 0.0
+                                stim_groups: Dict[tuple, list] = {}
+                                for b in range(n_trials):
+                                    sig = tuple(np.flatnonzero(stim_target[b]).tolist())
+                                    if sig:
+                                        stim_groups.setdefault(sig, []).append(b)
+                                pair_true_list, pair_pred_list = [], []
+                                for grp_idx in stim_groups.values():
+                                    if len(grp_idx) < 3:
+                                        continue
+                                    m_grp = sub_ev[grp_idx, t0:t_ev_end, :]
+                                    obs_trials = m_grp.any(axis=1).sum(axis=0)
+                                    keep_n = obs_trials >= 3
+                                    if not np.any(keep_n):
+                                        continue
+                                    m_keep = m_grp[:, :, keep_n]
+                                    cnt_n = np.maximum(m_keep.sum(axis=(0, 1)), 1)
+                                    t_mean = (yt_ev[grp_idx, t0:t_ev_end, :][:, :, keep_n] * m_keep).sum(axis=(0, 1)) / cnt_n
+                                    p_mean = (yp_ev[grp_idx, t0:t_ev_end, :][:, :, keep_n] * m_keep).sum(axis=(0, 1)) / cnt_n
+                                    pair_true_list.append(t_mean)
+                                    pair_pred_list.append(p_mean)
+                                if pair_true_list:
+                                    pt = np.concatenate(pair_true_list)
+                                    pp = np.concatenate(pair_pred_list)
+                                    out["pair_evoked_hop1_count"] = int(pt.size)
+                                    out["pair_evoked_hop1_r"] = _safe_pearson_r(pt, pp)
+                                    out["pair_evoked_hop1_r2"] = float(r2_score(pt, pp)) if pt.size >= 2 else float("nan")
+                                    pt_std = float(np.std(pt))
+                                    out["pair_evoked_hop1_amp_ratio"] = float(np.std(pp) / pt_std) if pt_std > 1e-12 else 0.0
+                                    strong = np.abs(pt) > 0.08
+                                    if np.any(strong):
+                                        out["pair_evoked_hop1_sign_acc"] = float(np.mean(np.sign(pt[strong]) == np.sign(pp[strong])))
                     sub_in = sub_mask & (np.abs(y_true) <= 3.0)
                     if np.any(sub_in):
                         out[f"{prefix}_inlier_r"] = _safe_pearson_r(y_true[sub_in], y_pred[sub_in])
