@@ -89,6 +89,7 @@ def compute_stratified_metrics(
     evoked_baseline: str = "linear",
     evoked_window_vols: int = 16,
     y_pred_counterfactual: Optional[np.ndarray] = None,
+    np_adjacency: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Compute overall, inlier (|y|<=3), direct-stimulated, and connectome hop-stratified metrics."""
     valid = mask.astype(bool)
@@ -260,6 +261,21 @@ def compute_stratified_metrics(
                     if np.any(sub_in):
                         out[f"{prefix}_inlier_r"] = _safe_pearson_r(y_true[sub_in], y_pred[sub_in])
 
+            if np_adjacency is not None and np_adjacency.shape == (n_neurons, n_neurons) and yt_ev is not None:
+                np_adj = np_adjacency.astype(bool)
+                np_only_neu = ((stim_target.astype(np.int32) @ np_adj.astype(np.int32)) > 0) & (~stim_target) & (~hop1_neu)
+                np_sub = np.zeros_like(valid)
+                np_sub[:, t0:t_ev_end, :] = np_only_neu[:, None, :] & valid[:, t0:t_ev_end, :]
+                if np.any(np_sub):
+                    yt_np, yp_np = yt_ev[np_sub], yp_ev[np_sub]
+                    out["evoked_np_only_count"] = int(yt_np.size)
+                    out["evoked_np_only_r2"] = float(r2_score(yt_np, yp_np))
+                    out["evoked_np_only_r"] = _safe_pearson_r(yt_np, yp_np)
+                    np_t_std = float(np.std(yt_np))
+                    np_p_std = float(np.std(yp_np))
+                    out["evoked_np_only_pred_std"] = np_p_std
+                    out["evoked_np_only_amp_ratio"] = float(np_p_std / np_t_std) if np_t_std > 1e-12 else 0.0
+
     return out
 
 
@@ -286,6 +302,7 @@ def evaluate_predictions(
     drift_gate_mode: str = "none",
     counterfactual_evoked: bool = True,
     evoked_window_vols: int = 16,
+    np_adjacency: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Evaluate posterior predictive GCaMP fit with overall, stimulated, and downstream metrics.
 
@@ -393,6 +410,7 @@ def evaluate_predictions(
         evoked_baseline="mean" if counterfactual_evoked else "linear",
         evoked_window_vols=evoked_window_vols,
         y_pred_counterfactual=np.concatenate(y_pred_cfs, axis=0) if y_pred_cfs else None,
+        np_adjacency=np_adjacency,
     )
 
 

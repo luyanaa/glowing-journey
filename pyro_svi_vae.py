@@ -182,6 +182,8 @@ def main() -> None:
                         help="Keep V_rest=-42 mV while sharpening V_slope (8 mV) and setting g_max median to 0.015 nS (std 0.95)")
     parser.add_argument("--direct-global-guide", action="store_true",
                         help="Use non-amortized PyroParam q(theta_global) and restrict amortization to q_phi(z | y_pre)")
+    parser.add_argument("--use-extrasynaptic", action="store_true",
+                        help="Enable neuropeptide and monoamine extrasynaptic pathway (edgelist_NP + MA)")
     parser.add_argument("--stim-actuator", action="store_true",
                         help="Apply a first-order rise/decay actuator before the membrane")
     parser.add_argument("--stim-tau-rise", default=0.08, type=float)
@@ -340,6 +342,7 @@ def main() -> None:
 
     step_model = c302.readConnectome(
         "./data/CElegansNeuronTables.xls",
+        use_extrasynaptic=args.use_extrasynaptic,
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,

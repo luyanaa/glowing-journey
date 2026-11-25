@@ -1428,10 +1428,14 @@ def test_direct_global_guide_elbo_plates_and_train_test_invariance():
     )
 
     gmax_before = vm.guide.wicks_g_max_loc.detach().clone()
+    gmax_glob_before = vm.guide.wicks_g_max_global_z.detach().clone()
+    gmax_z_before = vm.guide.wicks_g_max_z.detach().clone()
     svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
     loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=10)
     assert np.isfinite(loss)
     assert not torch.allclose(vm.guide.wicks_g_max_loc.detach(), gmax_before)
+    assert not torch.allclose(vm.guide.wicks_g_max_global_z.detach(), gmax_glob_before)
+    assert not torch.allclose(vm.guide.wicks_g_max_z.detach(), gmax_z_before)
 
 
 def test_direct_global_guide_stage2_freezes_connectome_and_trains_variational_prestim():
@@ -1464,6 +1468,7 @@ def test_direct_global_guide_stage2_freezes_connectome_and_trains_variational_pr
     _set_prestim_only_trainable(vm2, True)
 
     gmax_before = vm2.guide.wicks_g_max_loc.detach().clone()
+    gmax_glob_before = vm2.guide.wicks_g_max_global_z.detach().clone()
     erev_before = vm2.guide.wicks_E_rev_z.detach().clone()
     gsyn_before = vm2.guide.gap_g_syn_loc.detach().clone()
     prestim_q_before = vm2.guide.prestim_q.fc2.weight.detach().clone()
@@ -1475,6 +1480,7 @@ def test_direct_global_guide_stage2_freezes_connectome_and_trains_variational_pr
         assert np.isfinite(loss)
 
     assert torch.equal(vm2.guide.wicks_g_max_loc.detach(), gmax_before)
+    assert torch.equal(vm2.guide.wicks_g_max_global_z.detach(), gmax_glob_before)
     assert torch.equal(vm2.guide.wicks_E_rev_z.detach(), erev_before)
     assert torch.equal(vm2.guide.gap_g_syn_loc.detach(), gsyn_before)
     assert not torch.allclose(vm2.guide.prestim_q.fc2.weight.detach(), prestim_q_before)
@@ -1510,6 +1516,75 @@ def test_pair_evoked_hop1_metrics_reported():
     assert m["pair_evoked_hop1_r"] > 0.99
     assert m["pair_evoked_hop1_sign_acc"] == 1.0
     assert 0.35 < m["pair_evoked_hop1_amp_ratio"] < 0.45
+
+
+def test_extrasynaptic_pathway_calm_at_rest_no_self_loops_and_svi_step():
+    from pyro_svi_c302 import compute_stratified_metrics
+
+    pyro.clear_param_store()
+    pyro.set_rng_seed(7)
+    step = c302.readConnectome(
+        "./data/CElegansNeuronTables.xls",
+        use_extrasynaptic=True,
+        per_neuron_stim_gain=True,
+        wide_amp_priors=True,
+    )
+    src = np.asarray(step.synapse.Generic_SRC, dtype=np.int64)
+    dst = np.asarray(step.synapse.Generic_DST, dtype=np.int64)
+    assert src.size > 0
+    assert not np.any(src == dst)
+    np_adj = step.synapse.extrasynaptic_adjacency_matrix(step.neuronSize)
+    assert np_adj.shape == (step.neuronSize, step.neuronSize) and not np.any(np.diag(np_adj))
+
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2)
+    vm = vae.VAElegans(
+        rec, step.neuronSize,
+        len(step.synapse.Wicks_SRC), len(step.synapse.Gap_Junction_SRC),
+        direct_global_guide=True,
+    )
+    assert vm.guide.use_extrasynaptic and vm.guide.extra_dim == len(src)
+
+    with torch.no_grad():
+        stim0 = torch.zeros(1, 10, step.neuronSize)
+        y0, v0, _ = rec.simulate(stim0, dt_obs=0.5)
+        assert torch.isfinite(y0).all() and torch.isfinite(v0).all()
+        assert float(v0[:, -1, :].mean()) < -0.045
+
+    stim = torch.zeros(2, 8, step.neuronSize)
+    stim[:, 3, 0] = 1.0
+    y = torch.randn(2, 8, step.neuronSize) * 0.1
+    mask = torch.ones(2, 8, step.neuronSize, dtype=torch.bool)
+    noise = torch.full((2, step.neuronSize), 0.05)
+
+    extra_before = vm.guide.extrasyn_gain_z.detach().clone()
+    svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+    loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+    assert np.isfinite(loss)
+    assert not torch.allclose(vm.guide.extrasyn_gain_z.detach(), extra_before)
+
+    _set_prestim_only_trainable(vm, True)
+    assert not vm.guide.extrasyn_gain_z.requires_grad
+
+    # Verify np_only diagnostic metric
+    b, t, n = 2, 16, 4
+    s = np.zeros((b, t, n), dtype=np.float32)
+    s[:, 5, 0] = 1.0
+    adj = np.zeros((n, n), dtype=bool); adj[0, 1] = True
+    np_a = np.zeros((n, n), dtype=bool); np_a[0, 2] = True
+    yt = np.zeros((b, t, n), dtype=np.float32)
+    yt[:, 5:10, 2] = 0.25
+    yt[:, 10:, 2] = 0.10
+    yp = np.zeros((b, t, n), dtype=np.float32)
+    yp[:, 5:10, 2] = 0.20
+    yp[:, 10:, 2] = 0.08
+    metrics = compute_stratified_metrics(
+        yt, yp, np.ones_like(yt, dtype=bool), stim=s, pre_vols=5,
+        adjacency=adj, evoked_baseline="mean", evoked_window_vols=10,
+        y_pred_counterfactual=np.zeros_like(yt), np_adjacency=np_a,
+    )
+    assert metrics["evoked_np_only_count"] == 20
+    assert metrics["evoked_np_only_r2"] > 0.5
+    assert metrics["evoked_np_only_r"] > 0.99
 
 
 def test_all_python_modules_compile():

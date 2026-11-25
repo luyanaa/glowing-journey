@@ -199,6 +199,8 @@ class VAEGuide(PyroModule):
         pre_vols: int = 10,
         prestim_rank: int = 16,
         variational_prestim: bool = False,
+        use_extrasynaptic: bool = False,
+        extra_dim: int = 0,
     ):
         super().__init__()
         self.wide_amp_priors = bool(wide_amp_priors)
@@ -213,6 +215,8 @@ class VAEGuide(PyroModule):
         self.pre_vols = int(pre_vols)
         self.prestim_rank = int(prestim_rank)
         self.variational_prestim = bool(use_prestim_encoder and variational_prestim)
+        self.use_extrasynaptic = bool(use_extrasynaptic)
+        self.extra_dim = int(extra_dim)
 
         if e_rev_prior is not None and self.wicks_dim > 0:
             e_prior = torch.as_tensor(e_rev_prior, dtype=torch.float32).detach().clone().reshape(self.wicks_dim)
@@ -224,7 +228,6 @@ class VAEGuide(PyroModule):
         if self.direct_global_guide:
             self.encoder = None
             v_slope_init = math.log(0.008) if self.evoked_syn_priors else math.log(0.015)
-            gmax_init = math.log(0.015) if self.evoked_syn_priors else math.log(0.01)
 
             self.neuron_E_z = PyroParam(torch.zeros(self.neuron_dim))
             self.neuron_E_scale = PyroParam(
@@ -247,7 +250,8 @@ class VAEGuide(PyroModule):
                 torch.full((self.neuron_dim,), 0.12), constraint=constraints.interval(1e-3, 0.8)
             )
             if self.wicks_dim > 0:
-                self.wicks_g_max_loc = PyroParam(torch.full((self.wicks_dim,), gmax_init))
+                self.wicks_g_max_global_z = PyroParam(torch.tensor(0.0))
+                self.wicks_g_max_z = PyroParam(torch.zeros(self.wicks_dim))
                 self.wicks_g_max_scale = PyroParam(
                     torch.full((self.wicks_dim,), 0.25), constraint=constraints.interval(1e-3, 1.5)
                 )
@@ -256,7 +260,8 @@ class VAEGuide(PyroModule):
                     torch.full((self.wicks_dim,), 0.015), constraint=constraints.interval(1e-4, 0.06)
                 )
             if self.gap_dim > 0:
-                self.gap_g_syn_loc = PyroParam(torch.full((self.gap_dim,), math.log(0.015)))
+                self.gap_g_syn_global_z = PyroParam(torch.tensor(0.0))
+                self.gap_g_syn_z = PyroParam(torch.zeros(self.gap_dim))
                 self.gap_g_syn_scale = PyroParam(
                     torch.full((self.gap_dim,), 0.25), constraint=constraints.interval(1e-3, 1.5)
                 )
@@ -280,6 +285,12 @@ class VAEGuide(PyroModule):
             self.register_buffer("_ema_wicks_scale", torch.ones(2, self.wicks_dim))
             self.register_buffer("_ema_gap_loc", torch.zeros(self.gap_dim))
             self.register_buffer("_ema_gap_scale", torch.ones(self.gap_dim))
+
+        if self.use_extrasynaptic and self.extra_dim > 0:
+            self.extrasyn_gain_z = PyroParam(torch.zeros(self.extra_dim))
+            self.extrasyn_gain_scale = PyroParam(
+                torch.full((self.extra_dim,), 0.0005), constraint=constraints.interval(1e-5, 0.01)
+            )
 
         self.prestim_q = (
             PreStimVariationalEncoder(self.neuron_dim, rank=self.prestim_rank)
@@ -350,6 +361,15 @@ class VAEGuide(PyroModule):
             torch.full((self.neuron_dim,), 0.02), constraint=constraints.positive
         )
 
+    @property
+    def wicks_g_max_loc(self) -> torch.Tensor:
+        gmax_init = math.log(0.015) if self.evoked_syn_priors else math.log(0.01)
+        return gmax_init + 1.5 * self.wicks_g_max_global_z + 3.0 * self.wicks_g_max_z
+
+    @property
+    def gap_g_syn_loc(self) -> torch.Tensor:
+        return math.log(0.015) + 1.5 * self.gap_g_syn_global_z + 3.0 * self.gap_g_syn_z
+
     def _direct_global_params(self):
         neuron_loc = torch.stack(
             [
@@ -375,7 +395,7 @@ class VAEGuide(PyroModule):
             wicks_loc = torch.stack(
                 [
                     self.wicks_g_max_loc,
-                    self.e_rev_prior + 0.02 * self.wicks_E_rev_z,
+                    self.e_rev_prior + 0.04 * self.wicks_E_rev_z,
                 ],
                 dim=0,
             )
@@ -484,6 +504,11 @@ class VAEGuide(PyroModule):
                 "decoder.model.synapse.general.g_syn",
                 dist.LogNormal(gap_loc, gap_scale).to_event(1),
             )
+        if self.use_extrasynaptic and self.extra_dim > 0:
+            pyro.sample(
+                "decoder.model.synapse.extrasyn_gain",
+                dist.Normal(0.003 * self.extrasyn_gain_z, self.extrasyn_gain_scale).to_event(1),
+            )
 
         if self.per_neuron_stim_gain:
             pyro.sample(
@@ -584,6 +609,8 @@ class VAElegans(PyroModule):
         pre_vols = int(getattr(model, "pre_vols", 10))
         prestim_rank = int(getattr(model, "prestim_rank", 16))
         variational_prestim = bool(getattr(model, "variational_prestim", False))
+        use_extrasynaptic = bool(getattr(getattr(getattr(model, "model", None), "synapse", None), "use_extrasynaptic", False))
+        extra_dim = len(getattr(getattr(getattr(model, "model", None), "synapse", None), "Generic_SRC", []))
         self.direct_global_guide = bool(direct_global_guide)
         self.guide = VAEGuide(
             neuron_dim, wicks_dim, gap_dim,
@@ -598,6 +625,8 @@ class VAElegans(PyroModule):
             pre_vols=pre_vols,
             prestim_rank=prestim_rank,
             variational_prestim=variational_prestim,
+            use_extrasynaptic=use_extrasynaptic,
+            extra_dim=extra_dim,
         )
         self.decoder = model
         self.neuron_dim = int(neuron_dim)

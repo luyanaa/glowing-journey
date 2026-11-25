@@ -556,10 +556,10 @@ class synapseLayer(PyroModule):
             self.Gap_Junction_Weight,
         )
         self.register_buffer("_dev_ref", torch.tensor(0.0))
-        self.use_extrasynaptic = use_extrasynaptic
-        if use_extrasynaptic and len(self.Generic_SRC) > 0:
+        self.use_extrasynaptic = bool(use_extrasynaptic)
+        if self.use_extrasynaptic and len(self.Generic_SRC) > 0:
             self.extrasyn_gain = _sample_normal(
-                self, 0.0, 0.05, shape=(len(self.Generic_SRC),), to_event=1
+                self, 0.0, 0.0025, shape=(len(self.Generic_SRC),), to_event=1
             )
             self.register_buffer("generic_src_t", torch.as_tensor(self.Generic_SRC, dtype=torch.long))
             self.register_buffer("generic_dst_t", torch.as_tensor(self.Generic_DST, dtype=torch.long))
@@ -593,11 +593,11 @@ class synapseLayer(PyroModule):
         if self.use_extrasynaptic and len(self.Generic_SRC) > 0:
             w_extra = None if syn_cache is None else syn_cache.get("extra")
             if w_extra is not None:
-                drive = drive + torch.sigmoid((inputSignal + 0.055) / 0.02) @ w_extra
+                drive = drive + torch.sigmoid((inputSignal + 0.042) / 0.012) @ w_extra
             else:
                 dim = 0 if inputSignal.dim() == 1 else 1
                 pre_v = torch.index_select(inputSignal, dim, self.generic_src_t)
-                mod_cur = self.extrasyn_gain * torch.sigmoid((pre_v + 0.055) / 0.02)
+                mod_cur = self.extrasyn_gain * torch.sigmoid((pre_v + 0.042) / 0.012)
                 drive.index_add_(dim, self.generic_dst_t, mod_cur)
         return drive, cond
 
@@ -615,6 +615,14 @@ class synapseLayer(PyroModule):
             g_dst = np.asarray(self.Gap_Junction_DST, dtype=np.int64)
             adj[g_src, g_dst] = True
             adj[g_dst, g_src] = True
+        np.fill_diagonal(adj, False)
+        return adj
+
+    def extrasynaptic_adjacency_matrix(self, neuron_size: int) -> np.ndarray:
+        """Return boolean (N, N) adjacency A_np[src, dst] for extrasynaptic NP/MA links."""
+        adj = np.zeros((neuron_size, neuron_size), dtype=bool)
+        if len(self.Generic_SRC) > 0:
+            adj[np.asarray(self.Generic_SRC, dtype=np.int64), np.asarray(self.Generic_DST, dtype=np.int64)] = True
         np.fill_diagonal(adj, False)
         return adj
 
@@ -1507,8 +1515,12 @@ def readConnectome(
         origin = _normalize_neuron_name(row[0])
         target = _normalize_neuron_name(row[1])
         if origin in name_to_idx and target in name_to_idx:
-            generic_src.append(name_to_idx[origin])
-            generic_dst.append(name_to_idx[target])
+            src_idx = name_to_idx[origin]
+            dst_idx = name_to_idx[target]
+            if src_idx == dst_idx:
+                continue
+            generic_src.append(src_idx)
+            generic_dst.append(dst_idx)
             generic_w.append(1.0)
 
     if shuffle_seed is not None:

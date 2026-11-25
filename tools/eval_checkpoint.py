@@ -33,6 +33,7 @@ def main() -> None:
     p.add_argument("--wide-amp-priors", action="store_true")
     p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--direct-global-guide", action="store_true")
+    p.add_argument("--use-extrasynaptic", action="store_true")
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -52,6 +53,7 @@ def main() -> None:
 
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
+        use_extrasynaptic=args.use_extrasynaptic,
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,
@@ -89,6 +91,7 @@ def main() -> None:
     # control, not a new connectome definition.
     intact = c302.readConnectome(os.path.join(REPO, "data/CElegansNeuronTables.xls"))
     adjacency = intact.synapse.adjacency_matrix(intact.neuronSize)
+    np_adjacency = intact.synapse.extrasynaptic_adjacency_matrix(intact.neuronSize)
     np.random.seed(args.eval_seed)
     torch.manual_seed(args.eval_seed)
     if torch.cuda.is_available():
@@ -102,6 +105,7 @@ def main() -> None:
         num_samples=args.num_samples,
         pre_vols=args.pre_vols,
         adjacency=adjacency,
+        np_adjacency=np_adjacency,
     )
     result = {
         "metrics": metrics,
@@ -111,6 +115,7 @@ def main() -> None:
         "wide_amp_priors": bool(args.wide_amp_priors),
         "evoked_syn_priors": bool(args.evoked_syn_priors),
         "direct_global_guide": bool(args.direct_global_guide),
+        "use_extrasynaptic": bool(args.use_extrasynaptic),
         "substeps": args.substeps,
         "eval_seed": args.eval_seed,
         "num_samples": args.num_samples,

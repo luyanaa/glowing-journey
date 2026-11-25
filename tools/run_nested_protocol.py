@@ -77,6 +77,7 @@ def main() -> None:
     p.add_argument("--wide-amp-priors", action="store_true")
     p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--direct-global-guide", action="store_true")
+    p.add_argument("--use-extrasynaptic", action="store_true")
     p.add_argument("--init-from-dir", default=None, type=str,
                    help="Directory with Stage-1 summary.json and fold{fi}/{tag}_seed{seed}/ checkpoints for Stage-2 warm start")
     p.add_argument("--freeze-non-prestim", action="store_true")
@@ -144,6 +145,8 @@ def main() -> None:
                 cmd.append("--evoked-syn-priors")
             if args.direct_global_guide:
                 cmd.append("--direct-global-guide")
+            if args.use_extrasynaptic:
+                cmd.append("--use-extrasynaptic")
             if args.init_from_dir:
                 stage1_ckpt = _resolve_init_checkpoint(args.init_from_dir, init_runs, fi, tag, int(seed))
                 cmd.extend(["--init-from", stage1_ckpt])
@@ -206,6 +209,8 @@ def main() -> None:
                 eval_cmd.append("--evoked-syn-priors")
             if args.direct_global_guide:
                 eval_cmd.append("--direct-global-guide")
+            if args.use_extrasynaptic:
+                eval_cmd.append("--use-extrasynaptic")
             if args.stim_actuator:
                 eval_cmd.append("--stim-actuator")
                 eval_cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])
