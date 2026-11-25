@@ -1,0 +1,117 @@
+{
+  "gpu": "NVIDIA L4",
+  "train_trials_fold0": 1987,
+  "throughput": [
+    {
+      "batch_size": 64,
+      "lr": 0.005,
+      "ok": true,
+      "oom": false,
+      "all_dts_s": [
+        23.01,
+        15.58,
+        15.66
+      ],
+      "warm_dt_mean_s": 15.620000000000001,
+      "wall_s": 60.23084783554077,
+      "peak_vram_mb": 230.33,
+      "gpu_util_mean_pct": 10.068181818181818,
+      "gpu_util_max_pct": 18.0,
+      "mem_bw_util_mean_pct": 0.509090909090909,
+      "trials_per_sec": 127.20870678617156
+    },
+    {
+      "batch_size": 128,
+      "lr": 0.007,
+      "ok": true,
+      "oom": false,
+      "all_dts_s": [
+        9.63,
+        7.55,
+        7.56
+      ],
+      "warm_dt_mean_s": 7.555,
+      "wall_s": 30.6766517162323,
+      "peak_vram_mb": 439.76,
+      "gpu_util_mean_pct": 10.8125,
+      "gpu_util_max_pct": 20.0,
+      "mem_bw_util_mean_pct": 0.8482142857142857,
+      "trials_per_sec": 263.00463269358045
+    },
+    {
+      "batch_size": 256,
+      "lr": 0.01,
+      "ok": true,
+      "oom": false,
+      "all_dts_s": [
+        5.59,
+        3.84,
+        3.74
+      ],
+      "warm_dt_mean_s": 3.79,
+      "wall_s": 19.03113031387329,
+      "peak_vram_mb": 859.08,
+      "gpu_util_mean_pct": 9.342857142857143,
+      "gpu_util_max_pct": 24.0,
+      "mem_bw_util_mean_pct": 1.6714285714285715,
+      "trials_per_sec": 524.2744063324539
+    },
+    {
+      "batch_size": 512,
+      "lr": 0.014,
+      "ok": true,
+      "oom": false,
+      "all_dts_s": [
+        3.74,
+        1.75,
+        1.92
+      ],
+      "warm_dt_mean_s": 1.835,
+      "wall_s": 13.302959680557251,
+      "peak_vram_mb": 1698.27,
+      "gpu_util_mean_pct": 9.673469387755102,
+      "gpu_util_max_pct": 54.0,
+      "mem_bw_util_mean_pct": 5.26530612244898,
+      "trials_per_sec": 1082.83378746594
+    }
+  ],
+  "convergence_35ep_seed42": [
+    {
+      "batch_size": 128,
+      "lr": 0.007,
+      "train_wall_s": 293.64652729034424,
+      "selected_epoch": 35,
+      "evoked_hop1_r2": 0.00020064936500097108,
+      "evoked_hop1_r": 0.11019916747768695,
+      "evoked_stim_r2": 0.04101293055526578,
+      "pair_evoked_hop1_r": 0.22498184836843949,
+      "evoked_hop1_amp_ratio": 0.07214080050787211,
+      "post_inlier_r2": 0.028947830200195312
+    },
+    {
+      "batch_size": 256,
+      "lr": 0.01,
+      "train_wall_s": 155.50293397903442,
+      "selected_epoch": 35,
+      "evoked_hop1_r2": -0.002444045692830521,
+      "evoked_hop1_r": 0.09845944124712765,
+      "evoked_stim_r2": 0.019929628117443476,
+      "pair_evoked_hop1_r": 0.19684258819257264,
+      "evoked_hop1_amp_ratio": 0.07131359893172128,
+      "post_inlier_r2": 0.02787083387374878
+    }
+  ],
+  "baseline_64_seed42_ref": {
+    "evoked_hop1_r2": 0.002737118316454068,
+    "evoked_hop1_r": 0.1182393330968134,
+    "pair_evoked_hop1_r": 0.2378614989316796
+  },
+  "selected": {
+    "stage1_bs": 64,
+    "stage1_lr": 0.005,
+    "stage2_bs": 64,
+    "stage2_lr": 0.005,
+    "speedup_256_vs_128": 1.9934036939313984,
+    "reason": "fallback to 64/0.005 (128={'batch_size': 128, 'lr': 0.007, 'train_wall_s': 293.64652729034424, 'selected_epoch': 35, 'evoked_hop1_r2': 0.00020064936500097108, 'evoked_hop1_r': 0.11019916747768695, 'evoked_stim_r2': 0.04101293055526578, 'pair_evoked_hop1_r': 0.22498184836843949, 'evoked_hop1_amp_ratio': 0.07214080050787211, 'post_inlier_r2': 0.028947830200195312}, 256={'batch_size': 256, 'lr': 0.01, 'train_wall_s': 155.50293397903442, 'selected_epoch': 35, 'evoked_hop1_r2': -0.002444045692830521, 'evoked_hop1_r': 0.09845944124712765, 'evoked_stim_r2': 0.019929628117443476, 'pair_evoked_hop1_r': 0.19684258819257264, 'evoked_hop1_amp_ratio': 0.07131359893172128, 'post_inlier_r2': 0.02787083387374878})"
+  }
+}
