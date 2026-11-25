@@ -34,10 +34,12 @@ def main() -> None:
     p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--direct-global-guide", action="store_true")
     p.add_argument("--use-extrasynaptic", action="store_true")
+    p.add_argument("--prestim-oscillatory", action="store_true")
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
     p.add_argument("--substeps", default=2, type=int)
+    p.add_argument("--batch-size", default=256, type=int)
     p.add_argument("--eval-seed", default=42, type=int,
                    help="RNG seed for deterministic posterior predictive draws")
     p.add_argument("--num-samples", default=16, type=int)
@@ -49,7 +51,7 @@ def main() -> None:
     with open(args.split_file) as fh:
         split = json.load(fh)
     test_idx = [int(i) for i in split["test"]]
-    loader = DataLoader(Subset(dataset, test_idx), batch_size=64, shuffle=False)
+    loader = DataLoader(Subset(dataset, test_idx), batch_size=max(1, int(args.batch_size)), shuffle=False)
 
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
@@ -69,6 +71,7 @@ def main() -> None:
         pre_vols=args.pre_vols,
         prestim_rank=16,
         variational_prestim=bool(args.direct_global_guide and use_prestim),
+        prestim_oscillatory=args.prestim_oscillatory,
         per_neuron_kinetics=args.per_neuron_kinetics,
         per_edge_release=args.per_edge_release,
         stim_actuator=args.stim_actuator,
@@ -116,6 +119,7 @@ def main() -> None:
         "evoked_syn_priors": bool(args.evoked_syn_priors),
         "direct_global_guide": bool(args.direct_global_guide),
         "use_extrasynaptic": bool(args.use_extrasynaptic),
+        "prestim_oscillatory": bool(args.prestim_oscillatory),
         "substeps": args.substeps,
         "eval_seed": args.eval_seed,
         "num_samples": args.num_samples,

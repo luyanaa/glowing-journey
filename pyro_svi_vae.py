@@ -142,6 +142,16 @@ def _set_prestim_only_trainable(module, prestim_only: bool, train_obs_sigma: boo
             param.requires_grad_(True)
 
 
+def _set_extrasyn_only_trainable(module, extrasyn_only: bool, train_obs_sigma: bool = True):
+    """Freeze wired connectome/stim/GCaMP parameters for Stage-1b extrasynaptic fitting."""
+    for name, param in module.named_parameters():
+        if extrasyn_only:
+            keep = ("extrasyn" in name) or (train_obs_sigma and "obs_sigma" in name)
+            param.requires_grad_(keep)
+        else:
+            param.requires_grad_(True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train VAElegans amortized variational connectome model")
     parser.add_argument("total_epochs", nargs="?", type=int, default=10, help="Total epochs to train")
@@ -196,6 +206,10 @@ def main() -> None:
                         help="Freeze all parameters except guide tau_ca/k_off for this many epochs")
     parser.add_argument("--freeze-non-prestim", action="store_true",
                         help="Stage-2 decoupled mode: freeze connectome/stim/GCaMP params and train only prestim_encoder (+ obs_sigma)")
+    parser.add_argument("--freeze-wired-connectome", action="store_true",
+                        help="Stage-1b decoupled mode: freeze wired connectome/stim/GCaMP and train only extrasyn_gain (+ obs_sigma)")
+    parser.add_argument("--prestim-oscillatory", action="store_true",
+                        help="Augment CausalPreStimEncoder with strictly causal damped oscillatory latent modes")
     parser.add_argument("--trial-split", action="store_true", help="Disable recording-level grouping in split")
     parser.add_argument("--seed", default=42, type=int, help="Training RNG seed")
     parser.add_argument("--split-seed", default=42, type=int, help="Fixed data split seed")
@@ -321,10 +335,11 @@ def main() -> None:
         drop_last=len(train_ds) >= args.batch_size,
         num_workers=args.num_workers,
     )
+    eval_bs = max(int(args.batch_size), 256)
     val_data = (
         DataLoader(
             val_ds,
-            batch_size=min(args.batch_size, len(val_ds)),
+            batch_size=min(eval_bs, len(val_ds)),
             pin_memory=pin,
             shuffle=False,
             num_workers=args.num_workers,
@@ -334,7 +349,7 @@ def main() -> None:
     )
     test_data = DataLoader(
         test_ds,
-        batch_size=min(args.batch_size, len(test_ds)),
+        batch_size=min(eval_bs, len(test_ds)),
         pin_memory=pin,
         shuffle=False,
         num_workers=args.num_workers,
@@ -362,6 +377,7 @@ def main() -> None:
         pre_vols=args.pre_vols,
         prestim_rank=args.prestim_rank,
         variational_prestim=bool(args.direct_global_guide and args.use_prestim_encoder),
+        prestim_oscillatory=args.prestim_oscillatory,
         per_neuron_kinetics=args.per_neuron_kinetics,
         per_edge_release=args.per_edge_release,
         stim_actuator=args.stim_actuator,
@@ -386,6 +402,8 @@ def main() -> None:
             f"expanded_kinetics={expanded}",
             flush=True,
         )
+    if args.freeze_non_prestim and args.freeze_wired_connectome:
+        raise ValueError("--freeze-non-prestim and --freeze-wired-connectome cannot be combined")
     if args.freeze_non_prestim:
         if not args.use_prestim_encoder:
             raise ValueError("--freeze-non-prestim requires --use-prestim-encoder")
@@ -394,6 +412,16 @@ def main() -> None:
         n_frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
         print(
             f"Stage-2 prestim-only mode: trainable={n_train_p} params, frozen={n_frozen_p} params",
+            flush=True,
+        )
+    elif args.freeze_wired_connectome:
+        if not args.use_extrasynaptic:
+            raise ValueError("--freeze-wired-connectome requires --use-extrasynaptic")
+        _set_extrasyn_only_trainable(model, True)
+        n_train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        print(
+            f"Stage-1b extrasyn-only mode: trainable={n_train_p} params, frozen={n_frozen_p} params",
             flush=True,
         )
     summary(model)
@@ -407,6 +435,8 @@ def main() -> None:
     for epoch in range(args.total_epochs):
         if args.freeze_non_prestim:
             _set_prestim_only_trainable(model, True)
+        elif args.freeze_wired_connectome:
+            _set_extrasyn_only_trainable(model, True)
         elif freeze_epochs:
             frozen = epoch < freeze_epochs
             _set_kinetics_only_trainable(model, frozen)
@@ -419,12 +449,12 @@ def main() -> None:
                 print("Unfreezing all parameters after edge-only warm start", flush=True)
         t0 = time.time()
         loss = 0.0
-        scaled_obs = 0.0
+        scaled_obs_t = torch.zeros((), device=device, dtype=torch.float32)
         for stim, y, mask, noise in train_data:
-            stim = stim.to(device)
-            y = y.to(device)
-            mask = mask.to(device)
-            noise = noise.to(device)
+            stim = stim.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            noise = noise.to(device, non_blocking=True)
             bsz = max(1, int(stim.shape[0]))
             scale_factor = float(n_train_trials) / float(bsz) if n_train_trials > bsz else 1.0
             drift_gate = compute_drift_gate(stim, adj_t, args.drift_gate) if args.use_prestim_encoder else None
@@ -439,7 +469,8 @@ def main() -> None:
                 dataset_size=n_train_trials,
                 drift_gate=drift_gate,
             )
-            scaled_obs += float(mask.sum().item()) * scale_factor
+            scaled_obs_t = scaled_obs_t + mask.sum().to(dtype=torch.float32) * scale_factor
+        scaled_obs = float(scaled_obs_t.item())
         avg_loss = loss / max(1.0, scaled_obs)
         dt_ep = time.time() - t0
         print(f"Epoch {epoch:03d} | elbo/obs={avg_loss:.4f} | total_loss={loss:.2f} | dt={dt_ep:.2f}s")

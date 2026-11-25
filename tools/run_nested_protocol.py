@@ -78,6 +78,10 @@ def main() -> None:
     p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--direct-global-guide", action="store_true")
     p.add_argument("--use-extrasynaptic", action="store_true")
+    p.add_argument("--freeze-wired-connectome", action="store_true")
+    p.add_argument("--prestim-oscillatory", action="store_true")
+    p.add_argument("--skip-existing", action="store_true",
+                   help="Reuse existing completed run eval16.json files instead of retraining")
     p.add_argument("--init-from-dir", default=None, type=str,
                    help="Directory with Stage-1 summary.json and fold{fi}/{tag}_seed{seed}/ checkpoints for Stage-2 warm start")
     p.add_argument("--freeze-non-prestim", action="store_true")
@@ -117,6 +121,22 @@ def main() -> None:
         for tag, seed, shuffle_seed in runs:
             run_dir = os.path.join(args.out, f"fold{fi}", f"{tag}_seed{seed}")
             os.makedirs(run_dir, exist_ok=True)
+            eval_path = os.path.join(run_dir, "eval16.json")
+            if args.skip_existing and os.path.isfile(eval_path):
+                try:
+                    with open(eval_path) as fh:
+                        ev = json.load(fh)
+                    val_r2 = (ev.get("metrics") or {}).get("evoked_hop1_r2")
+                    if val_r2 is not None and np.isfinite(float(val_r2)):
+                        ev.setdefault("fold", fi)
+                        ev.setdefault("tag", tag)
+                        ev.setdefault("train_seed", seed)
+                        ev.setdefault("selected_val_metric", args.val_metric)
+                        records.append(ev)
+                        print(f"[skip-existing] reusing fold={fi} {tag} seed={seed}", flush=True)
+                        continue
+                except Exception:
+                    pass
             save_every = max(1, min(int(args.save_every), int(args.epochs)))
             cmd = [
                 args.python, "pyro_svi_vae.py", str(args.epochs), str(save_every),
@@ -147,6 +167,10 @@ def main() -> None:
                 cmd.append("--direct-global-guide")
             if args.use_extrasynaptic:
                 cmd.append("--use-extrasynaptic")
+            if args.freeze_wired_connectome:
+                cmd.append("--freeze-wired-connectome")
+            if args.prestim_oscillatory:
+                cmd.append("--prestim-oscillatory")
             if args.init_from_dir:
                 stage1_ckpt = _resolve_init_checkpoint(args.init_from_dir, init_runs, fi, tag, int(seed))
                 cmd.extend(["--init-from", stage1_ckpt])
@@ -211,6 +235,8 @@ def main() -> None:
                 eval_cmd.append("--direct-global-guide")
             if args.use_extrasynaptic:
                 eval_cmd.append("--use-extrasynaptic")
+            if args.prestim_oscillatory:
+                eval_cmd.append("--prestim-oscillatory")
             if args.stim_actuator:
                 eval_cmd.append("--stim-actuator")
                 eval_cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])

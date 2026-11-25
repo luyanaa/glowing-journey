@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import os
 import time
@@ -326,6 +327,11 @@ def evaluate_predictions(
         if (adj is not None and has_prestim and drift_gate_mode != "none")
         else None
     )
+    supports_sample_obs = False
+    try:
+        supports_sample_obs = "sample_obs" in inspect.signature(model.forward).parameters
+    except (TypeError, ValueError):
+        supports_sample_obs = False
     y_trues = []
     y_preds = []
     y_pred_cfs = []
@@ -333,33 +339,62 @@ def evaluate_predictions(
     stims = []
     with torch.no_grad():
         for batch in data_loader:
-            stim, y, mask, noise = [b.to(device) for b in batch]
+            stim, y, mask, noise = [b.to(device, non_blocking=True) for b in batch]
             t_cut = min(int(pre_vols), y.shape[1])
             if has_prestim:
                 gate = compute_drift_gate(stim, adj_t, drift_gate_mode) if adj_t is not None else None
+                pre_obs = y[:, :t_cut, :]
+                pre_mask = mask[:, :t_cut, :]
                 guide_kwargs = dict(
                     ExternalInput=stim,
                     mask=None,
                     y=None,
                     noise_scale=noise,
-                    pre_stim_obs=y[:, :t_cut, :],
-                    pre_stim_mask=mask[:, :t_cut, :],
+                    pre_stim_obs=pre_obs,
+                    pre_stim_mask=pre_mask,
                     drift_gate=gate,
                 )
-                model_kwargs = dict(guide_kwargs)
-                model_kwargs_zero = dict(model_kwargs)
-                model_kwargs_zero["ExternalInput"] = torch.zeros_like(stim)
             else:
+                gate = None
+                pre_obs = None
+                pre_mask = None
                 guide_kwargs = dict(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
-                model_kwargs = dict(guide_kwargs)
-                model_kwargs_zero = dict(model_kwargs)
-                model_kwargs_zero["ExternalInput"] = torch.zeros_like(stim)
+            model_kwargs = dict(guide_kwargs)
+            model_kwargs_zero = dict(model_kwargs)
+            model_kwargs_zero["ExternalInput"] = torch.zeros_like(stim)
+            if supports_sample_obs:
+                model_kwargs["sample_obs"] = False
+                model_kwargs_zero["sample_obs"] = False
 
             if counterfactual_evoked:
                 stim_returns = []
                 zero_returns = []
                 n_draws = 1 if posterior_samples is not None else int(num_samples)
-                for draw in range(n_draws):
+                can_stack = posterior_samples is None and stim.dim() == 3
+                if can_stack:
+                    stacked_kwargs = dict(
+                        ExternalInput=torch.cat([stim, torch.zeros_like(stim)], dim=0),
+                        mask=None,
+                        y=None,
+                        noise_scale=torch.cat([noise, noise], dim=0),
+                    )
+                    if has_prestim:
+                        stacked_kwargs["pre_stim_obs"] = torch.cat([pre_obs, pre_obs], dim=0)
+                        stacked_kwargs["pre_stim_mask"] = torch.cat([pre_mask, pre_mask], dim=0)
+                        if gate is not None:
+                            if gate.dim() == 3:
+                                stacked_gate = torch.cat([gate, gate], dim=1)
+                            elif gate.dim() == 2:
+                                stacked_gate = torch.cat([gate, gate], dim=0)
+                            else:
+                                stacked_gate = gate
+                            stacked_kwargs["drift_gate"] = stacked_gate
+                        else:
+                            stacked_kwargs["drift_gate"] = None
+                    if supports_sample_obs:
+                        stacked_kwargs["sample_obs"] = False
+                bsz = stim.shape[0]
+                for _ in range(n_draws):
                     if posterior_samples is not None:
                         ps = posterior_samples
                     else:
@@ -367,18 +402,27 @@ def evaluate_predictions(
                         ps = {
                             name: site["value"]
                             for name, site in gtrace.nodes.items()
-                            if site["type"] == "sample"
+                            if site["type"] == "sample" and name != "batch"
                         }
-                    # Condition the model directly so scalar guide samples
-                    # remain scalars; Predictive would treat their leading
-                    # neuron dimension as a sample dimension.
-                    conditioned = pyro.condition(model, data=ps)
-                    s_out = conditioned(**model_kwargs)
-                    z_out = conditioned(**model_kwargs_zero)
-                    if s_out.dim() == 4:
-                        s_out = s_out.mean(dim=0)
-                    if z_out.dim() == 4:
-                        z_out = z_out.mean(dim=0)
+                    if can_stack:
+                        pz = ps.get("prestim_z")
+                        if torch.is_tensor(pz) and pz.dim() >= 2 and pz.shape[0] == bsz:
+                            ps_run = {k: v for k, v in ps.items() if k != "batch"}
+                            ps_run["prestim_z"] = torch.cat([pz, pz], dim=0)
+                        else:
+                            ps_run = {k: v for k, v in ps.items() if k != "batch"}
+                        both_out = pyro.condition(model, data=ps_run)(**stacked_kwargs)
+                        if both_out.dim() == 4:
+                            both_out = both_out.mean(dim=0)
+                        s_out, z_out = both_out.chunk(2, dim=0)
+                    else:
+                        conditioned = pyro.condition(model, data=ps)
+                        s_out = conditioned(**model_kwargs)
+                        z_out = conditioned(**model_kwargs_zero)
+                        if s_out.dim() == 4:
+                            s_out = s_out.mean(dim=0)
+                        if z_out.dim() == 4:
+                            z_out = z_out.mean(dim=0)
                     stim_returns.append(s_out)
                     zero_returns.append(z_out)
                 pred_mean = torch.stack(stim_returns).mean(dim=0)

@@ -160,11 +160,13 @@ class Encoder(PyroModule):
 class PreStimVariationalEncoder(PyroModule):
     """Strictly causal recognition network q_phi(z | y_pre) for local/worm latent state."""
 
-    def __init__(self, neuron_dim: int, rank: int = 16, hidden: int = 64):
+    def __init__(self, neuron_dim: int, rank: int = 16, hidden: int = 64, oscillatory: bool = False):
         super().__init__()
         self.neuron_dim = int(neuron_dim)
         self.rank = int(rank)
-        self.fc1 = PyroModule[nn.Linear](self.neuron_dim * 3, hidden)
+        self.oscillatory = bool(oscillatory)
+        in_mult = 4 if self.oscillatory else 3
+        self.fc1 = PyroModule[nn.Linear](self.neuron_dim * in_mult, hidden)
         self.ln = PyroModule[nn.LayerNorm](hidden)
         self.fc2 = PyroModule[nn.Linear](hidden, self.rank * 2)
         with torch.no_grad():
@@ -172,7 +174,10 @@ class PreStimVariationalEncoder(PyroModule):
             self.fc2.bias.zero_()
 
     def forward(self, y_pre: torch.Tensor, mask_pre: Optional[torch.Tensor] = None):
-        global_in, _, _, _, _ = CausalPreStimEncoder.extract_global_features(y_pre, mask_pre)
+        if self.oscillatory:
+            global_in, _, _, _, _, _ = CausalPreStimEncoder.extract_oscillatory_features(y_pre, mask_pre)
+        else:
+            global_in, _, _, _, _ = CausalPreStimEncoder.extract_global_features(y_pre, mask_pre)
         h = F.silu(self.ln(self.fc1(global_in)))
         raw = self.fc2(h)
         z_loc = 3.0 * torch.tanh(raw[:, :self.rank])
@@ -199,6 +204,7 @@ class VAEGuide(PyroModule):
         pre_vols: int = 10,
         prestim_rank: int = 16,
         variational_prestim: bool = False,
+        prestim_oscillatory: bool = False,
         use_extrasynaptic: bool = False,
         extra_dim: int = 0,
     ):
@@ -293,7 +299,9 @@ class VAEGuide(PyroModule):
             )
 
         self.prestim_q = (
-            PreStimVariationalEncoder(self.neuron_dim, rank=self.prestim_rank)
+            PreStimVariationalEncoder(
+                self.neuron_dim, rank=self.prestim_rank, oscillatory=bool(prestim_oscillatory)
+            )
             if self.variational_prestim
             else None
         )
@@ -609,6 +617,7 @@ class VAElegans(PyroModule):
         pre_vols = int(getattr(model, "pre_vols", 10))
         prestim_rank = int(getattr(model, "prestim_rank", 16))
         variational_prestim = bool(getattr(model, "variational_prestim", False))
+        prestim_oscillatory = bool(getattr(model, "prestim_oscillatory", False))
         use_extrasynaptic = bool(getattr(getattr(getattr(model, "model", None), "synapse", None), "use_extrasynaptic", False))
         extra_dim = len(getattr(getattr(getattr(model, "model", None), "synapse", None), "Generic_SRC", []))
         self.direct_global_guide = bool(direct_global_guide)
@@ -625,6 +634,7 @@ class VAElegans(PyroModule):
             pre_vols=pre_vols,
             prestim_rank=prestim_rank,
             variational_prestim=variational_prestim,
+            prestim_oscillatory=prestim_oscillatory,
             use_extrasynaptic=use_extrasynaptic,
             extra_dim=extra_dim,
         )
@@ -734,6 +744,7 @@ class VAElegans(PyroModule):
         pre_stim_obs: Optional[torch.Tensor] = None,
         pre_stim_mask: Optional[torch.Tensor] = None,
         drift_gate: Optional[torch.Tensor] = None,
+        sample_obs: bool = True,
     ) -> torch.Tensor:
         return self.decoder(
             ExternalInput=ExternalInput,
@@ -745,4 +756,5 @@ class VAElegans(PyroModule):
             pre_stim_obs=pre_stim_obs,
             pre_stim_mask=pre_stim_mask,
             drift_gate=drift_gate,
+            sample_obs=sample_obs,
         )
