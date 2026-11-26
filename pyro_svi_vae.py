@@ -39,7 +39,7 @@ def compute_drift_gate(stim: torch.Tensor, adjacency: torch.Tensor, mode: str) -
     """
     if mode == "none":
         return None
-    stim_target = stim.sum(dim=1) > 0
+    stim_target = stim.abs().sum(dim=1) > 0
     if mode == "direct":
         return (~stim_target).to(dtype=stim.dtype)
     hop1 = (stim_target.to(dtype=stim.dtype) @ adjacency > 0) & (~stim_target)
@@ -59,7 +59,7 @@ def reweight_hop1_noise(
     the direct stimulus targets, which are only ~1.4% of post-stim observations
     and otherwise disappear into the background likelihood.
     """
-    stim_target = stim.sum(dim=1) > 0
+    stim_target = stim.abs().sum(dim=1) > 0
     hop1 = (stim_target.to(dtype=stim.dtype) @ adjacency > 0) & (~stim_target)
     factor = torch.ones_like(noise)
     if stim_weight > 1.0:
@@ -75,6 +75,22 @@ def reweight_hop1_noise(
             factor,
         )
     return noise * factor
+
+
+def _validate_cache_provenance(provenance: dict, expected: dict, cache_path: str) -> None:
+    """Fail fast if a dataset cache does not match the requested preprocessing contract."""
+    if not provenance:
+        raise ValueError(
+            f"Dataset cache {cache_path!r} is missing provenance metadata; delete and rebuild it."
+        )
+    mismatches = []
+    for k, v in expected.items():
+        if provenance.get(k) != v:
+            mismatches.append(f"{k}: cache={provenance.get(k)!r} vs requested={v!r}")
+    if mismatches:
+        raise ValueError(
+            f"Dataset cache {cache_path!r} provenance mismatch ({'; '.join(mismatches)})."
+        )
 
 
 def _load_compatible_state_dict(module, state):
@@ -236,8 +252,17 @@ def main() -> None:
     os.makedirs(args.snapshot_dir, exist_ok=True)
 
     if args.source == "randi":
+        expected_prov = {
+            "source": "randi",
+            "strain": str(args.strain),
+            "norm_mode": str(args.norm_mode),
+            "causal_preprocess": bool(args.causal_preprocess),
+            "pre_vols": int(args.pre_vols),
+            "post_vols": int(args.post_vols),
+        }
         if args.dataset_cache and os.path.isfile(args.dataset_cache):
             dataset = RandiTrialDataset.load(args.dataset_cache)
+            _validate_cache_provenance(dataset.provenance, expected_prov, args.dataset_cache)
         else:
             dataset = AtlasLoader(
                 path=args.data_path,
@@ -250,8 +275,14 @@ def main() -> None:
                 dataset.save(args.dataset_cache)
         source_label = "randi"
     elif args.source == "toyoshima":
+        expected_prov = {
+            "source": "toyoshima",
+            "pre_vols": int(args.pre_vols),
+            "post_vols": int(args.post_vols),
+        }
         if args.dataset_cache and os.path.isfile(args.dataset_cache):
             dataset = RandiTrialDataset.load(args.dataset_cache)
+            _validate_cache_provenance(dataset.provenance, expected_prov, args.dataset_cache)
         else:
             targets = tuple(t.strip() for t in args.toyoshima_targets.split(",") if t.strip())
             dataset = ToyoshimaLoader(

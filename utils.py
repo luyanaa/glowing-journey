@@ -497,6 +497,7 @@ class RandiTrialDataset(Dataset):
         noise_scale: torch.Tensor,
         dts: torch.Tensor,
         meta: List[dict],
+        provenance: Optional[dict] = None,
     ):
         self.stim_inputs = stim_inputs
         self.y = y
@@ -504,6 +505,7 @@ class RandiTrialDataset(Dataset):
         self.noise_scale = noise_scale
         self.dts = dts
         self.meta = meta
+        self.provenance = dict(provenance) if provenance is not None else {}
 
     def __len__(self) -> int:
         return self.y.shape[0]
@@ -532,6 +534,7 @@ class RandiTrialDataset(Dataset):
             noise_scale=self.noise_scale.cpu().numpy().astype(np.float32),
             dts=self.dts.cpu().numpy().astype(np.float32),
             meta_json=np.array([json.dumps(self.meta)]),
+            provenance_json=np.array([json.dumps(self.provenance)]),
         )
 
     @classmethod
@@ -545,6 +548,7 @@ class RandiTrialDataset(Dataset):
             stim_nz = d["stim_nz"]
             if len(stim_nz) > 0:
                 stim[stim_nz[:, 0], stim_nz[:, 1], stim_nz[:, 2]] = torch.from_numpy(d["stim_vals"])
+            provenance = json.loads(str(d["provenance_json"][0])) if "provenance_json" in d else {}
             return cls(
                 stim_inputs=stim,
                 y=torch.from_numpy(d["y"].astype(np.float32)),
@@ -552,6 +556,7 @@ class RandiTrialDataset(Dataset):
                 noise_scale=torch.from_numpy(d["noise_scale"].astype(np.float32)),
                 dts=torch.from_numpy(d["dts"].astype(np.float32)),
                 meta=json.loads(str(d["meta_json"][0])),
+                provenance=provenance,
             )
 
 
@@ -576,6 +581,7 @@ class AtlasLoader(Dataset):
         causal_preprocess: bool = False,
     ):
         self.device = device
+        self.strain = str(strain)
         self.causal_preprocess = bool(causal_preprocess)
         self.norm_mode = norm_mode
         self.neuron_names, self.name_to_idx = load_canonical_neurons(aconnectome_path)
@@ -835,6 +841,16 @@ class AtlasLoader(Dataset):
             noise_scale=torch.stack(noise_list, dim=0),
             dts=torch.tensor(dt_list, dtype=torch.float32),
             meta=meta_list,
+            provenance={
+                "source": "randi",
+                "strain": str(getattr(self, "strain", "unknown")),
+                "norm_mode": str(getattr(self, "norm_mode", "unknown")),
+                "causal_preprocess": bool(getattr(self, "causal_preprocess", False)),
+                "pre_vols": int(pre_vols),
+                "post_vols": int(post_vols),
+                "stim_duration_s": float(stim_duration_s),
+                "rebaseline_on_pre": bool(rebaseline_on_pre),
+            },
         )
 
     def __len__(self) -> int:
@@ -1099,6 +1115,15 @@ class ToyoshimaLoader:
             noise_scale=torch.stack(noise_list),
             dts=torch.tensor(dt_list, dtype=torch.float32),
             meta=meta_list,
+            provenance={
+                "source": "toyoshima",
+                "target_fs": float(getattr(self, "target_fs", 2.0)),
+                "pre_vols": int(pre_vols),
+                "post_vols": int(post_vols),
+                "step_duration_s": float(step_duration_s),
+                "rebaseline_on_pre": bool(rebaseline_on_pre),
+                "observation_scale": float(getattr(self, "observation_scale", 0.18)),
+            },
         )
 
 

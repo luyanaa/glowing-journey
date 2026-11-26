@@ -91,6 +91,7 @@ def compute_stratified_metrics(
     evoked_window_vols: int = 16,
     y_pred_counterfactual: Optional[np.ndarray] = None,
     np_adjacency: Optional[np.ndarray] = None,
+    dt_obs: float = 0.5,
 ) -> Dict[str, float]:
     """Compute overall, inlier (|y|<=3), direct-stimulated, and connectome hop-stratified metrics."""
     valid = mask.astype(bool)
@@ -169,7 +170,7 @@ def compute_stratified_metrics(
         t1_stim = min(n_t, t0 + 35)
         t1_down = min(n_t, t0 + 35)
 
-        stim_target = stim.sum(axis=1) > 0  # (B, N)
+        stim_target = np.abs(stim).sum(axis=1) > 0  # (B, N)
         evoked_stim = np.zeros_like(valid)
         evoked_stim[:, t0:t1_stim, :] = stim_target[:, None, :] & valid[:, t0:t1_stim, :]
         if np.any(evoked_stim):
@@ -258,24 +259,51 @@ def compute_stratified_metrics(
                                     strong = np.abs(pt) > 0.08
                                     if np.any(strong):
                                         out["pair_evoked_hop1_sign_acc"] = float(np.mean(np.sign(pt[strong]) == np.sign(pp[strong])))
+                                from tools.kernel_metrics import compute_pair_kernel_metrics
+                                out.update(
+                                    compute_pair_kernel_metrics(
+                                        yt_ev,
+                                        yp_ev,
+                                        stim_target=stim_target,
+                                        neu_sel=hop1_neu,
+                                        valid_ev=ev_window,
+                                        t0=t0,
+                                        t_ev_end=t_ev_end,
+                                        dt_obs=dt_obs,
+                                        prefix="kernel_hop1",
+                                    )
+                                )
                     sub_in = sub_mask & (np.abs(y_true) <= 3.0)
                     if np.any(sub_in):
                         out[f"{prefix}_inlier_r"] = _safe_pearson_r(y_true[sub_in], y_pred[sub_in])
 
             if np_adjacency is not None and np_adjacency.shape == (n_neurons, n_neurons) and yt_ev is not None:
                 np_adj = np_adjacency.astype(bool)
-                np_only_neu = ((stim_target.astype(np.int32) @ np_adj.astype(np.int32)) > 0) & (~stim_target) & (~hop1_neu)
-                np_sub = np.zeros_like(valid)
-                np_sub[:, t0:t_ev_end, :] = np_only_neu[:, None, :] & valid[:, t0:t_ev_end, :]
-                if np.any(np_sub):
-                    yt_np, yp_np = yt_ev[np_sub], yp_ev[np_sub]
-                    out["evoked_np_only_count"] = int(yt_np.size)
-                    out["evoked_np_only_r2"] = float(r2_score(yt_np, yp_np))
-                    out["evoked_np_only_r"] = _safe_pearson_r(yt_np, yp_np)
-                    np_t_std = float(np.std(yt_np))
-                    np_p_std = float(np.std(yp_np))
-                    out["evoked_np_only_pred_std"] = np_p_std
-                    out["evoked_np_only_amp_ratio"] = float(np_p_std / np_t_std) if np_t_std > 1e-12 else 0.0
+                np_hit = (stim_target.astype(np.int32) @ np_adj.astype(np.int32)) > 0
+                wired_reach = adj1.copy()
+                while True:
+                    nxt = wired_reach | ((wired_reach.astype(np.int32) @ adj1.astype(np.int32)) > 0)
+                    if np.array_equal(nxt, wired_reach):
+                        break
+                    wired_reach = nxt
+                wired_neu = (stim_target.astype(np.int32) @ wired_reach.astype(np.int32)) > 0
+                np_strata = [
+                    ("evoked_np_only", np_hit & (~stim_target) & (~hop1_neu)),
+                    ("evoked_np_no_hop12", np_hit & (~stim_target) & (~hop1_neu) & (~hop2_neu)),
+                    ("evoked_np_no_wired_path", np_hit & (~stim_target) & (~wired_neu)),
+                ]
+                for np_prefix, np_neu in np_strata:
+                    np_sub = np.zeros_like(valid)
+                    np_sub[:, t0:t_ev_end, :] = np_neu[:, None, :] & valid[:, t0:t_ev_end, :]
+                    if np.any(np_sub):
+                        yt_np, yp_np = yt_ev[np_sub], yp_ev[np_sub]
+                        out[f"{np_prefix}_count"] = int(yt_np.size)
+                        out[f"{np_prefix}_r2"] = float(r2_score(yt_np, yp_np))
+                        out[f"{np_prefix}_r"] = _safe_pearson_r(yt_np, yp_np)
+                        np_t_std = float(np.std(yt_np))
+                        np_p_std = float(np.std(yp_np))
+                        out[f"{np_prefix}_pred_std"] = np_p_std
+                        out[f"{np_prefix}_amp_ratio"] = float(np_p_std / np_t_std) if np_t_std > 1e-12 else 0.0
 
     return out
 
@@ -284,7 +312,7 @@ def compute_drift_gate(stim: torch.Tensor, adjacency: torch.Tensor, mode: str) -
     """Build a causal per-neuron gate for pre-stimulus drift using only stimulus schedule + connectome."""
     if mode == "none" or adjacency is None:
         return None
-    stim_target = stim.sum(dim=1) > 0
+    stim_target = stim.abs().sum(dim=1) > 0
     if mode == "direct":
         return (~stim_target).to(dtype=stim.dtype)
     hop1 = (stim_target.to(dtype=stim.dtype) @ adjacency > 0) & (~stim_target)
@@ -444,6 +472,7 @@ def evaluate_predictions(
     if not y_trues:
         return {"r2": float("nan"), "mae": float("nan"), "rmse": float("nan")}
 
+    dt_obs = float(getattr(getattr(model, "decoder", model), "dt_obs", 0.5))
     return compute_stratified_metrics(
         np.concatenate(y_trues, axis=0),
         np.concatenate(y_preds, axis=0),
@@ -455,6 +484,7 @@ def evaluate_predictions(
         evoked_window_vols=evoked_window_vols,
         y_pred_counterfactual=np.concatenate(y_pred_cfs, axis=0) if y_pred_cfs else None,
         np_adjacency=np_adjacency,
+        dt_obs=dt_obs,
     )
 
 

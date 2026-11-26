@@ -1810,6 +1810,143 @@ def test_oscillatory_prestim_fits_damped_oscillation():
     assert losses[-1] < losses[0]
 
 
+def test_negative_stimulus_detected_in_metrics_and_drift_gate():
+    from pyro_svi_c302 import compute_drift_gate, compute_stratified_metrics
+
+    rng = np.random.default_rng(7)
+    b, t_tot, n = 4, 24, 5
+    pre = 8
+    stim = np.zeros((b, t_tot, n), dtype=np.float32)
+    stim[:, pre, 0] = -1.5  # purely negative stimulus (e.g., hyperpolarizing / ASEL up-step)
+    adj = np.zeros((n, n), dtype=np.float32)
+    adj[0, 1] = 1.0  # 1-hop target is neuron 1
+    adj[1, 2] = 1.0  # 2-hop target is neuron 2
+
+    y_true = np.zeros((b, t_tot, n), dtype=np.float32)
+    y_true[:, pre:pre + 10, 0] = -0.8
+    y_true[:, pre:pre + 10, 1] = 0.4 + 0.05 * rng.standard_normal((b, 10)).astype(np.float32)
+    y_pred = y_true * 0.9
+    mask = np.ones_like(y_true, dtype=bool)
+
+    m = compute_stratified_metrics(y_true, y_pred, mask, stim=stim, pre_vols=pre, adjacency=adj)
+    assert m["stim_count"] > 0
+    assert m["hop1_count"] > 0
+    assert m["evoked_stim_r2"] > 0.8
+    assert m["evoked_hop1_r2"] > 0.8
+
+    gate_direct = compute_drift_gate(torch.from_numpy(stim), torch.from_numpy(adj), mode="direct")
+    gate_hop1 = compute_drift_gate(torch.from_numpy(stim), torch.from_numpy(adj), mode="direct_and_hop1")
+    assert float(gate_direct[0, 0]) == 0.0
+    assert float(gate_direct[0, 1]) == 1.0
+    assert float(gate_hop1[0, 0]) == 0.0
+    assert float(gate_hop1[0, 1]) == 0.0
+    assert float(gate_hop1[0, 2]) == 1.0
+
+
+def test_kernel_metrics_and_np_strict_no_wired_path():
+    from pyro_svi_c302 import compute_stratified_metrics
+
+    b, t_tot, n = 6, 30, 6
+    pre = 10
+    stim = np.zeros((b, t_tot, n), dtype=np.float32)
+    stim[:3, pre, 0] = 1.0
+    stim[3:, pre, 0] = 1.0
+    # Wired chain: 0 -> 1 -> 2 -> 3
+    adj = np.zeros((n, n), dtype=np.float32)
+    adj[0, 1] = 1.0
+    adj[1, 2] = 1.0
+    adj[2, 3] = 1.0
+    # NP links from 0 to: 1 (1-hop), 2 (2-hop), 3 (3-hop wired!), and 4 (strictly no wired path!)
+    np_adj = np.zeros((n, n), dtype=np.float32)
+    np_adj[0, 1] = 1.0
+    np_adj[0, 2] = 1.0
+    np_adj[0, 3] = 1.0
+    np_adj[0, 4] = 1.0
+
+    y_true = np.zeros((b, t_tot, n), dtype=np.float32)
+    y_pred = np.zeros((b, t_tot, n), dtype=np.float32)
+    t_post = np.arange(16, dtype=np.float32)
+    wave_t = 0.6 * np.sin(0.35 * t_post) * np.exp(-0.08 * t_post)
+    wave_p = 0.55 * np.sin(0.35 * t_post) * np.exp(-0.08 * t_post)
+    y_true[:, pre:pre + 16, 1] = wave_t[None, :]
+    y_pred[:, pre:pre + 16, 1] = wave_p[None, :]
+    y_true[:, pre:pre + 16, 4] = 0.3 * wave_t[None, :]
+    y_pred[:, pre:pre + 16, 4] = 0.3 * wave_t[None, :]
+    mask = np.ones_like(y_true, dtype=bool)
+
+    m = compute_stratified_metrics(
+        y_true, y_pred, mask, stim=stim, pre_vols=pre, adjacency=adj, np_adjacency=np_adj, dt_obs=0.5
+    )
+    assert m["kernel_hop1_n_pairs"] == 1
+    assert m["kernel_hop1_r"] > 0.99
+    assert m["kernel_hop1_auc_r"] == 0.0 or np.isfinite(m["kernel_hop1_auc_r"])
+    assert m["kernel_hop1_peak_latency_mae_s"] == 0.0
+    assert m["kernel_hop1_fft_r"] > 0.99
+    assert m["kernel_hop1_sign_acc"] == 1.0
+
+    # Neuron 4 only -> 16 time steps * 6 trials = 96; excludes neuron 2 (hop2) and neuron 3 (3-hop wired!)
+    assert m["evoked_np_only_count"] == 3 * 16 * 6
+    assert m["evoked_np_no_hop12_count"] == 2 * 16 * 6
+    assert m["evoked_np_no_wired_path_count"] == 1 * 16 * 6
+    assert m["evoked_np_no_wired_path_r2"] > 0.99
+
+
+def test_dataset_provenance_roundtrip_and_mismatch_rejection(tmp_path):
+    from pyro_svi_vae import _validate_cache_provenance
+
+    prov = {
+        "source": "randi",
+        "strain": "wild-type",
+        "norm_mode": "dff_safe",
+        "causal_preprocess": True,
+        "pre_vols": 10,
+        "post_vols": 50,
+    }
+    ds = RandiTrialDataset(
+        stim_inputs=torch.zeros(2, 60, 4),
+        y=torch.zeros(2, 60, 4),
+        obs_mask=torch.ones(2, 60, 4, dtype=torch.bool),
+        noise_scale=torch.full((2, 4), 0.1),
+        dts=torch.full((2,), 0.5),
+        meta=[{"rec_id": 1}, {"rec_id": 2}],
+        provenance=prov,
+    )
+    cache = tmp_path / "cache.npz"
+    ds.save(str(cache))
+    loaded = RandiTrialDataset.load(str(cache))
+    assert loaded.provenance == prov
+    _validate_cache_provenance(loaded.provenance, prov, str(cache))
+
+    bad = dict(prov, causal_preprocess=False)
+    try:
+        _validate_cache_provenance(loaded.provenance, bad, str(cache))
+        raise AssertionError("Expected provenance mismatch ValueError")
+    except ValueError as exc:
+        assert "causal_preprocess" in str(exc)
+
+    try:
+        _validate_cache_provenance({}, prov, str(cache))
+        raise AssertionError("Expected missing provenance ValueError")
+    except ValueError as exc:
+        assert "missing provenance" in str(exc)
+
+
+def test_kernel_metrics_empty_on_insufficient_trials():
+    from tools.kernel_metrics import compute_pair_kernel_metrics
+
+    out = compute_pair_kernel_metrics(
+        yt_ev=np.zeros((2, 20, 4), dtype=np.float32),
+        yp_ev=np.zeros((2, 20, 4), dtype=np.float32),
+        stim_target=np.array([[True, False, False, False], [True, False, False, False]]),
+        neu_sel=np.ones((2, 4), dtype=bool),
+        valid_ev=np.ones((2, 20, 4), dtype=bool),
+        t0=5,
+        t_ev_end=20,
+        min_trials=3,
+    )
+    assert out == {}
+
+
 def test_all_python_modules_compile():
     for fname in [
         "c302.py",
@@ -1822,5 +1959,6 @@ def test_all_python_modules_compile():
         "AutoRegress.py",
         "tools/eval_checkpoint.py",
         "tools/run_nested_protocol.py",
+        "tools/kernel_metrics.py",
     ]:
         py_compile.compile(fname, doraise=True)
