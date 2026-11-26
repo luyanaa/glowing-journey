@@ -1960,5 +1960,8 @@ def test_all_python_modules_compile():
         "tools/eval_checkpoint.py",
         "tools/run_nested_protocol.py",
         "tools/kernel_metrics.py",
+        "tools/substep_convergence.py",
+        "tools/noise_ceiling.py",
+        "tools/run_baselines.py",
     ]:
         py_compile.compile(fname, doraise=True)
