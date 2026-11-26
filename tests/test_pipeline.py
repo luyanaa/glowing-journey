@@ -2147,6 +2147,241 @@ def test_evoked_kernel_aux_loss_gradient_flow():
     assert gain.grad is not None and float(gain.grad.abs()) > 1e-3
 
 
+def test_online_ttt_prequential_ordering_and_non_overlap_guard():
+    from tools.eval_online_ttt import (
+        group_and_order_trials_by_worm,
+        select_causal_history_indices,
+    )
+
+    meta = [
+        {"rec_id": 2, "stim_vol": 100, "event_idx": 1},  # idx 0
+        {"rec_id": 1, "stim_vol": 200, "event_idx": 2},  # idx 1
+        {"rec_id": 1, "stim_vol": 10, "event_idx": 0},   # idx 2
+        {"rec_id": 1, "stim_vol": 45, "event_idx": 1},   # idx 3 (overlaps with idx 2 if post_vols=50)
+        {"rec_id": 1, "stim_vol": 120, "event_idx": 3},  # idx 4 (non-overlapping with idx 2 and idx 3)
+    ]
+    by_worm = group_and_order_trials_by_worm(meta)
+    assert list(by_worm.keys()) == [1, 2]
+    # Worm 1 sorted strictly by stim_vol: 10 (idx 2), 45 (idx 3), 120 (idx 4), 200 (idx 1)
+    assert by_worm[1] == [2, 3, 4, 1]
+    assert by_worm[2] == [0]
+
+    w1 = by_worm[1]
+    # Target pos 0 (vol 10): no history
+    assert select_causal_history_indices(w1, 0, meta, post_vols=50) == []
+    # Target pos 1 (vol 45): vol 10 + 50 = 60 > 45 -> overlaps, MUST be excluded
+    assert select_causal_history_indices(w1, 1, meta, post_vols=50) == []
+    # Target pos 2 (vol 120): vol 10+50=60<=120 (ok), vol 45+50=95<=120 (ok)
+    assert select_causal_history_indices(w1, 2, meta, post_vols=50) == [2, 3]
+    # Target pos 3 (vol 200): all three prior trials non-overlapping; max_history=2 keeps most recent
+    assert select_causal_history_indices(w1, 3, meta, post_vols=50) == [2, 3, 4]
+    assert select_causal_history_indices(w1, 3, meta, post_vols=50, max_history=2) == [3, 4]
+
+
+def test_online_ttt_tier_isolation_kl_anchor_and_worm_reset():
+    from tools.eval_online_ttt import (
+        adapt_worm_posterior,
+        evaluate_online_ttt,
+        restore_population_state,
+        snapshot_population_state,
+    )
+
+    pyro.clear_param_store()
+    torch.manual_seed(0)
+    # 4-neuron graph with two distinct presynaptic sources (0 -> 2, 1 -> 3)
+    tiny_syn = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0, 1], [2, 3], [2.0, 2.0], [0.0, 0.0], [0.01, 0.01]),
+        "Generic": ([], [], []),
+    }
+    n = 4
+    step = c302.NematodeForStep(
+        n, {}, tiny_syn, per_neuron_stim_gain=True, wide_amp_priors=True, dimensionless=True
+    )
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4, stim_actuator=True
+    )
+    vm = vae.VAElegans(rec, n, 2, 1, direct_global_guide=True)
+    adj = step.synapse.adjacency_matrix(n)
+
+    # Trigger PyroParam registration before snapshotting
+    stim_h = torch.zeros(2, 12, n)
+    stim_h[:, 4:6, 0] = 1.0  # Only neuron 0 is stimulated in history (edge 0->2 active, edge 1->3 inactive)
+    y_h = torch.zeros(2, 12, n)
+    y_h[:, 4:, 0] = 0.8
+    y_h[:, 5:, 2] = 0.35
+    mask_h = torch.ones(2, 12, n, dtype=torch.bool)
+    noise_h = torch.full((2, n), 0.05)
+    _ = pyro.poutine.trace(vm.guide).get_trace(ExternalInput=stim_h, noise_scale=noise_h)
+    pop_snap = snapshot_population_state(vm)
+
+    # 1. Tier 1: updates observation/stim calibration only; all connectome weights bitwise frozen
+    wicks_z0 = vm.guide.wicks_g_max_z.detach().clone()
+    wicks_g0 = vm.guide.wicks_g_max_global_z.detach().clone()
+    gap_z0 = vm.guide.gap_g_syn_z.detach().clone()
+    e_z0 = vm.guide.neuron_E_z.detach().clone()
+    gcamp_gain0 = vm.guide.gcamp_gain_loc.detach().clone()
+    gcamp_off0 = vm.guide.gcamp_offset_loc.detach().clone()
+    obs_sig0 = vm.guide.obs_sigma_loc.detach().clone()
+
+    log_t1_loose = adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier1", ttt_steps=5, ttt_lr=3e-2, kl_weight=0.01, pre_vols=4, seed=7
+    )
+    assert np.isfinite(log_t1_loose["loss_end"])
+    assert log_t1_loose["loss_end"] < log_t1_loose["loss_start"]
+    assert float((vm.guide.wicks_g_max_z.detach() - wicks_z0).abs().max()) == 0.0
+    assert float((vm.guide.wicks_g_max_global_z.detach() - wicks_g0).abs().max()) == 0.0
+    assert float((vm.guide.gap_g_syn_z.detach() - gap_z0).abs().max()) == 0.0
+    assert float((vm.guide.neuron_E_z.detach() - e_z0).abs().max()) == 0.0
+    assert float((vm.guide.obs_sigma_loc.detach() - obs_sig0).abs().max()) == 0.0
+    assert float((vm.guide.gcamp_gain_loc.detach() - gcamp_gain0).abs().max()) > 1e-4
+    assert float((vm.guide.gcamp_offset_loc.detach() - gcamp_off0).abs().max()) > 1e-4
+
+    # Likelihood tempering scales down gradient-driven drift on tiny history
+    restore_population_state(vm, pop_snap)
+    log_t1_temp = adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier1", ttt_steps=5, ttt_lr=3e-2,
+        kl_weight=1.0, nll_temp=0.05, pre_vols=4, seed=7,
+    )
+    log_t1_untemp = adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier1", ttt_steps=5, ttt_lr=3e-2,
+        kl_weight=1.0, nll_temp=1.0, pre_vols=4, seed=7,
+    )
+    assert log_t1_temp["max_whitened_shift"] < log_t1_untemp["max_whitened_shift"]
+
+    # Explicit opt-in adapt_obs_sigma=True allows obs_sigma_loc to move
+    restore_population_state(vm, pop_snap)
+    adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier1", ttt_steps=5, ttt_lr=3e-2,
+        kl_weight=0.01, adapt_obs_sigma=True, pre_vols=4, seed=7,
+    )
+    assert float((vm.guide.obs_sigma_loc.detach() - obs_sig0).abs().max()) > 1e-4
+
+    # Strong KL anchor must shrink parameter shift relative to loose KL anchor
+    restore_population_state(vm, pop_snap)
+    log_t1_tight = adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier1", ttt_steps=5, ttt_lr=3e-2, kl_weight=500.0, pre_vols=4, seed=7
+    )
+    assert log_t1_tight["max_param_shift"] < log_t1_loose["max_param_shift"]
+    assert log_t1_tight["max_whitened_shift"] < log_t1_loose["max_whitened_shift"]
+
+    # 2. Tier 2: updates global synaptic scale / neuron excitability, but keeps edge-level wicks_g_max_z frozen
+    restore_population_state(vm, pop_snap)
+    adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier2", ttt_steps=4, ttt_lr=3e-2, kl_weight=0.1, pre_vols=4, seed=7
+    )
+    assert float((vm.guide.wicks_g_max_z.detach() - wicks_z0).abs().max()) == 0.0
+    assert float((vm.guide.neuron_E_z.detach() - e_z0).abs().max()) > 1e-4
+
+    # 3. Tier 3: updates ONLY stimulated source's outgoing edge (idx 0: 0->2), keeping unstimulated edge (idx 1: 1->3) and global gain frozen
+    restore_population_state(vm, pop_snap)
+    adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier3", ttt_steps=4, ttt_lr=3e-2, kl_weight=0.1, pre_vols=4, seed=7
+    )
+    delta_edge = (vm.guide.wicks_g_max_z.detach() - wicks_z0).abs()
+    assert float(delta_edge[0]) > 1e-4
+    assert float(delta_edge[1]) == 0.0
+    assert float((vm.guide.wicks_g_max_global_z.detach() - wicks_g0).abs().max()) == 0.0
+
+    # 4. Full prequential evaluate_online_ttt across 2 worms + bitwise reset verification
+    restore_population_state(vm, pop_snap)
+    stim_all = torch.zeros(4, 12, n)
+    stim_all[:, 4:6, 0] = 1.0
+    y_all = torch.zeros(4, 12, n)
+    y_all[:2, 4:, 0] = 0.7
+    y_all[:2, 5:, 2] = 0.3
+    y_all[2:, 4:, 0] = 0.4
+    y_all[2:, 5:, 2] = 0.15
+    mask_all = torch.ones(4, 12, n, dtype=torch.bool)
+    noise_all = torch.full((4, n), 0.05)
+    meta_all = [
+        {"rec_id": 10, "stim_vol": 20, "event_idx": 0},
+        {"rec_id": 10, "stim_vol": 60, "event_idx": 1},  # non-overlapping with vol 20 (post_vols=8 -> 20+8<=60)
+        {"rec_id": 20, "stim_vol": 15, "event_idx": 0},
+        {"rec_id": 20, "stim_vol": 20, "event_idx": 1},  # overlapping with vol 15 (15+8=23 > 20) -> k=0!
+    ]
+    ds = RandiTrialDataset(stim_all, y_all, mask_all, noise_all, torch.full((4,), 0.5), meta_all)
+
+    res = evaluate_online_ttt(
+        vm, ds, test_indices=[0, 1, 2, 3], device=torch.device("cpu"),
+        adjacency=adj, tier="tier1", ttt_steps=3, ttt_lr=2e-2, kl_weight=1.0,
+        pre_vols=4, post_vols=8, num_samples=2, eval_seed=42,
+    )
+    assert res["n_worms"] == 2
+    assert res["n_trials"] == 4
+    # Only trial 1 (worm 10, vol 60) has 1 non-overlapping past trial; trial 3 overlaps so k=0
+    assert res["n_adapted_trials"] == 1
+    assert res["learning_curve"]["k=0"]["n_trials"] == 3
+    assert res["learning_curve"]["k=1..3"]["n_trials"] == 1
+    assert np.isfinite(res["overall_metrics"]["r2"])
+
+    res_zero = evaluate_online_ttt(
+        vm, ds, test_indices=[0, 1, 2, 3], device=torch.device("cpu"),
+        adjacency=adj, tier="tier1", ttt_steps=0,
+        pre_vols=4, post_vols=8, num_samples=2, eval_seed=42,
+    )
+    assert res_zero["n_adapted_trials"] == 0
+
+    res_gated = evaluate_online_ttt(
+        vm, ds, test_indices=[0, 1, 2, 3], device=torch.device("cpu"),
+        adjacency=adj, tier="tier2", ttt_steps=3, ttt_lr=2e-2, kl_weight=1.0,
+        min_history=2, k_tier_schedule="none",
+        pre_vols=4, post_vols=8, num_samples=2, eval_seed=42,
+    )
+    assert res_gated["n_adapted_trials"] == 0
+
+    res_sched = evaluate_online_ttt(
+        vm, ds, test_indices=[0, 1, 2, 3], device=torch.device("cpu"),
+        adjacency=adj, tier="tier2", ttt_steps=3, ttt_lr=2e-2, kl_weight=1.0,
+        min_history=2, k_tier_schedule="t1_then_t2",
+        pre_vols=4, post_vols=8, num_samples=2, eval_seed=42,
+    )
+    assert res_sched["n_adapted_trials"] == 1
+
+    # Model state must be bitwise restored to q_pop after evaluation
+    for k, v in pop_snap["model_state"].items():
+        assert torch.equal(vm.state_dict()[k], v), f"State drift on {k}"
+
+
+def test_online_ttt_latent_ssm_deterministic():
+    from tools.eval_online_ttt import (
+        adapt_worm_posterior,
+        restore_population_state,
+        snapshot_population_state,
+    )
+
+    pyro.clear_param_store()
+    torch.manual_seed(0)
+    tiny_syn = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0], [2], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    n = 4
+    step = c302.NematodeForStep(n, {}, tiny_syn, wide_amp_priors=True, dimensionless=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, pre_vols=4, use_latent_ssm=True, latent_ssm_dim=6
+    )
+    vm = vae.VAElegans(rec, n, 1, 1, direct_global_guide=True)
+    stim_h = torch.zeros(2, 10, n)
+    stim_h[:, 4:6, 0] = 1.0
+    y_h = torch.randn(2, 10, n) * 0.2
+    mask_h = torch.ones(2, 10, n, dtype=torch.bool)
+    noise_h = torch.full((2, n), 0.1)
+    _ = pyro.poutine.trace(vm.guide).get_trace(ExternalInput=stim_h, noise_scale=noise_h)
+    snap = snapshot_population_state(vm)
+
+    log1 = adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier1", ttt_steps=3, ttt_lr=2e-2, kl_weight=1.0, pre_vols=4, seed=11
+    )
+    restore_population_state(vm, snap)
+    log2 = adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h, tier="tier1", ttt_steps=3, ttt_lr=2e-2, kl_weight=1.0, pre_vols=4, seed=11
+    )
+    assert log1["loss_end"] == log2["loss_end"]
+    assert log1["max_whitened_shift"] == log2["max_whitened_shift"]
+
+
 def test_all_python_modules_compile():
     for fname in [
         "c302.py",
@@ -2164,5 +2399,6 @@ def test_all_python_modules_compile():
         "tools/noise_ceiling.py",
         "tools/run_baselines.py",
         "tools/eval_unc31_knockout.py",
+        "tools/eval_online_ttt.py",
     ]:
         py_compile.compile(fname, doraise=True)

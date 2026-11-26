@@ -621,6 +621,18 @@ Replaced the TCN batch-averaged global connectome guide with a true non-amortize
      - **`--kernel-loss-weight` / `--dynamics-loss-weight`** (`pyro_svi_vae.py`): Explicit minibatch pair-level 1-hop counterfactual response kernel loss (`K_{ij}(t)`) and temporal derivative loss (`dK_{ij}/dt`).
      - **Flexible context & substeps**: `--pre-vols` and `--post-vols` plumbed cleanly across `pyro_svi_vae.py`, `tools/eval_checkpoint.py`, and `tools/run_nested_protocol.py` for `--substeps 4` + `--pre-vols 40` training.
 
+   - **Phase 6 (Pre-Study Baseline) — Online Bayesian Parameter Assimilation / Individual-Worm TTT (`tools/eval_online_ttt.py`, Fold-0 `22` worms / `641` trials, Task 4)**:
+     - Separate evaluation task (Task 4: cross-trial slow parameter assimilation $\theta_{\text{worm}}$ anchored to `q_pop` on strictly past non-overlapping trials `h_vol + post_vols <= target_vol`, bitwise reset between worms). Must NOT be conflated with Zero-Shot Task 1/3 tables.
+
+| Fold-0 Online TTT (`Phase 1.5 S2`, `sub=4`) | `evoked_stim_r2` | `stim_r` | `evoked_hop1_r2` | `pair_evoked_hop1_r2` | `kernel_hop1_r` \| `fft_r` | `post_inlier_r2` | `Δ(intact−shuf)` `hop1_r2` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Zero-Shot (`ttt_steps=0`, intact) | `+0.05426` | `0.3113` | `+0.01032` | `+0.0194` | `0.2039` \| `0.2948` | `+0.1052` | `+0.02709` |
+| Tier 1 (`unwhitened`, `phase5_online_ttt_tier1_fold0.json`) | `+0.06168` | `0.3230` | `+0.01064` | `+0.0212` | `0.2052` \| `0.2960` | `+0.1060` | `+0.02743` |
+| Tier 1 (`whitened`, `phase5_online_ttt_tier1_whitened_fold0.json`) | `+0.06039` | `0.3192` | `+0.01070` | `+0.0215` | `0.2052` \| `0.2966` | `+0.1059` | `+0.02748` |
+| **Tier 2 (`whitened`, `phase5_online_ttt_tier2_whitened_fold0.json`)** | **`+0.06271`** | **`0.3331`** | **`+0.01128`** | **`+0.0293`** | **`0.2121`** \| **`0.3117`** | **`+0.1066`** | **`+0.02820`** |
+
+     - *Topology specificity & sample-count finding*: While `shuffle7` Tier 2 also improves direct stimulation (`evoked_stim_r2: 0.02533 → 0.03783`), its 1-hop propagation **fails to gain** (`-0.01677 → -0.01691`), widening `Δ(intact − shuffle)` from `+0.02709` to **`+0.02820`**. Learning-curve stratification reveals `k>=9` gains strongly (`evoked_stim_r2 +0.0559 → +0.0729`, `pair_evoked_hop1_r2 +0.0296 → +0.0463`) whereas `k=1..3` overfits un-tempered frame sums (`evoked_hop1_r2 +0.0417 → +0.0353`). Hardening added to `tools/eval_online_ttt.py`: `--min-history`, `--k-tier-schedule t1_then_t2`, `--nll-temp` likelihood tempering, default `obs_sigma_loc` freeze, Tier-3 global-gain freeze, deterministic `ssm_eps=0` for `--latent-ssm`, and fixed `n_adapted_trials` reporting.
+
 The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
 
 ```bash
@@ -711,7 +723,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest -q tests/test_pipeline.py` → **58 passed, 2 skipped**.
+- Regression tests: `pytest -q tests/test_pipeline.py` → **61 passed, 2 skipped**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.
@@ -720,7 +732,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
-- Phase 4 & Phase 5A diagnostics/evals: `report/data/substep_convergence_audit.json`, `report/data/phase4_noise_ceiling_and_ablations.json`, `report/data/phase4_baselines_fold0.json`, `report/data/phase4_unc31_knockout_eval.json` (plus scripts `tools/kernel_metrics.py`, `tools/substep_convergence.py`, `tools/noise_ceiling.py`, `tools/run_baselines.py`, `tools/eval_unc31_knockout.py`).
+- Phase 4–6 diagnostics & evals: `report/data/substep_convergence_audit.json`, `report/data/phase4_noise_ceiling_and_ablations.json`, `report/data/phase4_baselines_fold0.json`, `report/data/phase4_unc31_knockout_eval.json`, `report/data/phase5_online_ttt_tier1_fold0.json`, `report/data/phase5_online_ttt_tier1_whitened_fold0.json`, `report/data/phase5_online_ttt_tier2_whitened_fold0.json` (plus scripts `tools/kernel_metrics.py`, `tools/substep_convergence.py`, `tools/noise_ceiling.py`, `tools/run_baselines.py`, `tools/eval_unc31_knockout.py`, `tools/eval_online_ttt.py`).
 - All Colab sessions are stopped; there are no active sessions.
 
 ### 4.4 Data
