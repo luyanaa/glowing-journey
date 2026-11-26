@@ -207,11 +207,14 @@ class VAEGuide(PyroModule):
         prestim_oscillatory: bool = False,
         use_extrasynaptic: bool = False,
         extra_dim: int = 0,
+        dimensionless: bool = False,
     ):
         super().__init__()
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
         self.direct_global_guide = bool(direct_global_guide)
+        self.dimensionless = bool(dimensionless)
+        cond_scale = 2.0 if self.dimensionless else 1.0
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
         self.gap_dim = int(gap_dim)
@@ -239,11 +242,17 @@ class VAEGuide(PyroModule):
             self.neuron_E_scale = PyroParam(
                 torch.full((self.neuron_dim,), 0.008), constraint=constraints.interval(1e-4, 0.04)
             )
-            self.neuron_G_loc = PyroParam(torch.full((self.neuron_dim,), math.log(0.5)))
-            self.neuron_G_scale = PyroParam(
-                torch.full((self.neuron_dim,), 0.15), constraint=constraints.interval(1e-3, 1.0)
-            )
-            self.neuron_C_loc = PyroParam(torch.full((self.neuron_dim,), math.log(0.05)))
+            if self.dimensionless:
+                self.register_buffer("neuron_G_loc", torch.zeros(self.neuron_dim))
+                self.register_buffer("neuron_G_scale", torch.full((self.neuron_dim,), 0.15))
+                c_init = math.log(0.10)
+            else:
+                self.neuron_G_loc = PyroParam(torch.full((self.neuron_dim,), math.log(0.5)))
+                self.neuron_G_scale = PyroParam(
+                    torch.full((self.neuron_dim,), 0.15), constraint=constraints.interval(1e-3, 1.0)
+                )
+                c_init = math.log(0.05)
+            self.neuron_C_loc = PyroParam(torch.full((self.neuron_dim,), c_init))
             self.neuron_C_scale = PyroParam(
                 torch.full((self.neuron_dim,), 0.15), constraint=constraints.interval(1e-3, 1.0)
             )
@@ -307,7 +316,7 @@ class VAEGuide(PyroModule):
         )
 
         # Variational parameters for shared/GCaMP parameters in RecurrentNematode
-        stim_init = math.log(2.0) if self.wide_amp_priors else math.log(1.2)
+        stim_init = math.log((2.0 if self.wide_amp_priors else 1.2) * cond_scale)
         self.stim_gain_loc = PyroParam(torch.tensor(stim_init))
         self.stim_gain_scale = PyroParam(torch.tensor(0.2), constraint=constraints.positive)
         self.obs_sigma_loc = PyroParam(torch.tensor(math.log(0.15)))
@@ -371,12 +380,12 @@ class VAEGuide(PyroModule):
 
     @property
     def wicks_g_max_loc(self) -> torch.Tensor:
-        gmax_init = math.log(0.015) if self.evoked_syn_priors else math.log(0.01)
-        return gmax_init + 1.5 * self.wicks_g_max_global_z + 3.0 * self.wicks_g_max_z
+        gmax_med = (0.015 if self.evoked_syn_priors else 0.01) * (2.0 if self.dimensionless else 1.0)
+        return math.log(gmax_med) + 1.5 * self.wicks_g_max_global_z + 3.0 * self.wicks_g_max_z
 
     @property
     def gap_g_syn_loc(self) -> torch.Tensor:
-        return math.log(0.015) + 1.5 * self.gap_g_syn_global_z + 3.0 * self.gap_g_syn_z
+        return math.log(0.015 * (2.0 if self.dimensionless else 1.0)) + 1.5 * self.gap_g_syn_global_z + 3.0 * self.gap_g_syn_z
 
     def _direct_global_params(self):
         neuron_loc = torch.stack(
@@ -471,10 +480,11 @@ class VAEGuide(PyroModule):
             "decoder.model.Neuron.conductance.E",
             dist.Normal(neuron_loc[0], neuron_scale[0]).to_event(1),
         )
-        pyro.sample(
-            "decoder.model.Neuron.conductance.G",
-            dist.LogNormal(neuron_loc[1], neuron_scale[1]).to_event(1),
-        )
+        if not self.dimensionless:
+            pyro.sample(
+                "decoder.model.Neuron.conductance.G",
+                dist.LogNormal(neuron_loc[1], neuron_scale[1]).to_event(1),
+            )
         pyro.sample(
             "decoder.model.Neuron.conductance.C",
             dist.LogNormal(neuron_loc[2], neuron_scale[2]).to_event(1),
@@ -513,9 +523,10 @@ class VAEGuide(PyroModule):
                 dist.LogNormal(gap_loc, gap_scale).to_event(1),
             )
         if self.use_extrasynaptic and self.extra_dim > 0:
+            ex_scale = 0.006 if self.dimensionless else 0.003
             pyro.sample(
                 "decoder.model.synapse.extrasyn_gain",
-                dist.Normal(0.003 * self.extrasyn_gain_z, self.extrasyn_gain_scale).to_event(1),
+                dist.Normal(ex_scale * self.extrasyn_gain_z, self.extrasyn_gain_scale).to_event(1),
             )
 
         if self.per_neuron_stim_gain:
@@ -620,7 +631,11 @@ class VAElegans(PyroModule):
         prestim_oscillatory = bool(getattr(model, "prestim_oscillatory", False))
         use_extrasynaptic = bool(getattr(getattr(getattr(model, "model", None), "synapse", None), "use_extrasynaptic", False))
         extra_dim = len(getattr(getattr(getattr(model, "model", None), "synapse", None), "Generic_SRC", []))
+        dimensionless = bool(
+            getattr(getattr(getattr(getattr(model, "model", None), "Neuron", None), "conductance", None), "dimensionless", False)
+        )
         self.direct_global_guide = bool(direct_global_guide)
+        self.dimensionless = dimensionless
         self.guide = VAEGuide(
             neuron_dim, wicks_dim, gap_dim,
             e_rev_prior=e_rev_prior,
@@ -637,6 +652,7 @@ class VAElegans(PyroModule):
             prestim_oscillatory=prestim_oscillatory,
             use_extrasynaptic=use_extrasynaptic,
             extra_dim=extra_dim,
+            dimensionless=dimensionless,
         )
         self.decoder = model
         self.neuron_dim = int(neuron_dim)
@@ -745,6 +761,7 @@ class VAElegans(PyroModule):
         pre_stim_mask: Optional[torch.Tensor] = None,
         drift_gate: Optional[torch.Tensor] = None,
         sample_obs: bool = True,
+        ssm_eps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.decoder(
             ExternalInput=ExternalInput,
@@ -757,4 +774,5 @@ class VAElegans(PyroModule):
             pre_stim_mask=pre_stim_mask,
             drift_gate=drift_gate,
             sample_obs=sample_obs,
+            ssm_eps=ssm_eps,
         )

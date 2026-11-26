@@ -345,10 +345,14 @@ def evaluate_predictions(
     else:
         predictive = Predictive(model, guide=guide, num_samples=num_samples, return_sites=("_RETURN",))
 
+    dec = getattr(model, "decoder", model)
     has_prestim = bool(
         getattr(model, "use_prestim_encoder", False)
-        or getattr(getattr(model, "decoder", None), "use_prestim_encoder", False)
+        or getattr(dec, "use_prestim_encoder", False)
     )
+    ssm_mod = getattr(dec, "latent_ssm", None)
+    has_ssm = ssm_mod is not None
+    has_history = has_prestim or has_ssm
     adj = adjacency if adjacency is not None else _extract_adjacency(model)
     adj_t = (
         torch.as_tensor(adj, dtype=torch.float32, device=device)
@@ -356,10 +360,14 @@ def evaluate_predictions(
         else None
     )
     supports_sample_obs = False
+    supports_ssm_eps = False
     try:
-        supports_sample_obs = "sample_obs" in inspect.signature(model.forward).parameters
+        fwd_params = inspect.signature(model.forward).parameters
+        supports_sample_obs = "sample_obs" in fwd_params
+        supports_ssm_eps = "ssm_eps" in fwd_params
     except (TypeError, ValueError):
         supports_sample_obs = False
+        supports_ssm_eps = False
     y_trues = []
     y_preds = []
     y_pred_cfs = []
@@ -369,10 +377,10 @@ def evaluate_predictions(
         for batch in data_loader:
             stim, y, mask, noise = [b.to(device, non_blocking=True) for b in batch]
             t_cut = min(int(pre_vols), y.shape[1])
+            pre_obs = y[:, :t_cut, :] if has_history else None
+            pre_mask = mask[:, :t_cut, :] if has_history else None
             if has_prestim:
                 gate = compute_drift_gate(stim, adj_t, drift_gate_mode) if adj_t is not None else None
-                pre_obs = y[:, :t_cut, :]
-                pre_mask = mask[:, :t_cut, :]
                 guide_kwargs = dict(
                     ExternalInput=stim,
                     mask=None,
@@ -384,10 +392,11 @@ def evaluate_predictions(
                 )
             else:
                 gate = None
-                pre_obs = None
-                pre_mask = None
                 guide_kwargs = dict(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
             model_kwargs = dict(guide_kwargs)
+            if has_ssm and not has_prestim:
+                model_kwargs["pre_stim_obs"] = pre_obs
+                model_kwargs["pre_stim_mask"] = pre_mask
             model_kwargs_zero = dict(model_kwargs)
             model_kwargs_zero["ExternalInput"] = torch.zeros_like(stim)
             if supports_sample_obs:
@@ -406,9 +415,10 @@ def evaluate_predictions(
                         y=None,
                         noise_scale=torch.cat([noise, noise], dim=0),
                     )
-                    if has_prestim:
+                    if has_history:
                         stacked_kwargs["pre_stim_obs"] = torch.cat([pre_obs, pre_obs], dim=0)
                         stacked_kwargs["pre_stim_mask"] = torch.cat([pre_mask, pre_mask], dim=0)
+                    if has_prestim:
                         if gate is not None:
                             if gate.dim() == 3:
                                 stacked_gate = torch.cat([gate, gate], dim=1)
@@ -432,6 +442,15 @@ def evaluate_predictions(
                             for name, site in gtrace.nodes.items()
                             if site["type"] == "sample" and name != "batch"
                         }
+                    eps_draw = (
+                        torch.randn(
+                            (bsz, stim.shape[1] + 1, int(ssm_mod.z_dim)),
+                            device=device,
+                            dtype=stim.dtype,
+                        )
+                        if (has_ssm and supports_ssm_eps)
+                        else None
+                    )
                     if can_stack:
                         pz = ps.get("prestim_z")
                         if torch.is_tensor(pz) and pz.dim() >= 2 and pz.shape[0] == bsz:
@@ -439,14 +458,23 @@ def evaluate_predictions(
                             ps_run["prestim_z"] = torch.cat([pz, pz], dim=0)
                         else:
                             ps_run = {k: v for k, v in ps.items() if k != "batch"}
-                        both_out = pyro.condition(model, data=ps_run)(**stacked_kwargs)
+                        if eps_draw is not None:
+                            both_out = pyro.condition(model, data=ps_run)(
+                                **stacked_kwargs, ssm_eps=torch.cat([eps_draw, eps_draw], dim=0)
+                            )
+                        else:
+                            both_out = pyro.condition(model, data=ps_run)(**stacked_kwargs)
                         if both_out.dim() == 4:
                             both_out = both_out.mean(dim=0)
                         s_out, z_out = both_out.chunk(2, dim=0)
                     else:
                         conditioned = pyro.condition(model, data=ps)
-                        s_out = conditioned(**model_kwargs)
-                        z_out = conditioned(**model_kwargs_zero)
+                        if eps_draw is not None:
+                            s_out = conditioned(**model_kwargs, ssm_eps=eps_draw)
+                            z_out = conditioned(**model_kwargs_zero, ssm_eps=eps_draw)
+                        else:
+                            s_out = conditioned(**model_kwargs)
+                            z_out = conditioned(**model_kwargs_zero)
                         if s_out.dim() == 4:
                             s_out = s_out.mean(dim=0)
                         if z_out.dim() == 4:

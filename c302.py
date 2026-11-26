@@ -160,13 +160,19 @@ class conductanceLayer(PyroModule):
         V_{t+dt} = (V_t + (dt / C) * (I_t + G * E)) / (1 + dt * G / C)
     """
 
-    def __init__(self, input_size: int):
+    def __init__(self, input_size: int, dimensionless: bool = False):
         super().__init__()
         self.input_size = input_size
+        self.dimensionless = bool(dimensionless)
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.E = _sample_normal(self, -0.065, 0.005, shape=(input_size,), to_event=1)
-        self.G = _sample_lognormal(self, math.log(0.5), 0.4, shape=(input_size,), to_event=1)
-        self.C = _sample_lognormal(self, math.log(0.05), 0.4, shape=(input_size,), to_event=1)
+        if self.dimensionless:
+            # Gauge-fixed normalized physiology: leak G_i = 1.0, membrane time constant tau_m = C_i / G_i
+            self.register_buffer("G", torch.ones(input_size, dtype=torch.float32))
+            self.C = _sample_lognormal(self, math.log(0.10), 0.4, shape=(input_size,), to_event=1)
+        else:
+            self.G = _sample_lognormal(self, math.log(0.5), 0.4, shape=(input_size,), to_event=1)
+            self.C = _sample_lognormal(self, math.log(0.05), 0.4, shape=(input_size,), to_event=1)
 
     def build_step_cache(self, dt: float = timeStep) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Precompute positive conductance parameters once per rollout."""
@@ -194,10 +200,10 @@ class conductanceLayer(PyroModule):
 class neuronLayer(PyroModule):
     """Neuron population layer combining conductance dynamics and optional sensory models."""
 
-    def __init__(self, neuronSize: int, neuronList: Optional[Dict[int, PyroModule]] = None):
+    def __init__(self, neuronSize: int, neuronList: Optional[Dict[int, PyroModule]] = None, dimensionless: bool = False):
         super().__init__()
         self.neuronSize = neuronSize
-        self.conductance = conductanceLayer(input_size=neuronSize)
+        self.conductance = conductanceLayer(input_size=neuronSize, dimensionless=dimensionless)
         self._neuron_List = PyroModuleDict(
             {str(int(k)): v for k, v in (neuronList or {}).items()}
         )
@@ -255,9 +261,10 @@ class neuronLayer(PyroModule):
 class GeneralSynapse(PyroModule):
     """Ohmic electrical gap-junction layer: I_{post} = sum_{pre} w * g_syn * (V_pre - V_post)."""
 
-    def __init__(self, synapseInput, synapseOutput, synapseWeight, g_syn=None, symmetric: bool = True):
+    def __init__(self, synapseInput, synapseOutput, synapseWeight, g_syn=None, symmetric: bool = True, cond_scale: float = 1.0):
         super().__init__()
         self.symmetric = bool(symmetric)
+        self.cond_scale = float(cond_scale)
         src = np.asarray(synapseInput, dtype=np.int64).reshape(-1)
         dst = np.asarray(synapseOutput, dtype=np.int64).reshape(-1)
         w = np.asarray(synapseWeight, dtype=np.float32).reshape(-1)
@@ -272,7 +279,7 @@ class GeneralSynapse(PyroModule):
                 # Gap junctions draw zero tonic current at uniform rest; 0.015 median + 0.85 log-std
                 # preserves quiet baseline while letting strong homologous pairs reach ~0.08-0.15 nS.
                 self.g_syn = _sample_lognormal(
-                    self, math.log(0.015), 0.85, shape=(self.inputSize,), to_event=1
+                    self, math.log(0.015 * self.cond_scale), 0.85, shape=(self.inputSize,), to_event=1
                 )
             else:
                 self.g_syn = g_syn
@@ -345,6 +352,7 @@ class WicksSynapse(PyroModule):
         per_edge_release: bool = False,
         wide_amp_priors: bool = False,
         evoked_syn_priors: bool = False,
+        cond_scale: float = 1.0,
     ):
         super().__init__()
         src = np.asarray(synapseInput, dtype=np.int64).reshape(-1)
@@ -356,6 +364,7 @@ class WicksSynapse(PyroModule):
         self.per_edge_release = bool(per_edge_release)
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
+        self.cond_scale = float(cond_scale)
         self.register_buffer("synapseInput", torch.as_tensor(src, dtype=torch.long))
         self.register_buffer("synapseOutput", torch.as_tensor(dst, dtype=torch.long))
         self.register_buffer("synapseWeight", torch.as_tensor(w, dtype=torch.float32))
@@ -376,7 +385,7 @@ class WicksSynapse(PyroModule):
             pre_param_dim = self.neuron_size if self.share_presynaptic else self.inputSize
             # Keep prior median calm (0.01 nS, or 0.015 nS with sharper V_slope=8 mV for evoked_syn_priors)
             # so high-degree hubs avoid resting tonic depolarization while evoked release remains responsive.
-            g_max_med = 0.015 if self.evoked_syn_priors else 0.01
+            g_max_med = (0.015 if self.evoked_syn_priors else 0.01) * self.cond_scale
             g_max_scale = 0.95 if self.evoked_syn_priors else (1.1 if self.wide_amp_priors else 0.85)
             v_rest_loc = -0.042
             v_slope_loc = math.log(0.008) if self.evoked_syn_priors else math.log(0.015)
@@ -541,11 +550,14 @@ class synapseLayer(PyroModule):
         per_edge_release: bool = False,
         wide_amp_priors: bool = False,
         evoked_syn_priors: bool = False,
+        dimensionless: bool = False,
     ):
         super().__init__()
         self.per_edge_release = bool(per_edge_release)
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
+        self.dimensionless = bool(dimensionless)
+        cond_scale = 2.0 if self.dimensionless else 1.0
         wicks_tuple = synapseList["Wicks"]
         self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight = wicks_tuple[:3]
         e_rev_loc = wicks_tuple[3] if len(wicks_tuple) > 3 else None
@@ -565,17 +577,19 @@ class synapseLayer(PyroModule):
             per_edge_release=per_edge_release,
             wide_amp_priors=wide_amp_priors,
             evoked_syn_priors=evoked_syn_priors,
+            cond_scale=cond_scale,
         )
         self.general = GeneralSynapse(
             self.Gap_Junction_SRC,
             self.Gap_Junction_DST,
             self.Gap_Junction_Weight,
+            cond_scale=cond_scale,
         )
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.use_extrasynaptic = bool(use_extrasynaptic)
         if self.use_extrasynaptic and len(self.Generic_SRC) > 0:
             self.extrasyn_gain = _sample_normal(
-                self, 0.0, 0.0025, shape=(len(self.Generic_SRC),), to_event=1
+                self, 0.0, 0.0025 * cond_scale, shape=(len(self.Generic_SRC),), to_event=1
             )
             self.register_buffer("generic_src_t", torch.as_tensor(self.Generic_SRC, dtype=torch.long))
             self.register_buffer("generic_dst_t", torch.as_tensor(self.Generic_DST, dtype=torch.long))
@@ -1100,6 +1114,142 @@ class CausalPreStimEncoder(PyroModule):
         return post + osc_term
 
 
+class LatentNeuralSSM(PyroModule):
+    """Low-dimensional stochastic neural state-space residual coupled to membrane dynamics.
+
+    Encodes arbitrary-length strictly causal pre-stimulus history ``y[:, :pre_vols, :]``
+    into initial state ``z0 ~ N(mu_0, sigma_0)`` + local ``(delta_v0, delta_ca0)``,
+    evolves ``z_{t+1} = A z_t + B tanh((V_t - V_rest) / 0.025) + sigma_eta * eps_t``
+    where ``A = diag(0.98 * sigmoid(a)) @ exp(S - S^T)`` guarantees spectral radius < 0.98,
+    and injects latent current ``U z_t`` + residual readout ``C_y z_t`` (zero-initialized
+    for safe warm-start). Also provides causal online ``filter_step`` for Task 2.
+    """
+
+    def __init__(self, neuron_size: int, z_dim: int = 16):
+        super().__init__()
+        self.neuron_size = int(neuron_size)
+        self.z_dim = int(z_dim)
+
+        # Scale-invariant multi-window causal summary encoder (works for pre_vols >= 1)
+        self.pre_global_fc1 = PyroModule[nn.Linear](self.neuron_size * 4, 64)
+        self.pre_global_ln = PyroModule[nn.LayerNorm](64)
+        self.pre_global_fc2 = PyroModule[nn.Linear](64, self.z_dim * 2)
+
+        self.local_fc1 = PyroModule[nn.Linear](5, 16)
+        self.local_fc2 = PyroModule[nn.Linear](16, 2)  # (delta_v0, delta_ca0)
+
+        # Autonomous stable transition & closed-loop membrane feedback + residual readouts
+        self.A_decay_logit = PyroParam(torch.full((self.z_dim,), 2.2))
+        self.S_skew = PyroParam(torch.zeros(self.z_dim, self.z_dim))
+        self.sigma_eta_log = PyroParam(torch.full((self.z_dim,), math.log(0.04)))
+
+        self.v_proj = PyroModule[nn.Linear](self.neuron_size, 32, bias=False)
+        self.v_to_z = PyroModule[nn.Linear](32, self.z_dim, bias=False)
+        self.z_to_current = PyroModule[nn.Linear](self.z_dim, self.neuron_size, bias=False)
+        self.z_to_obs = PyroModule[nn.Linear](self.z_dim, self.neuron_size, bias=False)
+        # Task-2 strictly causal innovation gain: z_{t|t} = z_{t|t-1} + K_obs(masked_innov)
+        self.K_obs = PyroModule[nn.Linear](self.neuron_size, self.z_dim, bias=False)
+
+        with torch.no_grad():
+            self.pre_global_fc2.weight.zero_()
+            self.pre_global_fc2.bias.zero_()
+            self.local_fc2.weight.mul_(0.05)
+            self.local_fc2.bias.zero_()
+            self.v_to_z.weight.zero_()
+            self.z_to_current.weight.zero_()
+            self.z_to_obs.weight.zero_()
+            self.K_obs.weight.mul_(0.02)
+
+    @staticmethod
+    def extract_causal_pre_features(
+        y_pre: torch.Tensor,
+        mask_pre: Optional[torch.Tensor] = None,
+        dt_obs: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract length-invariant causal features from arbitrary pre_vols."""
+        y_safe, m, clean_pre, obs_any = CausalPreStimEncoder._prepare_masked_pre(y_pre, mask_pre)
+        B, t_pre, N = y_safe.shape
+        dtype, device = y_safe.dtype, y_safe.device
+
+        t_idx = torch.arange(t_pre, device=device, dtype=dtype).view(1, t_pre, 1)
+        valid_idx = torch.where(m > 0.5, torch.arange(t_pre, device=device).view(1, t_pre, 1), torch.full((1, t_pre, 1), -1, device=device))
+        last_idx = valid_idx.max(dim=1).values.clamp(min=0)
+        y_last = y_safe.gather(1, last_idx.unsqueeze(1)).squeeze(1) * obs_any
+
+        tau_rec = max(dt_obs, 10.0)
+        w_rec = torch.exp(-(t_pre - 1 - t_idx) * dt_obs / tau_rec) * m
+        y_slow = (y_safe * w_rec).sum(dim=1) / torch.clamp(w_rec.sum(dim=1), min=1e-6) * obs_any
+        y_all = (y_safe * m).sum(dim=1) / torch.clamp(m.sum(dim=1), min=1.0) * obs_any
+
+        _, _, y_slope, _, _ = CausalPreStimEncoder._extract_features_impl(y_safe, m)
+        global_feat = torch.cat([y_last, y_slow, y_all, y_slope], dim=-1)  # (B, 4*N)
+        local_feat = torch.stack([y_last, y_slow, y_all, y_slope, obs_any], dim=-1)  # (B, N, 5)
+        return global_feat, local_feat
+
+    def encode_initial(
+        self,
+        y_pre: torch.Tensor,
+        mask_pre: Optional[torch.Tensor] = None,
+        dt_obs: float = 0.5,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode pre_stim slice to (z0_loc, z0_scale, delta_v0, delta_ca0)."""
+        global_feat, local_feat = self.extract_causal_pre_features(y_pre, mask_pre, dt_obs=dt_obs)
+        h = F.silu(self.pre_global_ln(self.pre_global_fc1(global_feat)))
+        raw = self.pre_global_fc2(h)
+        z0_loc = 2.0 * torch.tanh(raw[:, :self.z_dim])
+        z0_scale = 0.05 + 0.45 * torch.sigmoid(raw[:, self.z_dim:])
+
+        loc_out = self.local_fc2(F.silu(self.local_fc1(local_feat)))
+        delta_v0 = 0.015 * torch.tanh(loc_out[..., 0])
+        delta_ca0 = 0.5 * torch.tanh(loc_out[..., 1])
+        return z0_loc, z0_scale, delta_v0, delta_ca0
+
+    def transition_matrix(self) -> torch.Tensor:
+        """Build stable discrete-time transition matrix A (spectral radius < 0.98)."""
+        decay = 0.98 * torch.sigmoid(self.A_decay_logit)
+        skew = 0.5 * (self.S_skew - self.S_skew.T)
+        rot = torch.linalg.matrix_exp(skew)
+        return decay.unsqueeze(1) * rot
+
+    def sigma_eta(self) -> torch.Tensor:
+        return torch.clamp(torch.exp(self.sigma_eta_log), min=1e-4, max=0.5)
+
+    def latent_current(self, z: torch.Tensor) -> torch.Tensor:
+        return 0.05 * torch.tanh(self.z_to_current(z))
+
+    def obs_residual(self, z: torch.Tensor) -> torch.Tensor:
+        return self.z_to_obs(z)
+
+    def step_latent(
+        self,
+        z: torch.Tensor,
+        v: torch.Tensor,
+        v_rest: torch.Tensor,
+        A_mat: Optional[torch.Tensor] = None,
+        eps: Optional[torch.Tensor] = None,
+        sigma: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        A = self.transition_matrix() if A_mat is None else A_mat
+        v_feat = torch.tanh(self.v_proj(torch.tanh((v - v_rest) / 0.025)))
+        z_next = z @ A.T + self.v_to_z(v_feat)
+        if eps is not None:
+            sig = self.sigma_eta() if sigma is None else sigma
+            z_next = z_next + eps * sig
+        return z_next
+
+    def filter_step(
+        self,
+        z_pred: torch.Tensor,
+        y_obs_t: torch.Tensor,
+        mask_t: torch.Tensor,
+        y_pred_t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Task-2 causal innovation update: strictly conditioned on t <= current."""
+        m = mask_t.to(device=z_pred.device, dtype=z_pred.dtype)
+        innov = torch.where(m > 0.5, y_obs_t - y_pred_t, torch.zeros_like(y_pred_t))
+        return z_pred + torch.tanh(self.K_obs(innov))
+
+
 class NematodeForStep(PyroModule):
     """Single-step continuous-time connectome + optional BNN residual current."""
 
@@ -1115,6 +1265,7 @@ class NematodeForStep(PyroModule):
         per_neuron_stim_gain: bool = False,
         wide_amp_priors: bool = False,
         evoked_syn_priors: bool = False,
+        dimensionless: bool = False,
     ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
@@ -1122,7 +1273,9 @@ class NematodeForStep(PyroModule):
         self.per_neuron_stim_gain = bool(per_neuron_stim_gain)
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
-        self.Neuron = neuronLayer(neuronSize, NeuronList)
+        self.dimensionless = bool(dimensionless)
+        cond_scale = 2.0 if self.dimensionless else 1.0
+        self.Neuron = neuronLayer(neuronSize, NeuronList, dimensionless=self.dimensionless)
         self.synapse = synapseLayer(
             synapseList,
             use_extrasynaptic=use_extrasynaptic,
@@ -1130,12 +1283,12 @@ class NematodeForStep(PyroModule):
             per_edge_release=per_edge_release,
             wide_amp_priors=wide_amp_priors,
             evoked_syn_priors=evoked_syn_priors,
+            dimensionless=self.dimensionless,
         )
-        # Optogenetic Chrimson cation-channel conductance (nS) with physiological reversal E_opt = 0 V
-        # (and inhibitory reversal E_inh = -85 mV if negative stimulation is supplied).
+        # Optogenetic Chrimson cation-channel conductance (nS, or dimensionless kappa=g/G when dimensionless=True)
         self.stim_e_rev = 0.0
         self.stim_e_inh = -0.085
-        stim_loc = math.log(2.0) if self.wide_amp_priors else math.log(1.2)
+        stim_loc = math.log((2.0 if self.wide_amp_priors else 1.2) * cond_scale)
         if self.per_neuron_stim_gain:
             stim_scale = 0.6 if self.wide_amp_priors else 0.3
             self.stim_gain_vec = _sample_lognormal(
@@ -1284,6 +1437,8 @@ class RecurrentNematode(PyroModule):
         stim_actuator: bool = False,
         stim_tau_rise: float = 0.08,
         stim_tau_decay: float = 0.4,
+        use_latent_ssm: bool = False,
+        latent_ssm_dim: int = 16,
     ):
         super().__init__()
         self.model = model
@@ -1301,6 +1456,8 @@ class RecurrentNematode(PyroModule):
         self.prestim_rank = int(prestim_rank)
         self.variational_prestim = bool(variational_prestim)
         self.prestim_oscillatory = bool(prestim_oscillatory)
+        self.use_latent_ssm = bool(use_latent_ssm)
+        self.latent_ssm_dim = int(latent_ssm_dim)
 
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         neuron_size = getattr(model, "neuronSize", 300)
@@ -1309,6 +1466,11 @@ class RecurrentNematode(PyroModule):
         self.prestim_encoder = (
             CausalPreStimEncoder(neuron_size, rank=self.prestim_rank, oscillatory=self.prestim_oscillatory)
             if self.use_prestim_encoder
+            else None
+        )
+        self.latent_ssm = (
+            LatentNeuralSSM(neuron_size, z_dim=self.latent_ssm_dim)
+            if self.use_latent_ssm
             else None
         )
         # Dimensionless observation noise multiplier (when noise_scale is provided) or base std
@@ -1325,6 +1487,7 @@ class RecurrentNematode(PyroModule):
         prestim_z: Optional[torch.Tensor] = None,
         return_trajectories: bool = True,
         use_step_cache: bool = True,
+        ssm_eps: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         batch_size, n_t, n_neurons = stim_input.shape
         dt_sim = dt_obs / max(1, self.substeps)
@@ -1408,13 +1571,52 @@ class RecurrentNematode(PyroModule):
             rel_t_sim = rel_t_obs + (sub_idx.unsqueeze(0) + 0.5) * dt_sim
             bg_decay = torch.exp(-rel_t_sim / tau_bg)  # (n_post, substeps)
 
+        ssm_z = None
+        ssm_dv0 = None
+        ssm_dca0 = None
+        ssm_A = None
+        ssm_sigma = None
+        if self.latent_ssm is not None:
+            ssm_A = self.latent_ssm.transition_matrix()
+            ssm_sigma = self.latent_ssm.sigma_eta()
+            if ssm_eps is None:
+                ssm_eps = torch.randn(
+                    (batch_size, n_t + 1, self.latent_ssm.z_dim),
+                    device=stim_input.device,
+                    dtype=stim_input.dtype,
+                )
+            if pre_stim_obs is not None and inject_t > 0:
+                y_pre_ssm = pre_stim_obs[:, :inject_t, :]
+                m_pre_ssm = None if pre_stim_mask is None else pre_stim_mask[:, :inject_t, :]
+                z0_loc, z0_sc, ssm_dv0, ssm_dca0 = self.latent_ssm.encode_initial(
+                    y_pre_ssm, m_pre_ssm, dt_obs=dt_obs
+                )
+                ssm_z = z0_loc + z0_sc * ssm_eps[:, 0, :]
+            else:
+                ssm_z = torch.zeros(
+                    (batch_size, self.latent_ssm.z_dim),
+                    device=stim_input.device,
+                    dtype=stim_input.dtype,
+                )
+
         call_cache = {"neuron_cache": neuron_cache, "stim_gain_cached": stim_gain_cached} if neuron_cache is not None else {}
 
         for t in range(n_t):
-            if prestim_state is not None and t == inject_t:
-                delta_v0, delta_ca0 = prestim_state[0], prestim_state[1]
-                v = v + delta_v0
-                ca = torch.clamp(ca + delta_ca0, min=1e-4)
+            if t == inject_t:
+                if prestim_state is not None:
+                    delta_v0, delta_ca0 = prestim_state[0], prestim_state[1]
+                    v = v + delta_v0
+                    ca = torch.clamp(ca + delta_ca0, min=1e-4)
+                if ssm_dv0 is not None:
+                    v = v + ssm_dv0
+                    ca = torch.clamp(ca + ssm_dca0, min=1e-4)
+
+            ssm_cur = None
+            if ssm_z is not None and t >= inject_t:
+                ssm_z = self.latent_ssm.step_latent(
+                    ssm_z, v, e_rest, A_mat=ssm_A, eps=ssm_eps[:, t + 1, :], sigma=ssm_sigma
+                )
+                ssm_cur = self.latent_ssm.latent_current(ssm_z)
 
             ext_t = stim_input[:, t, :]
             clamp_t = None if voltage_clamp is None else voltage_clamp[:, t, :]
@@ -1422,6 +1624,8 @@ class RecurrentNematode(PyroModule):
                 bg_cur = None
                 if bg_decay is not None and t >= inject_t:
                     bg_cur = prestim_state[2] * bg_decay[t - inject_t, sub]
+                if ssm_cur is not None:
+                    bg_cur = ssm_cur if bg_cur is None else (bg_cur + ssm_cur)
                 if self.stim_actuator:
                     stim_act = _advance_stim_actuator(
                         stim_act, ext_t, dt_sim, self.stim_tau_rise, self.stim_tau_decay,
@@ -1442,6 +1646,8 @@ class RecurrentNematode(PyroModule):
                 )
                 ca, b = self.gcamp.step(v, ca, b, dt=dt_sim, v_th_ca=v_th_ca, cached=gcamp_cache)
             y_t = gcamp_gain * (b - b_baseline) + gcamp_offset
+            if ssm_z is not None and t >= inject_t:
+                y_t = y_t + self.latent_ssm.obs_residual(ssm_z)
             y_preds.append(y_t)
             if return_trajectories:
                 v_traj.append(v)
@@ -1505,6 +1711,7 @@ class RecurrentNematode(PyroModule):
         drift_gate: Optional[torch.Tensor] = None,
         sample_obs: bool = True,
         use_step_cache: bool = True,
+        ssm_eps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if ExternalInput is None and VoltageClamp is None:
             if y is None:
@@ -1535,7 +1742,7 @@ class RecurrentNematode(PyroModule):
         if ext is None:
             ext = torch.zeros_like(v_clamp)
 
-        if self.prestim_encoder is not None and pre_obs is None and y_obs is not None:
+        if (self.prestim_encoder is not None or self.latent_ssm is not None) and pre_obs is None and y_obs is not None:
             t_cut = min(self.pre_vols, y_obs.shape[1])
             pre_obs = y_obs[:, :t_cut, :]
             pre_msk = None if obs_mask is None else obs_mask[:, :t_cut, :]
@@ -1567,6 +1774,7 @@ class RecurrentNematode(PyroModule):
             prestim_z=prestim_z,
             return_trajectories=False,
             use_step_cache=use_step_cache,
+            ssm_eps=ssm_eps,
         )
         if not sample_obs and y_obs is None:
             return y_pred.squeeze(0) if squeezed else y_pred
@@ -1604,9 +1812,10 @@ class RecurrentNematode(PyroModule):
         self.model.Neuron.conductance.E = PyroSample(
             dist.Normal(neuron_loc[0], torch.clamp(neuron_scale[0], min=1e-4)).to_event(1)
         )
-        self.model.Neuron.conductance.G = PyroSample(
-            dist.LogNormal(neuron_loc[1], torch.clamp(neuron_scale[1], min=1e-4)).to_event(1)
-        )
+        if not getattr(self.model.Neuron.conductance, "dimensionless", False):
+            self.model.Neuron.conductance.G = PyroSample(
+                dist.LogNormal(neuron_loc[1], torch.clamp(neuron_scale[1], min=1e-4)).to_event(1)
+            )
         self.model.Neuron.conductance.C = PyroSample(
             dist.LogNormal(neuron_loc[2], torch.clamp(neuron_scale[2], min=1e-4)).to_event(1)
         )
@@ -1668,6 +1877,7 @@ def readConnectome(
     per_neuron_stim_gain: bool = False,
     wide_amp_priors: bool = False,
     evoked_syn_priors: bool = False,
+    dimensionless: bool = False,
     aconnectome_ids_path: str = "./pumpprobe/pumpprobe/aconnectome_ids.txt",
     edgelist_path: str = "./data/herm_full_edgelist.csv",
     np_path: str = "./data/edgelist_NP.csv",
@@ -1789,6 +1999,7 @@ def readConnectome(
             per_neuron_stim_gain=per_neuron_stim_gain,
             wide_amp_priors=wide_amp_priors,
             evoked_syn_priors=evoked_syn_priors,
+            dimensionless=dimensionless,
         )
     model.register_buffer("sensory_mask", torch.from_numpy(sensory_mask))
     return model

@@ -599,6 +599,28 @@ Replaced the TCN batch-averaged global connectome guide with a true non-amortize
 
    - *Scientific separation across tasks*: Purely data-driven recurrent filters (`Exp-Decay`, `Graph VAR`, `Connectome LDS`, `Causal GRU`) reach **`~0.89–0.91`** on `0.5 s` online filtering where autocorrelation dominates, **yet collapse on 25 s open-loop forecasting (`-0.053` to `+0.044`) and fail counterfactual intervention propagation (`evoked_hop1_r2 = -0.014` to `-0.020`, `intact <= shuffle7`, `evoked_stim_r2 < 0`)**. Conversely, **`Phase 1.5 / 2.5 S2`** dominates BOTH `25 s` open-loop (`+0.1059`) AND causal intervention kernels (`kernel_hop1_r = +0.201` intact vs `+0.051` shuffled; `kernel_hop1_r2 = +0.0357` vs `-0.159` on `Dense LDS`; `sign_acc = 84.2%`; `evoked_np_no_hop12_r2 = +0.00008` in Phase 2.5 vs `-0.00060` shuffled), proving physical conductance constraints are essential when causal perturbation structure—not short-horizon autocorrelation—is tested.
 
+   - **Step 4.3 WT → `unc-31` Zero-Shot Genetic Knockout Falsification (`report/data/phase4_unc31_knockout_eval.json`, `tools/eval_unc31_knockout.py`, `15` recordings / `533` trials)**:
+
+| Zero-Shot WT → `unc-31` | `substeps=2` `evoked_hop1_r2` | `substeps=4` `evoked_hop1_r2` | `kernel_hop1_r` (`s=4`) | `evoked_np_only_r2` (`s=4`) | `evoked_np_no_hop12_r2` (`s=4`) |
+|---|---:|---:|---:|---:|---:|
+| `Phase 1.5 S1` (`3+3` intact \| shuf) | `+0.00609` \| `-0.01923` (**`18.13×`**) | **`+0.00713`** \| `-0.01916` (**`17.94×`**) | `N/A` (gate) | `N/A` | `N/A` |
+| `Phase 1.5 S2` (`intact` \| `shuf7`) | `+0.00957` \| `-0.01689` | **`+0.01091`** \| `-0.01667` | **`+0.2543`** \| `+0.1316` | `-0.00391` | `-0.00138` |
+| `Phase 2.5 S1b` (`intact` \| `shuf7`) | `+0.01139` \| `-0.01655` | **`+0.01269`** \| `-0.01632` | **`+0.2587`** \| `+0.1398` | `-0.00289` | `-0.00120` |
+| `Phase 2.5 S2` (`intact` \| `shuf7`) | `+0.01223` \| `-0.01712` | **`+0.01362`** \| `-0.01692` | **`+0.2699`** \| `+0.1214` | `-0.00287` | `-0.00103` |
+
+| *In-Silico* Extrasyn Ablation (`Δ = full − zero`) | WT `evoked_np_only_r2 Δ` | `unc-31` `evoked_np_only_r2 Δ` | WT `np_no_hop12 Δ` | `unc-31` `np_no_hop12 Δ` |
+|---|---:|---:|---:|---:|
+| `Phase 2.5 S1b` (`substeps=2` \| `4`) | `+0.00157` \| **`+0.00176`** | `+0.00093` \| **`+0.00102`** | `+0.00050` \| **`+0.00057`** | `+0.00025` \| **`+0.00026`** |
+| `Phase 2.5 S2` (`substeps=2` \| `4`) | `+0.00140` \| **`+0.00156`** | `+0.00095` \| **`+0.00104`** | `+0.00047` \| **`+0.00052`** | `+0.00031` \| **`+0.00033`** |
+
+   - *Biological interpretation*: (1) WT models transfer zero-shot to **`unc-31`** (`post_inlier_r2 = +0.104–0.109` on S2; `unc-31` within-recording `hop1` noise ceiling `0.1311`), keeping fast 1-hop propagation intact (`evoked_hop1_r2 = +0.0109–0.0136`, `kernel_hop1_r = +0.254–0.270`, `fft_r = +0.370`, 3+3 gate `18.13× / 17.94× SEM`); (2) Conversely, `evoked_np_no_hop12_r2` flips from small positive in WT (`+0.00016` to `+0.00024` at `sub=4`) to negative in `unc-31` (`-0.00103` to `-0.00120`), and extrasynaptic ablation `Δ(full − zero)` drops **`~34–55%`** in `unc-31` (`np_only Δ`: `+0.00176 → +0.00102`, `np_no_hop12 Δ`: `+0.00057 → +0.00026` on S1b `sub=4`). The residual non-zero `Δ` in `unc-31` reflects `edgelist_NP + edgelist_MA` combining `unc-31`-dependent neuropeptides with `unc-31`-independent monoamines.
+
+   - **Phase 5A Model & Objective Readiness (`0 GPU`, unit-tested locally)**:
+     - **`--dimensionless-physiology`** (`c302.py`, `vae.py`, `pyro_svi_vae.py`): Fixes leak conductance `G=1.0` (removing redundant scale gauge), parameterizes membrane time constant `τ_m = C/G` (`0.10 s` center) and normalized conductances `κ = g/G` (`2×` prior shift). Gauge scaling equivalence verified to `< 1e-5` in pytest.
+     - **`--latent-ssm` / `--latent-ssm-dim`** (`c302.py`, `vae.py`, `pyro_svi_c302.py`): Adds autonomous discrete-time stochastic state space `LatentNeuralSSM` with strictly causal length-invariant pre-stim pooling (verified for `--pre-vols 40` / `20 s`), spectrally stable transition `A = diag(0.98·sigmoid(a)) @ exp(S − S^T)` (`ρ(A) < 0.98`), closed-loop membrane feedback (`v_to_z`, `latent_current`, `obs_residual`), online `filter_step(...)`, and paired counterfactual `ssm_eps` sharing in `evaluate_predictions`.
+     - **`--kernel-loss-weight` / `--dynamics-loss-weight`** (`pyro_svi_vae.py`): Explicit minibatch pair-level 1-hop counterfactual response kernel loss (`K_{ij}(t)`) and temporal derivative loss (`dK_{ij}/dt`).
+     - **Flexible context & substeps**: `--pre-vols` and `--post-vols` plumbed cleanly across `pyro_svi_vae.py`, `tools/eval_checkpoint.py`, and `tools/run_nested_protocol.py` for `--substeps 4` + `--pre-vols 40` training.
+
 The mandatory next run remains Fold 0 with a larger effective budget (30–35 epochs) and/or `--val-metric stim_r2` before any 5-fold gate. Commands remain:
 
 ```bash
@@ -689,7 +711,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest -q tests/test_pipeline.py` → **55 passed, 2 skipped**.
+- Regression tests: `pytest -q tests/test_pipeline.py` → **58 passed, 2 skipped**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.
@@ -698,7 +720,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - `--eval-test-each-save` is opt-in; with `val_fraction=0`, test is no longer reused as validation.
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
-- Phase 4 diagnostics & baseline JSONs: `report/data/substep_convergence_audit.json`, `report/data/phase4_noise_ceiling_and_ablations.json`, `report/data/phase4_baselines_fold0.json` (plus scripts `tools/kernel_metrics.py`, `tools/substep_convergence.py`, `tools/noise_ceiling.py`, `tools/run_baselines.py`).
+- Phase 4 & Phase 5A diagnostics/evals: `report/data/substep_convergence_audit.json`, `report/data/phase4_noise_ceiling_and_ablations.json`, `report/data/phase4_baselines_fold0.json`, `report/data/phase4_unc31_knockout_eval.json` (plus scripts `tools/kernel_metrics.py`, `tools/substep_convergence.py`, `tools/noise_ceiling.py`, `tools/run_baselines.py`, `tools/eval_unc31_knockout.py`).
 - All Colab sessions are stopped; there are no active sessions.
 
 ### 4.4 Data

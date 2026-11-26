@@ -85,6 +85,13 @@ def main() -> None:
     p.add_argument("--init-from-dir", default=None, type=str,
                    help="Directory with Stage-1 summary.json and fold{fi}/{tag}_seed{seed}/ checkpoints for Stage-2 warm start")
     p.add_argument("--freeze-non-prestim", action="store_true")
+    p.add_argument("--dimensionless-physiology", action="store_true")
+    p.add_argument("--latent-ssm", action="store_true")
+    p.add_argument("--latent-ssm-dim", default=16, type=int)
+    p.add_argument("--kernel-loss-weight", default=0.0, type=float)
+    p.add_argument("--dynamics-loss-weight", default=0.0, type=float)
+    p.add_argument("--pre-vols", default=10, type=int)
+    p.add_argument("--post-vols", default=50, type=int)
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -146,6 +153,8 @@ def main() -> None:
                 "--seed", str(seed),
                 "--batch-size", str(args.batch_size),
                 "--substeps", str(args.substeps),
+                "--pre-vols", str(args.pre_vols),
+                "--post-vols", str(args.post_vols),
                 "--lr", str(args.lr),
                 "--snapshot-dir", run_dir,
             ]
@@ -176,6 +185,14 @@ def main() -> None:
                 cmd.extend(["--init-from", stage1_ckpt])
             if args.freeze_non_prestim:
                 cmd.append("--freeze-non-prestim")
+            if args.dimensionless_physiology:
+                cmd.append("--dimensionless-physiology")
+            if args.latent_ssm:
+                cmd.extend(["--latent-ssm", "--latent-ssm-dim", str(args.latent_ssm_dim)])
+            if args.kernel_loss_weight > 0:
+                cmd.extend(["--kernel-loss-weight", str(args.kernel_loss_weight)])
+            if args.dynamics_loss_weight > 0:
+                cmd.extend(["--dynamics-loss-weight", str(args.dynamics_loss_weight)])
             if args.stim_actuator:
                 cmd.append("--stim-actuator")
                 cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])
@@ -217,6 +234,7 @@ def main() -> None:
                 "--checkpoint", ckpt,
                 "--out", eval_path,
                 "--substeps", str(args.substeps),
+                "--pre-vols", str(args.pre_vols),
                 "--num-samples", "16",
             ]
             if args.no_prestim_encoder:
@@ -237,6 +255,10 @@ def main() -> None:
                 eval_cmd.append("--use-extrasynaptic")
             if args.prestim_oscillatory:
                 eval_cmd.append("--prestim-oscillatory")
+            if args.dimensionless_physiology:
+                eval_cmd.append("--dimensionless-physiology")
+            if args.latent_ssm:
+                eval_cmd.extend(["--latent-ssm", "--latent-ssm-dim", str(args.latent_ssm_dim)])
             if args.stim_actuator:
                 eval_cmd.append("--stim-actuator")
                 eval_cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])

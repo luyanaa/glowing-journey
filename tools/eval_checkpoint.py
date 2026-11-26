@@ -35,6 +35,9 @@ def main() -> None:
     p.add_argument("--direct-global-guide", action="store_true")
     p.add_argument("--use-extrasynaptic", action="store_true")
     p.add_argument("--prestim-oscillatory", action="store_true")
+    p.add_argument("--dimensionless-physiology", action="store_true")
+    p.add_argument("--latent-ssm", action="store_true")
+    p.add_argument("--latent-ssm-dim", default=16, type=int)
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -60,6 +63,7 @@ def main() -> None:
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,
         evoked_syn_priors=args.evoked_syn_priors,
+        dimensionless=args.dimensionless_physiology,
         shuffle_seed=args.shuffle_seed,
     )
     use_prestim = not args.no_prestim_encoder
@@ -77,6 +81,8 @@ def main() -> None:
         stim_actuator=args.stim_actuator,
         stim_tau_rise=args.stim_tau_rise,
         stim_tau_decay=args.stim_tau_decay,
+        use_latent_ssm=args.latent_ssm,
+        latent_ssm_dim=args.latent_ssm_dim,
     )
     model = vae.VAElegans(
         rec,
@@ -120,6 +126,8 @@ def main() -> None:
         "direct_global_guide": bool(args.direct_global_guide),
         "use_extrasynaptic": bool(args.use_extrasynaptic),
         "prestim_oscillatory": bool(args.prestim_oscillatory),
+        "dimensionless_physiology": bool(args.dimensionless_physiology),
+        "latent_ssm": bool(args.latent_ssm),
         "substeps": args.substeps,
         "eval_seed": args.eval_seed,
         "num_samples": args.num_samples,

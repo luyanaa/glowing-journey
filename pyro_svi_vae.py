@@ -8,6 +8,7 @@ import pyro
 from pyro.infer import SVI, Trace_ELBO
 from sklearn.model_selection import train_test_split
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchinfo import summary
 
@@ -75,6 +76,151 @@ def reweight_hop1_noise(
             factor,
         )
     return noise * factor
+
+
+def _prestim_baseline_torch(y: torch.Tensor, mask: torch.Tensor, pre_vols: int) -> torch.Tensor:
+    """Differentiable causal pre-stim linear extrapolation baseline per (B, N)."""
+    t0 = max(1, min(int(pre_vols), y.shape[1]))
+    n_t = y.shape[1]
+    w = mask[:, :t0, :].to(dtype=y.dtype)
+    denom = torch.clamp(w.sum(dim=1), min=1.0)
+    pre_t = torch.arange(t0, device=y.device, dtype=y.dtype).view(1, t0, 1)
+    mean_t = (w * pre_t).sum(dim=1) / denom
+    mean_y = (w * y[:, :t0, :]).sum(dim=1) / denom
+    cov = (w * (pre_t - mean_t.unsqueeze(1)) * (y[:, :t0, :] - mean_y.unsqueeze(1))).sum(dim=1)
+    var = (w * (pre_t - mean_t.unsqueeze(1)) ** 2).sum(dim=1)
+    slope = torch.where(var > 1e-8, cov / torch.clamp(var, min=1e-12), torch.zeros_like(var))
+    intercept = mean_y - slope * mean_t
+    t_all = torch.arange(n_t, device=y.device, dtype=y.dtype).view(1, n_t, 1)
+    return intercept.unsqueeze(1) + slope.unsqueeze(1) * t_all
+
+
+def compute_evoked_kernel_aux_loss(
+    y_pred_stim: torch.Tensor,
+    y_pred_zero: torch.Tensor,
+    y_true: torch.Tensor,
+    obs_mask: torch.Tensor,
+    stim: torch.Tensor,
+    adjacency: torch.Tensor,
+    pre_vols: int = 10,
+    evoked_window_vols: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute differentiable pair-level 1-hop evoked kernel & temporal-derivative losses.
+
+    Returns ``(kernel_loss, dynamics_loss)`` comparing paired counterfactual curves
+    ``y_pred_stim - y_pred_zero`` against pre-stim detrended ``y_true - baseline``
+    averaged within minibatch stimulus-signature groups on observed 1-hop targets.
+    """
+    t0 = int(pre_vols)
+    t1 = min(y_true.shape[1], t0 + int(evoked_window_vols))
+    zero = y_pred_stim.new_zeros(())
+    if t1 <= t0 + 1:
+        return zero, zero
+
+    baseline = _prestim_baseline_torch(y_true, obs_mask, pre_vols)
+    yt_ev = (y_true - baseline)[:, t0:t1, :]
+    yp_ev = (y_pred_stim - y_pred_zero)[:, t0:t1, :]
+    valid = obs_mask[:, t0:t1, :].bool()
+
+    stim_target = stim.abs().sum(dim=1) > 0  # (B, N)
+    hop1 = (stim_target.to(dtype=stim.dtype) @ adjacency > 0) & (~stim_target)
+
+    # Group trials in minibatch by stimulated neuron signature
+    sigs: dict[tuple[int, ...], list[int]] = {}
+    st_cpu = stim_target.detach().cpu().numpy()
+    for b in range(stim.shape[0]):
+        s_tuple = tuple(np.flatnonzero(st_cpu[b]).tolist())
+        if s_tuple:
+            sigs.setdefault(s_tuple, []).append(b)
+
+    k_losses, d_losses = [], []
+    for grp in sigs.values():
+        m_grp = valid[grp] & hop1[grp].unsqueeze(1)
+        if not torch.any(m_grp):
+            continue
+        cnt = m_grp.sum(dim=0)  # (T_ev, N)
+        ok_n = cnt.any(dim=0)
+        if not torch.any(ok_n):
+            continue
+        cnt_k = torch.clamp(cnt[:, ok_n].to(dtype=yp_ev.dtype), min=1.0)
+        m_k = m_grp[:, :, ok_n].to(dtype=yp_ev.dtype)
+        k_true = (yt_ev[grp][:, :, ok_n] * m_k).sum(dim=0) / cnt_k
+        k_pred = (yp_ev[grp][:, :, ok_n] * m_k).sum(dim=0) / cnt_k
+        step_ok = cnt[:, ok_n] >= 1
+        k_losses.append(F.smooth_l1_loss(k_pred[step_ok], k_true[step_ok], beta=0.1))
+        diff_ok = step_ok[1:] & step_ok[:-1]
+        if torch.any(diff_ok):
+            dk_p = k_pred[1:] - k_pred[:-1]
+            dk_t = k_true[1:] - k_true[:-1]
+            d_losses.append(F.smooth_l1_loss(dk_p[diff_ok], dk_t[diff_ok], beta=0.05))
+
+    kernel_loss = torch.stack(k_losses).mean() if k_losses else zero
+    dyn_loss = torch.stack(d_losses).mean() if d_losses else zero
+    return kernel_loss, dyn_loss
+
+
+def _aux_kernel_step(
+    model,
+    aux_opt: torch.optim.Optimizer,
+    stim: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    noise: torch.Tensor,
+    adj_t: torch.Tensor,
+    pre_vols: int,
+    kernel_w: float,
+    dyn_w: float,
+    drift_gate: torch.Tensor | None = None,
+) -> float:
+    """Single optimization step on differentiable paired-counterfactual kernel/dynamics auxiliary loss."""
+    aux_opt.zero_grad()
+    B, n_t, _ = stim.shape
+    has_pre = bool(getattr(model.decoder, "use_prestim_encoder", False))
+    has_ssm = getattr(model.decoder, "latent_ssm", None) is not None
+    guide_kw = dict(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
+    if has_pre or has_ssm:
+        guide_kw["pre_stim_obs"] = y[:, :pre_vols, :]
+        guide_kw["pre_stim_mask"] = mask[:, :pre_vols, :]
+        guide_kw["drift_gate"] = drift_gate
+
+    tr = pyro.poutine.trace(model.guide).get_trace(**guide_kw)
+    ps = {}
+    for name, site in tr.nodes.items():
+        if site["type"] == "sample" and not site.get("is_observed", False):
+            val = site["value"]
+            if val.dim() >= 1 and val.shape[0] == B:
+                ps[name] = val.repeat(2, *([1] * (val.dim() - 1)))
+            else:
+                ps[name] = val
+
+    stacked_kw = dict(
+        ExternalInput=torch.cat([stim, torch.zeros_like(stim)], dim=0),
+        mask=None,
+        y=None,
+        noise_scale=torch.cat([noise, noise], dim=0),
+        sample_obs=False,
+    )
+    if has_pre or has_ssm:
+        stacked_kw["pre_stim_obs"] = torch.cat([y[:, :pre_vols, :], y[:, :pre_vols, :]], dim=0)
+        stacked_kw["pre_stim_mask"] = torch.cat([mask[:, :pre_vols, :], mask[:, :pre_vols, :]], dim=0)
+        if drift_gate is not None:
+            g_cat = torch.cat([drift_gate, drift_gate], dim=1 if drift_gate.dim() == 3 else 0) if drift_gate.dim() >= 2 else drift_gate
+            stacked_kw["drift_gate"] = g_cat
+    if has_ssm:
+        z_dim = model.decoder.latent_ssm.z_dim
+        eps = torch.randn((B, n_t + 1, z_dim), device=stim.device, dtype=stim.dtype)
+        stacked_kw["ssm_eps"] = torch.cat([eps, eps], dim=0)
+
+    out = pyro.condition(model, data=ps)(**stacked_kw)
+    k_loss, d_loss = compute_evoked_kernel_aux_loss(
+        out[:B], out[B:], y, mask, stim, adj_t, pre_vols=pre_vols
+    )
+    tot = float(kernel_w) * k_loss + float(dyn_w) * d_loss
+    if tot.requires_grad:
+        tot.backward()
+        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 5.0)
+        aux_opt.step()
+    return float(tot.detach().item())
 
 
 def _validate_cache_provenance(provenance: dict, expected: dict, cache_path: str) -> None:
@@ -145,12 +291,13 @@ def _set_edge_only_trainable(module, edge_only: bool):
 
 
 def _set_prestim_only_trainable(module, prestim_only: bool, train_obs_sigma: bool = True):
-    """Freeze all non-prestim parameters for Stage-2 residual spontaneous drift fitting."""
+    """Freeze all non-prestim/non-latent-SSM parameters for Stage-2 fitting."""
     for name, param in module.named_parameters():
         if prestim_only:
             keep = (
                 ("prestim_encoder" in name)
                 or ("prestim_q" in name)
+                or ("latent_ssm" in name)
                 or (train_obs_sigma and "obs_sigma" in name)
             )
             param.requires_grad_(keep)
@@ -226,6 +373,16 @@ def main() -> None:
                         help="Stage-1b decoupled mode: freeze wired connectome/stim/GCaMP and train only extrasyn_gain (+ obs_sigma)")
     parser.add_argument("--prestim-oscillatory", action="store_true",
                         help="Augment CausalPreStimEncoder with strictly causal damped oscillatory latent modes")
+    parser.add_argument("--dimensionless-physiology", action="store_true",
+                        help="Fix leak conductance G=1.0 and sample tau_m=C/G and normalized conductances kappa=g/G")
+    parser.add_argument("--latent-ssm", action="store_true",
+                        help="Enable autonomous discrete-time stochastic LatentNeuralSSM residual")
+    parser.add_argument("--latent-ssm-dim", default=16, type=int,
+                        help="Latent state dimension for LatentNeuralSSM (default: 16)")
+    parser.add_argument("--kernel-loss-weight", default=0.0, type=float,
+                        help="Auxiliary pair-level 1-hop response kernel K_ij(t) loss weight (0 disables)")
+    parser.add_argument("--dynamics-loss-weight", default=0.0, type=float,
+                        help="Auxiliary pair-level 1-hop temporal derivative dK_ij/dt loss weight (0 disables)")
     parser.add_argument("--trial-split", action="store_true", help="Disable recording-level grouping in split")
     parser.add_argument("--seed", default=42, type=int, help="Training RNG seed")
     parser.add_argument("--split-seed", default=42, type=int, help="Fixed data split seed")
@@ -393,6 +550,7 @@ def main() -> None:
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,
         evoked_syn_priors=args.evoked_syn_priors,
+        dimensionless=args.dimensionless_physiology,
         shuffle_seed=args.shuffle_connectome,
     )
     adj_t = torch.as_tensor(
@@ -414,6 +572,8 @@ def main() -> None:
         stim_actuator=args.stim_actuator,
         stim_tau_rise=args.stim_tau_rise,
         stim_tau_decay=args.stim_tau_decay,
+        use_latent_ssm=args.latent_ssm,
+        latent_ssm_dim=args.latent_ssm_dim,
     )
     model = vae.VAElegans(
         rec_model,
@@ -436,8 +596,8 @@ def main() -> None:
     if args.freeze_non_prestim and args.freeze_wired_connectome:
         raise ValueError("--freeze-non-prestim and --freeze-wired-connectome cannot be combined")
     if args.freeze_non_prestim:
-        if not args.use_prestim_encoder:
-            raise ValueError("--freeze-non-prestim requires --use-prestim-encoder")
+        if not (args.use_prestim_encoder or args.latent_ssm):
+            raise ValueError("--freeze-non-prestim requires --use-prestim-encoder or --latent-ssm")
         _set_prestim_only_trainable(model, True)
         n_train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)
@@ -459,6 +619,12 @@ def main() -> None:
 
     optim = pyro.optim.ClippedAdam({"lr": args.lr, "clip_norm": 10.0})
     svi = SVI(model, model.guide, optim, Trace_ELBO())
+    use_aux = (float(args.kernel_loss_weight) > 0.0) or (float(args.dynamics_loss_weight) > 0.0)
+    aux_opt = (
+        torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr * 0.5)
+        if use_aux
+        else None
+    )
 
     n_train_trials = len(train_ds)
     freeze_epochs = max(0, int(args.freeze_nonkinetics_epochs))
@@ -480,6 +646,8 @@ def main() -> None:
                 print("Unfreezing all parameters after edge-only warm start", flush=True)
         t0 = time.time()
         loss = 0.0
+        aux_loss_sum = 0.0
+        n_batches_ep = 0
         scaled_obs_t = torch.zeros((), device=device, dtype=torch.float32)
         for stim, y, mask, noise in train_data:
             stim = stim.to(device, non_blocking=True)
@@ -500,11 +668,19 @@ def main() -> None:
                 dataset_size=n_train_trials,
                 drift_gate=drift_gate,
             )
+            if use_aux and aux_opt is not None:
+                aux_loss_sum += _aux_kernel_step(
+                    model, aux_opt, stim, y, mask, noise, adj_t,
+                    args.pre_vols, args.kernel_loss_weight, args.dynamics_loss_weight, drift_gate=drift_gate,
+                )
+            n_batches_ep += 1
             scaled_obs_t = scaled_obs_t + mask.sum().to(dtype=torch.float32) * scale_factor
         scaled_obs = float(scaled_obs_t.item())
         avg_loss = loss / max(1.0, scaled_obs)
+        avg_aux = aux_loss_sum / max(1, n_batches_ep)
         dt_ep = time.time() - t0
-        print(f"Epoch {epoch:03d} | elbo/obs={avg_loss:.4f} | total_loss={loss:.2f} | dt={dt_ep:.2f}s")
+        aux_str = f" | aux={avg_aux:.5f}" if use_aux else ""
+        print(f"Epoch {epoch:03d} | elbo/obs={avg_loss:.4f} | total_loss={loss:.2f}{aux_str} | dt={dt_ep:.2f}s")
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
             gate_mode = args.drift_gate if args.use_prestim_encoder else "none"
             val_metrics = {}
@@ -534,7 +710,7 @@ def main() -> None:
             _save_snapshot(os.path.join(args.snapshot_dir, f"vae_epoch_{epoch+1}.pt"), model, model.guide, epoch + 1)
             metrics_path = os.path.join(args.snapshot_dir, f"metrics_epoch_{epoch+1}.json")
             with open(metrics_path, "w") as mf:
-                json.dump({"epoch": epoch + 1, "elbo_per_obs": avg_loss,
+                json.dump({"epoch": epoch + 1, "elbo_per_obs": avg_loss, "aux_loss": avg_aux if use_aux else 0.0,
                            "val": val_metrics, "test": test_metrics}, mf, indent=2)
 
 
