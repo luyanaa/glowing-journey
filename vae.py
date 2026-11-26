@@ -208,6 +208,11 @@ class VAEGuide(PyroModule):
         use_extrasynaptic: bool = False,
         extra_dim: int = 0,
         dimensionless: bool = False,
+        split_extrasynaptic: bool = False,
+        np_dim: int = 0,
+        ma_dim: int = 0,
+        use_syn_filter: bool = False,
+        tau_syn_dim: int = 0,
     ):
         super().__init__()
         self.wide_amp_priors = bool(wide_amp_priors)
@@ -226,6 +231,11 @@ class VAEGuide(PyroModule):
         self.variational_prestim = bool(use_prestim_encoder and variational_prestim)
         self.use_extrasynaptic = bool(use_extrasynaptic)
         self.extra_dim = int(extra_dim)
+        self.split_extrasynaptic = bool(split_extrasynaptic)
+        self.np_dim = int(np_dim)
+        self.ma_dim = int(ma_dim)
+        self.use_syn_filter = bool(use_syn_filter)
+        self.tau_syn_dim = int(tau_syn_dim) if int(tau_syn_dim) > 0 else int(wicks_dim)
 
         if e_rev_prior is not None and self.wicks_dim > 0:
             e_prior = torch.as_tensor(e_rev_prior, dtype=torch.float32).detach().clone().reshape(self.wicks_dim)
@@ -301,10 +311,35 @@ class VAEGuide(PyroModule):
             self.register_buffer("_ema_gap_loc", torch.zeros(self.gap_dim))
             self.register_buffer("_ema_gap_scale", torch.ones(self.gap_dim))
 
-        if self.use_extrasynaptic and self.extra_dim > 0:
+        if self.use_extrasynaptic and self.split_extrasynaptic:
+            if self.np_dim > 0:
+                self.extrasyn_np_gain_z = PyroParam(torch.zeros(self.np_dim))
+                self.extrasyn_np_gain_scale = PyroParam(
+                    torch.full((self.np_dim,), 0.0005), constraint=constraints.interval(1e-5, 0.01)
+                )
+                self.tau_np_loc = PyroParam(torch.tensor(math.log(4.0)))
+                self.tau_np_scale = PyroParam(
+                    torch.tensor(0.3), constraint=constraints.interval(1e-3, 1.0)
+                )
+            if self.ma_dim > 0:
+                self.extrasyn_ma_gain_z = PyroParam(torch.zeros(self.ma_dim))
+                self.extrasyn_ma_gain_scale = PyroParam(
+                    torch.full((self.ma_dim,), 0.0005), constraint=constraints.interval(1e-5, 0.01)
+                )
+                self.tau_ma_loc = PyroParam(torch.tensor(math.log(1.0)))
+                self.tau_ma_scale = PyroParam(
+                    torch.tensor(0.3), constraint=constraints.interval(1e-3, 1.0)
+                )
+        elif self.use_extrasynaptic and self.extra_dim > 0:
             self.extrasyn_gain_z = PyroParam(torch.zeros(self.extra_dim))
             self.extrasyn_gain_scale = PyroParam(
                 torch.full((self.extra_dim,), 0.0005), constraint=constraints.interval(1e-5, 0.01)
+            )
+
+        if self.use_syn_filter and self.wicks_dim > 0 and self.tau_syn_dim > 0:
+            self.tau_syn_loc = PyroParam(torch.full((self.tau_syn_dim,), math.log(0.6)))
+            self.tau_syn_scale = PyroParam(
+                torch.full((self.tau_syn_dim,), 0.35), constraint=constraints.interval(1e-3, 1.2)
             )
 
         self.prestim_q = (
@@ -516,13 +551,38 @@ class VAEGuide(PyroModule):
                     "decoder.model.synapse.wicks.v_slope_edge_logdelta",
                     dist.Normal(self.v_slope_edge_loc, self.v_slope_edge_scale).to_event(1),
                 )
+            if self.use_syn_filter and self.tau_syn_dim > 0:
+                pyro.sample(
+                    "decoder.model.synapse.wicks.tau_syn",
+                    dist.LogNormal(self.tau_syn_loc, self.tau_syn_scale).to_event(1),
+                )
 
         if self.gap_dim > 0:
             pyro.sample(
                 "decoder.model.synapse.general.g_syn",
                 dist.LogNormal(gap_loc, gap_scale).to_event(1),
             )
-        if self.use_extrasynaptic and self.extra_dim > 0:
+        if self.use_extrasynaptic and self.split_extrasynaptic:
+            ex_scale = 0.006 if self.dimensionless else 0.003
+            if self.np_dim > 0:
+                pyro.sample(
+                    "decoder.model.synapse.extrasyn_np_gain",
+                    dist.Normal(ex_scale * self.extrasyn_np_gain_z, self.extrasyn_np_gain_scale).to_event(1),
+                )
+                pyro.sample(
+                    "decoder.model.synapse.tau_np",
+                    dist.LogNormal(self.tau_np_loc, self.tau_np_scale),
+                )
+            if self.ma_dim > 0:
+                pyro.sample(
+                    "decoder.model.synapse.extrasyn_ma_gain",
+                    dist.Normal(ex_scale * self.extrasyn_ma_gain_z, self.extrasyn_ma_gain_scale).to_event(1),
+                )
+                pyro.sample(
+                    "decoder.model.synapse.tau_ma",
+                    dist.LogNormal(self.tau_ma_loc, self.tau_ma_scale),
+                )
+        elif self.use_extrasynaptic and self.extra_dim > 0:
             ex_scale = 0.006 if self.dimensionless else 0.003
             pyro.sample(
                 "decoder.model.synapse.extrasyn_gain",
@@ -629,8 +689,15 @@ class VAElegans(PyroModule):
         prestim_rank = int(getattr(model, "prestim_rank", 16))
         variational_prestim = bool(getattr(model, "variational_prestim", False))
         prestim_oscillatory = bool(getattr(model, "prestim_oscillatory", False))
-        use_extrasynaptic = bool(getattr(getattr(getattr(model, "model", None), "synapse", None), "use_extrasynaptic", False))
-        extra_dim = len(getattr(getattr(getattr(model, "model", None), "synapse", None), "Generic_SRC", []))
+        syn_mod = getattr(getattr(model, "model", None), "synapse", None)
+        use_extrasynaptic = bool(getattr(syn_mod, "use_extrasynaptic", False))
+        extra_dim = len(getattr(syn_mod, "Generic_SRC", []))
+        split_extrasynaptic = bool(getattr(syn_mod, "split_extrasynaptic", False))
+        np_dim = len(getattr(syn_mod, "NP_SRC", []))
+        ma_dim = len(getattr(syn_mod, "MA_SRC", []))
+        wicks_mod = getattr(syn_mod, "wicks", None)
+        use_syn_filter = bool(getattr(wicks_mod, "use_syn_filter", False))
+        tau_syn_dim = int(neuron_dim) if (wicks_mod is not None and getattr(wicks_mod, "share_presynaptic", False)) else int(wicks_dim)
         dimensionless = bool(
             getattr(getattr(getattr(getattr(model, "model", None), "Neuron", None), "conductance", None), "dimensionless", False)
         )
@@ -653,6 +720,11 @@ class VAElegans(PyroModule):
             use_extrasynaptic=use_extrasynaptic,
             extra_dim=extra_dim,
             dimensionless=dimensionless,
+            split_extrasynaptic=split_extrasynaptic,
+            np_dim=np_dim,
+            ma_dim=ma_dim,
+            use_syn_filter=use_syn_filter,
+            tau_syn_dim=tau_syn_dim,
         )
         self.decoder = model
         self.neuron_dim = int(neuron_dim)

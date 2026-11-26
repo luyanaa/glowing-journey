@@ -621,6 +621,10 @@ Replaced the TCN batch-averaged global connectome guide with a true non-amortize
      - **`--kernel-loss-weight` / `--dynamics-loss-weight`** (`pyro_svi_vae.py`): Explicit minibatch pair-level 1-hop counterfactual response kernel loss (`K_{ij}(t)`) and temporal derivative loss (`dK_{ij}/dt`).
      - **Flexible context & substeps**: `--pre-vols` and `--post-vols` plumbed cleanly across `pyro_svi_vae.py`, `tools/eval_checkpoint.py`, and `tools/run_nested_protocol.py` for `--substeps 4` + `--pre-vols 40` training.
 
+   - **Phase 5B Extrasynaptic Split & Synaptic Delay Readiness (`0 GPU`, unit-tested locally)**:
+     - **`--split-extrasynaptic`** (`c302.py`, `vae.py`, `pyro_svi_vae.py`, `tools/eval_unc31_knockout.py`): Decouples the `8,717` extrasynaptic union into separate **`edgelist_NP.csv` (`7,035` directed edges, slow timescale `tau_np`, default `4.0 s`)** and **`edgelist_MA.csv` (`1,920` directed edges, `tau_ma`, default `1.0 s`)** pathways (`238` overlapping edges) with independent Stage-1b parameters (`extrasyn_np_gain`, `extrasyn_ma_gain`, `tau_np`, `tau_ma`) and `unc-31` double-dissociation evaluation (`--split-checkpoint`: `full`, `np_zero`, `ma_zero`, `both_zero` scored separately on `np_adj` and `ma_adj`).
+     - **`--syn-filter`** (`c302.py`, `vae.py`, `pyro_svi_vae.py`): Adds per-presynaptic-neuron first-order chemical synaptic low-pass activation filter `tau_syn` (`0.6 s` LogNormal prior) initialized at exact resting equilibrium, generating causal phase lag without shifting baseline equilibrium.
+
    - **Phase 6 (Pre-Study Baseline) — Online Bayesian Parameter Assimilation / Individual-Worm TTT (`tools/eval_online_ttt.py`, Fold-0 `22` worms / `641` trials, Task 4)**:
      - Separate evaluation task (Task 4: cross-trial slow parameter assimilation $\theta_{\text{worm}}$ anchored to `q_pop` on strictly past non-overlapping trials `h_vol + post_vols <= target_vol`, bitwise reset between worms). Must NOT be conflated with Zero-Shot Task 1/3 tables.
 
@@ -723,7 +727,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Repository: `/Users/yanlu/Documents/glowing-journey`
 - v3 experiments correspond to commit `e26d99c`.
 - The v4/v5 per-neuron kinetics, per-edge release, warm-start, and validation-split changes are included in this commit.
-- Regression tests: `pytest -q tests/test_pipeline.py` → **61 passed, 2 skipped**.
+- Regression tests: `pytest -q tests/test_pipeline.py` → **63 passed, 2 skipped**.
 - `utils.ToyoshimaLoader` and `--source toyoshima` are integrated into `pyro_svi_vae.py`; the loader has a synthetic-fixture test and one-recording smoke test (47 trials from sample 1).
 - `--test-size` controls the recording-grouped test fraction; `--dataset-cache` accepts a prebuilt Toyoshima cache.
 - P0 protocol tools: `tools/run_nested_protocol.py` and `tools/eval_checkpoint.py`; `pyro_svi_vae.py --split-file` consumes the generated fold JSON. The gate metric is `evoked_hop1_r2`, now computed from paired counterfactual rollouts.

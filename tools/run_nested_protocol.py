@@ -78,6 +78,8 @@ def main() -> None:
     p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--direct-global-guide", action="store_true")
     p.add_argument("--use-extrasynaptic", action="store_true")
+    p.add_argument("--split-extrasynaptic", action="store_true")
+    p.add_argument("--syn-filter", action="store_true")
     p.add_argument("--freeze-wired-connectome", action="store_true")
     p.add_argument("--prestim-oscillatory", action="store_true")
     p.add_argument("--skip-existing", action="store_true",
@@ -176,6 +178,10 @@ def main() -> None:
                 cmd.append("--direct-global-guide")
             if args.use_extrasynaptic:
                 cmd.append("--use-extrasynaptic")
+            if args.split_extrasynaptic:
+                cmd.append("--split-extrasynaptic")
+            if args.syn_filter:
+                cmd.append("--syn-filter")
             if args.freeze_wired_connectome:
                 cmd.append("--freeze-wired-connectome")
             if args.prestim_oscillatory:
@@ -253,6 +259,10 @@ def main() -> None:
                 eval_cmd.append("--direct-global-guide")
             if args.use_extrasynaptic:
                 eval_cmd.append("--use-extrasynaptic")
+            if args.split_extrasynaptic:
+                eval_cmd.append("--split-extrasynaptic")
+            if args.syn_filter:
+                eval_cmd.append("--syn-filter")
             if args.prestim_oscillatory:
                 eval_cmd.append("--prestim-oscillatory")
             if args.dimensionless_physiology:

@@ -309,7 +309,12 @@ def _set_extrasyn_only_trainable(module, extrasyn_only: bool, train_obs_sigma: b
     """Freeze wired connectome/stim/GCaMP parameters for Stage-1b extrasynaptic fitting."""
     for name, param in module.named_parameters():
         if extrasyn_only:
-            keep = ("extrasyn" in name) or (train_obs_sigma and "obs_sigma" in name)
+            keep = (
+                ("extrasyn" in name)
+                or ("tau_np" in name)
+                or ("tau_ma" in name)
+                or (train_obs_sigma and "obs_sigma" in name)
+            )
             param.requires_grad_(keep)
         else:
             param.requires_grad_(True)
@@ -357,6 +362,10 @@ def main() -> None:
                         help="Use non-amortized PyroParam q(theta_global) and restrict amortization to q_phi(z | y_pre)")
     parser.add_argument("--use-extrasynaptic", action="store_true",
                         help="Enable neuropeptide and monoamine extrasynaptic pathway (edgelist_NP + MA)")
+    parser.add_argument("--split-extrasynaptic", action="store_true",
+                        help="Split edgelist_NP (neuropeptide) and edgelist_MA (monoamine) with separate slow time constants")
+    parser.add_argument("--syn-filter", action="store_true",
+                        help="Enable first-order chemical synaptic low-pass activation filter tau_syn")
     parser.add_argument("--stim-actuator", action="store_true",
                         help="Apply a first-order rise/decay actuator before the membrane")
     parser.add_argument("--stim-tau-rise", default=0.08, type=float)
@@ -543,14 +552,17 @@ def main() -> None:
         num_workers=args.num_workers,
     )
 
+    eff_extrasyn = bool(args.use_extrasynaptic or args.split_extrasynaptic)
     step_model = c302.readConnectome(
         "./data/CElegansNeuronTables.xls",
-        use_extrasynaptic=args.use_extrasynaptic,
+        use_extrasynaptic=eff_extrasyn,
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,
         evoked_syn_priors=args.evoked_syn_priors,
         dimensionless=args.dimensionless_physiology,
+        split_extrasynaptic=args.split_extrasynaptic,
+        use_syn_filter=args.syn_filter,
         shuffle_seed=args.shuffle_connectome,
     )
     adj_t = torch.as_tensor(
@@ -606,8 +618,8 @@ def main() -> None:
             flush=True,
         )
     elif args.freeze_wired_connectome:
-        if not args.use_extrasynaptic:
-            raise ValueError("--freeze-wired-connectome requires --use-extrasynaptic")
+        if not eff_extrasyn:
+            raise ValueError("--freeze-wired-connectome requires --use-extrasynaptic or --split-extrasynaptic")
         _set_extrasyn_only_trainable(model, True)
         n_train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_frozen_p = sum(p.numel() for p in model.parameters() if not p.requires_grad)

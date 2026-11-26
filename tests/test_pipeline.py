@@ -2382,6 +2382,207 @@ def test_online_ttt_latent_ssm_deterministic():
     assert log1["max_whitened_shift"] == log2["max_whitened_shift"]
 
 
+def test_split_np_ma_extrasynaptic_double_dissociation_and_svi():
+    import warnings
+    from pyro_svi_vae import _set_extrasyn_only_trainable
+    from tools.eval_unc31_knockout import _eval_split_knockout_rollout
+
+    # 1. Verify full C. elegans connectome splits NP (7,035) and MA (1,920) cleanly while preserving 8,717 union
+    full_step = c302.readConnectome(
+        "./data/CElegansNeuronTables.xls",
+        use_extrasynaptic=True,
+        split_extrasynaptic=True,
+        dimensionless=True,
+    )
+    assert len(full_step.synapse.NP_SRC) == 7035
+    assert len(full_step.synapse.MA_SRC) == 1920
+    assert len(full_step.synapse.Generic_SRC) == 8717
+    np_adj_full = full_step.synapse.np_adjacency_matrix(full_step.neuronSize)
+    ma_adj_full = full_step.synapse.ma_adjacency_matrix(full_step.neuronSize)
+    assert int(np_adj_full.sum()) == 7035
+    assert int(ma_adj_full.sum()) == 1920
+
+    # 2. Toy circuit: 0 -> 1 via NP only, 0 -> 2 via MA only
+    pyro.clear_param_store()
+    torch.manual_seed(0)
+    syn_list = {
+        "General": ([], [], []),
+        "Wicks": ([0], [3], [1.0], [0.0], [0.01]),
+        "Generic": ([0, 0], [1, 2], [1.0, 1.0]),
+        "NP": ([0], [1], [1.0]),
+        "MA": ([0], [2], [1.0]),
+    }
+    n = 4
+    step = c302.NematodeForStep(
+        n, {}, syn_list,
+        use_extrasynaptic=True, split_extrasynaptic=True, wide_amp_priors=True, dimensionless=True,
+    )
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=4, use_prestim_encoder=False, pre_vols=4)
+    vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+
+    # Check Stage-1b freeze keeps NP/MA gains and slow timescales trainable, freezing wired params
+    _set_extrasyn_only_trainable(vm, True)
+    assert vm.guide.extrasyn_np_gain_z.requires_grad
+    assert vm.guide.extrasyn_ma_gain_z.requires_grad
+    assert vm.guide.tau_np_loc_unconstrained.requires_grad
+    assert vm.guide.tau_ma_loc_unconstrained.requires_grad
+    assert not vm.guide.wicks_g_max_z.requires_grad
+
+    # Unfreeze and run 2 SVI steps with ZERO Pyro site mismatch warnings
+    _set_extrasyn_only_trainable(vm, False)
+    stim = torch.zeros(2, 16, n)
+    stim[:, 4:6, 0] = 1.0
+    y = torch.zeros_like(stim)
+    y[:, 5:, 1] = 0.25
+    y[:, 5:10, 2] = 0.30
+    mask = torch.ones_like(stim, dtype=torch.bool)
+    noise = torch.full((2, n), 0.1)
+
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+        for _ in range(2):
+            loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+            assert np.isfinite(loss)
+    mismatch_w = [str(w.message) for w in w_rec if "Found non-auxiliary vars" in str(w.message) or "not in guide" in str(w.message)]
+    assert not mismatch_w, f"Pyro site mismatch warnings: {mismatch_w}"
+
+    # Verify independent in-silico knockout & slow tau_np peak lag vs faster tau_ma
+    shared_ps = {
+        "decoder.model.Neuron.conductance.E": torch.full((n,), -0.065),
+        "decoder.model.Neuron.conductance.C": torch.full((n,), 0.10),
+        "decoder.model.synapse.wicks.g_max": torch.tensor([0.0]),
+        "decoder.model.synapse.wicks.V_rest": torch.full((n,), -0.042),
+        "decoder.model.synapse.wicks.V_slope": torch.full((n,), 0.015),
+        "decoder.model.synapse.wicks.E_rev": torch.tensor([0.0]),
+        "decoder.model.stim_gain": torch.tensor(3.0),
+        "decoder.model.synapse.extrasyn_np_gain": torch.tensor([0.05]),
+        "decoder.model.synapse.extrasyn_ma_gain": torch.tensor([0.05]),
+        "decoder.model.synapse.tau_np": torch.tensor(6.0),
+        "decoder.model.synapse.tau_ma": torch.tensor(0.5),
+        "decoder.gcamp.v_th_ca_logit": torch.tensor(0.0),
+        "decoder.gcamp.v_slope_ca": torch.tensor(0.015),
+        "decoder.gcamp.alpha_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_on": torch.tensor(0.5),
+        "decoder.gcamp.tau_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_off": torch.tensor(0.1),
+        "decoder.gcamp.gain": torch.ones(n),
+        "decoder.gcamp.offset": torch.zeros(n),
+    }
+    stim_long = torch.zeros(1, 30, n)
+    stim_long[:, 4:7, 0] = 1.0
+    with torch.no_grad():
+        y_full = pyro.condition(vm, data=shared_ps)(ExternalInput=stim_long, sample_obs=False)
+        y_np_z = pyro.condition(
+            vm, data={**shared_ps, "decoder.model.synapse.extrasyn_np_gain": torch.tensor([0.0])}
+        )(ExternalInput=stim_long, sample_obs=False)
+        y_ma_z = pyro.condition(
+            vm, data={**shared_ps, "decoder.model.synapse.extrasyn_ma_gain": torch.tensor([0.0])}
+        )(ExternalInput=stim_long, sample_obs=False)
+
+    # Zeroing NP eliminates neuron 1 response while leaving neuron 2 unchanged; zeroing MA reverses it
+    assert float((y_np_z[:, :, 1] - y_np_z[:, 0:1, 1]).abs().max()) < 1e-6
+    assert float((y_np_z[:, :, 2] - y_full[:, :, 2]).abs().max()) < 1e-6
+    assert float((y_ma_z[:, :, 2] - y_ma_z[:, 0:1, 2]).abs().max()) < 1e-6
+    assert float((y_ma_z[:, :, 1] - y_full[:, :, 1]).abs().max()) < 1e-6
+    # Slower tau_np (6.0s) peaks strictly later than faster tau_ma (0.5s)
+    peak_np = int(torch.argmax(y_full[0, 4:, 1]))
+    peak_ma = int(torch.argmax(y_full[0, 4:, 2]))
+    assert peak_np > peak_ma
+
+    # Verify _eval_split_knockout_rollout helper runs cleanly on dataloader
+    dl = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(stim, y, mask, noise), batch_size=2, shuffle=False
+    )
+    adj_4 = step.synapse.adjacency_matrix(n)
+    np_4 = step.synapse.np_adjacency_matrix(n)
+    ma_4 = step.synapse.ma_adjacency_matrix(n)
+    res_split = _eval_split_knockout_rollout(vm, dl, adj_4, np_4, ma_4, pre_vols=4, num_samples=2, zero_np=True)
+    assert np.isfinite(res_split["post_inlier_r2"])
+
+
+def test_synaptic_lowpass_filter_phase_lag_and_svi():
+    import warnings
+    from pyro_svi_c302 import evaluate_predictions
+    from tools.eval_online_ttt import adapt_worm_posterior
+
+    pyro.clear_param_store()
+    torch.manual_seed(0)
+    tiny_syn = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    n = 3
+    step_inst = c302.NematodeForStep(n, {}, tiny_syn, wide_amp_priors=True, dimensionless=True, use_syn_filter=False)
+    step_filt = c302.NematodeForStep(n, {}, tiny_syn, wide_amp_priors=True, dimensionless=True, use_syn_filter=True)
+    rec_inst = c302.RecurrentNematode(step_inst, dt_obs=0.5, substeps=4, pre_vols=6)
+    rec_filt = c302.RecurrentNematode(step_filt, dt_obs=0.5, substeps=4, pre_vols=6)
+    vm_inst = vae.VAElegans(rec_inst, n, 1, 0, direct_global_guide=True)
+    vm_filt = vae.VAElegans(rec_filt, n, 1, 0, direct_global_guide=True)
+
+    ps_base = {
+        "decoder.model.Neuron.conductance.E": torch.full((n,), -0.065),
+        "decoder.model.Neuron.conductance.C": torch.full((n,), 0.10),
+        "decoder.model.synapse.wicks.g_max": torch.tensor([0.15]),
+        "decoder.model.synapse.wicks.V_rest": torch.full((n,), -0.042),
+        "decoder.model.synapse.wicks.V_slope": torch.full((n,), 0.015),
+        "decoder.model.synapse.wicks.E_rev": torch.tensor([0.0]),
+        "decoder.model.stim_gain": torch.tensor(3.0),
+        "decoder.gcamp.v_th_ca_logit": torch.tensor(0.0),
+        "decoder.gcamp.v_slope_ca": torch.tensor(0.015),
+        "decoder.gcamp.alpha_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_on": torch.tensor(0.5),
+        "decoder.gcamp.tau_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_off": torch.tensor(0.1),
+        "decoder.gcamp.gain": torch.ones(n),
+        "decoder.gcamp.offset": torch.zeros(n),
+    }
+
+    # Resting equilibrium must remain exact regardless of tau_syn
+    stim_zero = torch.zeros(1, 20, n)
+    with torch.no_grad():
+        y0_inst = pyro.condition(vm_inst, data=ps_base)(ExternalInput=stim_zero, sample_obs=False)
+        y0_slow = pyro.condition(
+            vm_filt, data={**ps_base, "decoder.model.synapse.wicks.tau_syn": torch.full((n,), 5.0)}
+        )(ExternalInput=stim_zero, sample_obs=False)
+    assert float((y0_inst - y0_slow).abs().max()) < 1e-6
+
+    # Slow tau_syn must systematically delay downstream peak latency vs instantaneous release
+    stim = torch.zeros(1, 30, n)
+    stim[:, 6:9, 0] = 1.0
+    with torch.no_grad():
+        y_fast = pyro.condition(vm_inst, data=ps_base)(ExternalInput=stim, sample_obs=False)
+        y_slow = pyro.condition(
+            vm_filt, data={**ps_base, "decoder.model.synapse.wicks.tau_syn": torch.full((n,), 4.0)}
+        )(ExternalInput=stim, sample_obs=False)
+    peak_fast = int(torch.argmax(y_fast[0, 6:, 1]))
+    peak_slow = int(torch.argmax(y_slow[0, 6:, 1]))
+    assert peak_slow > peak_fast
+
+    # End-to-end SVI + evaluate_predictions + Phase 6 TTT with zero Pyro warnings
+    stim_b = stim.expand(2, -1, -1).clone()
+    y_b = torch.randn(2, 30, n) * 0.1
+    mask_b = torch.ones_like(y_b, dtype=torch.bool)
+    noise_b = torch.full((2, n), 0.1)
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        svi = SVI(vm_filt, vm_filt.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+        for _ in range(2):
+            loss = svi.step(ExternalInput=stim_b, mask=mask_b, y=y_b, noise_scale=noise_b)
+            assert np.isfinite(loss)
+    mismatch_w = [str(w.message) for w in w_rec if "Found non-auxiliary vars" in str(w.message) or "not in guide" in str(w.message)]
+    assert not mismatch_w, f"Pyro site mismatch warnings: {mismatch_w}"
+
+    dl = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(stim_b, y_b, mask_b, noise_b), batch_size=2, shuffle=False
+    )
+    ev = evaluate_predictions(vm_filt, dl, torch.device("cpu"), guide=vm_filt.guide, num_samples=2, pre_vols=6)
+    assert np.isfinite(ev["r2"])
+    ttt_log = adapt_worm_posterior(vm_filt, stim_b, y_b, mask_b, noise_b, tier="tier1", ttt_steps=2, pre_vols=6)
+    assert np.isfinite(ttt_log["loss_end"])
+
+
 def test_all_python_modules_compile():
     for fname in [
         "c302.py",

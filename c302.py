@@ -353,6 +353,7 @@ class WicksSynapse(PyroModule):
         wide_amp_priors: bool = False,
         evoked_syn_priors: bool = False,
         cond_scale: float = 1.0,
+        use_syn_filter: bool = False,
     ):
         super().__init__()
         src = np.asarray(synapseInput, dtype=np.int64).reshape(-1)
@@ -365,6 +366,7 @@ class WicksSynapse(PyroModule):
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
         self.cond_scale = float(cond_scale)
+        self.use_syn_filter = bool(use_syn_filter)
         self.register_buffer("synapseInput", torch.as_tensor(src, dtype=torch.long))
         self.register_buffer("synapseOutput", torch.as_tensor(dst, dtype=torch.long))
         self.register_buffer("synapseWeight", torch.as_tensor(w, dtype=torch.float32))
@@ -422,6 +424,13 @@ class WicksSynapse(PyroModule):
             else:
                 self.register_buffer("v_rest_edge_delta", torch.empty(0, dtype=torch.float32))
                 self.register_buffer("v_slope_edge_logdelta", torch.empty(0, dtype=torch.float32))
+            if self.use_syn_filter:
+                # Per-presynaptic-neuron chemical vesicle/receptor first-order filter tau_syn (s)
+                self.tau_syn = _sample_lognormal(
+                    self, math.log(0.6), 0.7, shape=(pre_param_dim,), to_event=1
+                )
+            else:
+                self.register_buffer("tau_syn", torch.empty(0, dtype=torch.float32))
         else:
             self.register_buffer("g_max", torch.empty(0, dtype=torch.float32))
             self.register_buffer("V_rest", torch.empty(0, dtype=torch.float32))
@@ -429,6 +438,7 @@ class WicksSynapse(PyroModule):
             self.register_buffer("E_rev", torch.empty(0, dtype=torch.float32))
             self.register_buffer("v_rest_edge_delta", torch.empty(0, dtype=torch.float32))
             self.register_buffer("v_slope_edge_logdelta", torch.empty(0, dtype=torch.float32))
+            self.register_buffer("tau_syn", torch.empty(0, dtype=torch.float32))
 
     def build_weight_matrices(
         self, n_neurons: int, device: torch.device, dtype: torch.dtype
@@ -450,6 +460,7 @@ class WicksSynapse(PyroModule):
         self,
         inputSignal: torch.Tensor,
         cached: Optional[Tuple[torch.Tensor, ...]] = None,
+        pre_act: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (synaptic_drive_current, postsynaptic_conductance_sum) for semi-implicit integration."""
         if self.inputSize == 0:
@@ -464,28 +475,31 @@ class WicksSynapse(PyroModule):
             )
             if len(mats) >= 5 and mats[4] is not None:
                 v_rest, v_slope, w_both = mats[2], mats[3], mats[4]
-                act = torch.sigmoid((inputSignal - v_rest) / v_slope)
+                act = pre_act if pre_act is not None else torch.sigmoid((inputSignal - v_rest) / v_slope)
                 return (act @ w_both).chunk(2, dim=-1)
             w_drive, w_cond, v_rest, v_slope = mats[:4]
-            act = torch.sigmoid((inputSignal - v_rest) / v_slope)
+            act = pre_act if pre_act is not None else torch.sigmoid((inputSignal - v_rest) / v_slope)
             return act @ w_drive, act @ w_cond
 
         drive = torch.zeros_like(inputSignal)
         cond = torch.zeros_like(inputSignal)
         dim = 0 if inputSignal.dim() == 1 else 1
-        pre_v = torch.index_select(inputSignal, dim, self.synapseInput)
-        if self.per_edge_release:
-            v_rest = self.V_rest[self.synapseInput] + self.v_rest_edge_delta
-            slope = torch.clamp(
-                self.V_slope[self.synapseInput] * torch.exp(self.v_slope_edge_logdelta),
-                min=1e-3,
-            )
+        if pre_act is not None:
+            act = pre_act
         else:
-            v_rest = self.V_rest
-            slope = torch.clamp(self.V_slope, min=1e-3)
+            pre_v = torch.index_select(inputSignal, dim, self.synapseInput)
+            if self.per_edge_release:
+                v_rest = self.V_rest[self.synapseInput] + self.v_rest_edge_delta
+                slope = torch.clamp(
+                    self.V_slope[self.synapseInput] * torch.exp(self.v_slope_edge_logdelta),
+                    min=1e-3,
+                )
+            else:
+                v_rest = self.V_rest
+                slope = torch.clamp(self.V_slope, min=1e-3)
+            act = torch.sigmoid((pre_v - v_rest) / slope)
         g = torch.clamp(self.g_max, min=0.0)
         e_rev = torch.clamp(self.E_rev, min=-0.095, max=0.030)
-        act = torch.sigmoid((pre_v - v_rest) / slope)
         g_eff = g * self.synapseWeight * act
         drive.index_add_(dim, self.synapseOutput, g_eff * e_rev)
         cond.index_add_(dim, self.synapseOutput, g_eff)
@@ -540,7 +554,7 @@ class RecurrentSynapse(PyroModule):
 
 
 class synapseLayer(PyroModule):
-    """Aggregates chemical (Wicks) and electrical (gap junction) synaptic currents."""
+    """Aggregates chemical (Wicks), electrical (gap junction), and extrasynaptic (NP/MA) currents."""
 
     def __init__(
         self,
@@ -551,12 +565,16 @@ class synapseLayer(PyroModule):
         wide_amp_priors: bool = False,
         evoked_syn_priors: bool = False,
         dimensionless: bool = False,
+        split_extrasynaptic: bool = False,
+        use_syn_filter: bool = False,
     ):
         super().__init__()
         self.per_edge_release = bool(per_edge_release)
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
         self.dimensionless = bool(dimensionless)
+        self.split_extrasynaptic = bool(split_extrasynaptic)
+        self.use_syn_filter = bool(use_syn_filter)
         cond_scale = 2.0 if self.dimensionless else 1.0
         wicks_tuple = synapseList["Wicks"]
         self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight = wicks_tuple[:3]
@@ -564,7 +582,9 @@ class synapseLayer(PyroModule):
         e_rev_scale = wicks_tuple[4] if len(wicks_tuple) > 4 else None
 
         self.Gap_Junction_SRC, self.Gap_Junction_DST, self.Gap_Junction_Weight = synapseList["General"]
-        self.Generic_SRC, self.Generic_DST, self.Generic_Weight = synapseList["Generic"]
+        self.Generic_SRC, self.Generic_DST, self.Generic_Weight = synapseList.get("Generic", ([], [], []))
+        self.NP_SRC, self.NP_DST, self.NP_Weight = synapseList.get("NP", ([], [], []))
+        self.MA_SRC, self.MA_DST, self.MA_Weight = synapseList.get("MA", ([], [], []))
         self.neuron_size = neuron_size
 
         self.wicks = WicksSynapse(
@@ -578,6 +598,7 @@ class synapseLayer(PyroModule):
             wide_amp_priors=wide_amp_priors,
             evoked_syn_priors=evoked_syn_priors,
             cond_scale=cond_scale,
+            use_syn_filter=self.use_syn_filter,
         )
         self.general = GeneralSynapse(
             self.Gap_Junction_SRC,
@@ -587,7 +608,22 @@ class synapseLayer(PyroModule):
         )
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         self.use_extrasynaptic = bool(use_extrasynaptic)
-        if self.use_extrasynaptic and len(self.Generic_SRC) > 0:
+        if self.use_extrasynaptic and self.split_extrasynaptic:
+            if len(self.NP_SRC) > 0:
+                self.extrasyn_np_gain = _sample_normal(
+                    self, 0.0, 0.0025 * cond_scale, shape=(len(self.NP_SRC),), to_event=1
+                )
+                self.tau_np = _sample_lognormal(self, math.log(4.0), 0.5)
+                self.register_buffer("np_src_t", torch.as_tensor(self.NP_SRC, dtype=torch.long))
+                self.register_buffer("np_dst_t", torch.as_tensor(self.NP_DST, dtype=torch.long))
+            if len(self.MA_SRC) > 0:
+                self.extrasyn_ma_gain = _sample_normal(
+                    self, 0.0, 0.0025 * cond_scale, shape=(len(self.MA_SRC),), to_event=1
+                )
+                self.tau_ma = _sample_lognormal(self, math.log(1.0), 0.5)
+                self.register_buffer("ma_src_t", torch.as_tensor(self.MA_SRC, dtype=torch.long))
+                self.register_buffer("ma_dst_t", torch.as_tensor(self.MA_DST, dtype=torch.long))
+        elif self.use_extrasynaptic and len(self.Generic_SRC) > 0:
             self.extrasyn_gain = _sample_normal(
                 self, 0.0, 0.0025 * cond_scale, shape=(len(self.Generic_SRC),), to_event=1
             )
@@ -595,11 +631,32 @@ class synapseLayer(PyroModule):
             self.register_buffer("generic_dst_t", torch.as_tensor(self.Generic_DST, dtype=torch.long))
 
     def build_step_cache(
-        self, n_neurons: int, device: torch.device, dtype: torch.dtype
+        self, n_neurons: int, device: torch.device, dtype: torch.dtype, dt: float = timeStep
     ) -> dict:
-        """Build per-rollout dense (N, N) synaptic matrices once instead of per ODE substep."""
+        """Build per-rollout dense (N, N) synaptic matrices and filter decays once per rollout."""
         w_extra = None
-        if self.use_extrasynaptic and len(self.Generic_SRC) > 0:
+        w_extra_np = None
+        w_extra_ma = None
+        alpha_np = None
+        alpha_ma = None
+        if self.use_extrasynaptic and self.split_extrasynaptic:
+            if len(self.NP_SRC) > 0:
+                w_extra_np = torch.zeros((n_neurons, n_neurons), device=device, dtype=dtype).index_put(
+                    (self.np_src_t, self.np_dst_t),
+                    self.extrasyn_np_gain.to(dtype=dtype),
+                    accumulate=True,
+                )
+                tau_np = torch.clamp(self.tau_np.to(device=device, dtype=dtype), min=0.05, max=30.0)
+                alpha_np = torch.exp(-float(dt) / tau_np)
+            if len(self.MA_SRC) > 0:
+                w_extra_ma = torch.zeros((n_neurons, n_neurons), device=device, dtype=dtype).index_put(
+                    (self.ma_src_t, self.ma_dst_t),
+                    self.extrasyn_ma_gain.to(dtype=dtype),
+                    accumulate=True,
+                )
+                tau_ma = torch.clamp(self.tau_ma.to(device=device, dtype=dtype), min=0.05, max=30.0)
+                alpha_ma = torch.exp(-float(dt) / tau_ma)
+        elif self.use_extrasynaptic and len(self.Generic_SRC) > 0:
             w_extra = torch.zeros((n_neurons, n_neurons), device=device, dtype=dtype).index_put(
                 (self.generic_src_t, self.generic_dst_t),
                 self.extrasyn_gain.to(dtype=dtype),
@@ -608,22 +665,140 @@ class synapseLayer(PyroModule):
         wicks_mats = self.wicks.build_weight_matrices(n_neurons, device, dtype)
         if wicks_mats is not None:
             wicks_mats = (*wicks_mats, torch.cat([wicks_mats[0], wicks_mats[1]], dim=1))
+        alpha_syn = None
+        if self.use_syn_filter and self.wicks.inputSize > 0:
+            tau_syn = torch.clamp(self.wicks.tau_syn.to(device=device, dtype=dtype), min=0.02, max=15.0)
+            alpha_syn = torch.exp(-float(dt) / tau_syn)
         return {
             "wicks": wicks_mats,
             "general": self.general.build_weight_matrix(n_neurons, device, dtype),
             "extra": w_extra,
+            "extra_np": w_extra_np,
+            "extra_ma": w_extra_ma,
+            "alpha_np": alpha_np,
+            "alpha_ma": alpha_ma,
+            "alpha_syn": alpha_syn,
         }
 
+    def init_syn_states(
+        self, v_rest_eq: torch.Tensor, syn_cache: Optional[dict] = None
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Initialize slow chemical/NP/MA filter states at exact coupled resting equilibrium."""
+        states: Dict[str, torch.Tensor] = {}
+        if self.use_syn_filter and self.wicks.inputSize > 0:
+            w_mats = None if syn_cache is None else syn_cache.get("wicks")
+            if w_mats is not None and self.wicks.share_presynaptic and not self.wicks.per_edge_release:
+                v_rest, v_slope = w_mats[2], w_mats[3]
+                states["chem"] = torch.sigmoid((v_rest_eq - v_rest) / v_slope)
+            elif self.wicks.share_presynaptic and not self.wicks.per_edge_release:
+                v_rest = self.wicks.V_rest.to(device=v_rest_eq.device, dtype=v_rest_eq.dtype)
+                v_slope = torch.clamp(self.wicks.V_slope, min=1e-3).to(device=v_rest_eq.device, dtype=v_rest_eq.dtype)
+                states["chem"] = torch.sigmoid((v_rest_eq - v_rest) / v_slope)
+            else:
+                dim = 0 if v_rest_eq.dim() == 1 else 1
+                pre_v = torch.index_select(v_rest_eq, dim, self.wicks.synapseInput)
+                if self.wicks.per_edge_release:
+                    vr = self.wicks.V_rest[self.wicks.synapseInput] + self.wicks.v_rest_edge_delta
+                    vs = torch.clamp(
+                        self.wicks.V_slope[self.wicks.synapseInput] * torch.exp(self.wicks.v_slope_edge_logdelta),
+                        min=1e-3,
+                    )
+                else:
+                    vr = self.wicks.V_rest
+                    vs = torch.clamp(self.wicks.V_slope, min=1e-3)
+                states["chem"] = torch.sigmoid((pre_v - vr.to(dtype=v_rest_eq.dtype)) / vs.to(dtype=v_rest_eq.dtype))
+        if self.use_extrasynaptic and self.split_extrasynaptic:
+            mod_eq = torch.sigmoid((v_rest_eq + 0.042) / 0.012)
+            if len(self.NP_SRC) > 0:
+                states["np"] = mod_eq
+            if len(self.MA_SRC) > 0:
+                states["ma"] = mod_eq
+        return states if states else None
+
     def forward_terms(
-        self, inputSignal: torch.Tensor, syn_cache: Optional[dict] = None
+        self,
+        inputSignal: torch.Tensor,
+        syn_cache: Optional[dict] = None,
+        syn_states: Optional[Dict[str, torch.Tensor]] = None,
+        dt: float = timeStep,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         wicks_cache = None if syn_cache is None else syn_cache.get("wicks")
         gen_cache = None if syn_cache is None else syn_cache.get("general")
-        drive_w, cond_w = self.wicks.forward_terms(inputSignal, cached=wicks_cache)
+
+        pre_act = None
+        if self.use_syn_filter and self.wicks.inputSize > 0 and syn_states is not None and "chem" in syn_states:
+            alpha_syn = None if syn_cache is None else syn_cache.get("alpha_syn")
+            if alpha_syn is None:
+                tau_syn = torch.clamp(
+                    self.wicks.tau_syn.to(device=inputSignal.device, dtype=inputSignal.dtype),
+                    min=0.02, max=15.0,
+                )
+                alpha_syn = torch.exp(-float(dt) / tau_syn)
+            if self.wicks.share_presynaptic and not self.wicks.per_edge_release:
+                if wicks_cache is not None:
+                    v_rest, v_slope = wicks_cache[2], wicks_cache[3]
+                else:
+                    v_rest = self.wicks.V_rest.to(dtype=inputSignal.dtype)
+                    v_slope = torch.clamp(self.wicks.V_slope, min=1e-3).to(dtype=inputSignal.dtype)
+                act_inst = torch.sigmoid((inputSignal - v_rest) / v_slope)
+            else:
+                dim = 0 if inputSignal.dim() == 1 else 1
+                pre_v = torch.index_select(inputSignal, dim, self.wicks.synapseInput)
+                if self.wicks.per_edge_release:
+                    v_rest = self.wicks.V_rest[self.wicks.synapseInput] + self.wicks.v_rest_edge_delta
+                    v_slope = torch.clamp(
+                        self.wicks.V_slope[self.wicks.synapseInput] * torch.exp(self.wicks.v_slope_edge_logdelta),
+                        min=1e-3,
+                    )
+                else:
+                    v_rest = self.wicks.V_rest
+                    v_slope = torch.clamp(self.wicks.V_slope, min=1e-3)
+                act_inst = torch.sigmoid((pre_v - v_rest.to(dtype=inputSignal.dtype)) / v_slope.to(dtype=inputSignal.dtype))
+                if self.wicks.share_presynaptic and alpha_syn.numel() != act_inst.shape[-1]:
+                    alpha_syn = alpha_syn[self.wicks.synapseInput]
+            pre_act = alpha_syn * syn_states["chem"] + (1.0 - alpha_syn) * act_inst
+            syn_states["chem"] = pre_act
+
+        drive_w, cond_w = self.wicks.forward_terms(inputSignal, cached=wicks_cache, pre_act=pre_act)
         drive_g, cond_g = self.general.forward_terms(inputSignal, cached=gen_cache)
         drive = drive_w + drive_g
         cond = cond_w + cond_g
-        if self.use_extrasynaptic and len(self.Generic_SRC) > 0:
+
+        if self.use_extrasynaptic and self.split_extrasynaptic:
+            mod_inst = torch.sigmoid((inputSignal + 0.042) / 0.012)
+            if len(self.NP_SRC) > 0:
+                if syn_states is not None and "np" in syn_states:
+                    alpha_np = None if syn_cache is None else syn_cache.get("alpha_np")
+                    if alpha_np is None:
+                        tau_np = torch.clamp(self.tau_np.to(device=inputSignal.device, dtype=inputSignal.dtype), min=0.05, max=30.0)
+                        alpha_np = torch.exp(-float(dt) / tau_np)
+                    s_np = alpha_np * syn_states["np"] + (1.0 - alpha_np) * mod_inst
+                    syn_states["np"] = s_np
+                else:
+                    s_np = mod_inst
+                w_np = None if syn_cache is None else syn_cache.get("extra_np")
+                if w_np is not None:
+                    drive = drive + s_np @ w_np
+                else:
+                    dim = 0 if s_np.dim() == 1 else 1
+                    drive.index_add_(dim, self.np_dst_t, self.extrasyn_np_gain * torch.index_select(s_np, dim, self.np_src_t))
+            if len(self.MA_SRC) > 0:
+                if syn_states is not None and "ma" in syn_states:
+                    alpha_ma = None if syn_cache is None else syn_cache.get("alpha_ma")
+                    if alpha_ma is None:
+                        tau_ma = torch.clamp(self.tau_ma.to(device=inputSignal.device, dtype=inputSignal.dtype), min=0.05, max=30.0)
+                        alpha_ma = torch.exp(-float(dt) / tau_ma)
+                    s_ma = alpha_ma * syn_states["ma"] + (1.0 - alpha_ma) * mod_inst
+                    syn_states["ma"] = s_ma
+                else:
+                    s_ma = mod_inst
+                w_ma = None if syn_cache is None else syn_cache.get("extra_ma")
+                if w_ma is not None:
+                    drive = drive + s_ma @ w_ma
+                else:
+                    dim = 0 if s_ma.dim() == 1 else 1
+                    drive.index_add_(dim, self.ma_dst_t, self.extrasyn_ma_gain * torch.index_select(s_ma, dim, self.ma_src_t))
+        elif self.use_extrasynaptic and len(self.Generic_SRC) > 0:
             w_extra = None if syn_cache is None else syn_cache.get("extra")
             if w_extra is not None:
                 drive = drive + torch.sigmoid((inputSignal + 0.042) / 0.012) @ w_extra
@@ -651,8 +826,24 @@ class synapseLayer(PyroModule):
         np.fill_diagonal(adj, False)
         return adj
 
+    def np_adjacency_matrix(self, neuron_size: int) -> np.ndarray:
+        """Return boolean (N, N) adjacency A_np[src, dst] for neuropeptide (NP) links only."""
+        adj = np.zeros((neuron_size, neuron_size), dtype=bool)
+        if len(self.NP_SRC) > 0:
+            adj[np.asarray(self.NP_SRC, dtype=np.int64), np.asarray(self.NP_DST, dtype=np.int64)] = True
+        np.fill_diagonal(adj, False)
+        return adj
+
+    def ma_adjacency_matrix(self, neuron_size: int) -> np.ndarray:
+        """Return boolean (N, N) adjacency A_ma[src, dst] for monoamine (MA) links only."""
+        adj = np.zeros((neuron_size, neuron_size), dtype=bool)
+        if len(self.MA_SRC) > 0:
+            adj[np.asarray(self.MA_SRC, dtype=np.int64), np.asarray(self.MA_DST, dtype=np.int64)] = True
+        np.fill_diagonal(adj, False)
+        return adj
+
     def extrasynaptic_adjacency_matrix(self, neuron_size: int) -> np.ndarray:
-        """Return boolean (N, N) adjacency A_np[src, dst] for extrasynaptic NP/MA links."""
+        """Return boolean (N, N) adjacency A_extra[src, dst] for extrasynaptic NP/MA links."""
         adj = np.zeros((neuron_size, neuron_size), dtype=bool)
         if len(self.Generic_SRC) > 0:
             adj[np.asarray(self.Generic_SRC, dtype=np.int64), np.asarray(self.Generic_DST, dtype=np.int64)] = True
@@ -1266,6 +1457,8 @@ class NematodeForStep(PyroModule):
         wide_amp_priors: bool = False,
         evoked_syn_priors: bool = False,
         dimensionless: bool = False,
+        split_extrasynaptic: bool = False,
+        use_syn_filter: bool = False,
     ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
@@ -1274,6 +1467,8 @@ class NematodeForStep(PyroModule):
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
         self.dimensionless = bool(dimensionless)
+        self.split_extrasynaptic = bool(split_extrasynaptic)
+        self.use_syn_filter = bool(use_syn_filter)
         cond_scale = 2.0 if self.dimensionless else 1.0
         self.Neuron = neuronLayer(neuronSize, NeuronList, dimensionless=self.dimensionless)
         self.synapse = synapseLayer(
@@ -1284,6 +1479,8 @@ class NematodeForStep(PyroModule):
             wide_amp_priors=wide_amp_priors,
             evoked_syn_priors=evoked_syn_priors,
             dimensionless=self.dimensionless,
+            split_extrasynaptic=self.split_extrasynaptic,
+            use_syn_filter=self.use_syn_filter,
         )
         # Optogenetic Chrimson cation-channel conductance (nS, or dimensionless kappa=g/G when dimensionless=True)
         self.stim_e_rev = 0.0
@@ -1312,8 +1509,11 @@ class NematodeForStep(PyroModule):
         BackgroundCurrent: Optional[torch.Tensor] = None,
         neuron_cache: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
         stim_gain_cached: Optional[torch.Tensor] = None,
+        syn_states: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        drive_cur, syn_cond = self.synapse.forward_terms(Prev, syn_cache=syn_cache)
+        drive_cur, syn_cond = self.synapse.forward_terms(
+            Prev, syn_cache=syn_cache, syn_states=syn_states, dt=dt
+        )
         if self.bnn_residual is not None:
             drive_cur = drive_cur + self.bnn_residual(Prev)
         if ExternalInput is None:
@@ -1507,7 +1707,7 @@ class RecurrentNematode(PyroModule):
 
         sensory_states: Dict[str, object] = {}
         syn_cache = (
-            self.model.synapse.build_step_cache(n_neurons, stim_input.device, stim_input.dtype)
+            self.model.synapse.build_step_cache(n_neurons, stim_input.device, stim_input.dtype, dt=dt_sim)
             if (use_step_cache and hasattr(self.model, "synapse") and hasattr(self.model.synapse, "build_step_cache"))
             else None
         )
@@ -1522,6 +1722,11 @@ class RecurrentNematode(PyroModule):
         for _ in range(settle_steps):
             v_settle = self.model(v_settle, **step_kwargs)
         v = v_settle if has_sensory else v_settle.expand(batch_size, n_neurons)
+        syn_states = (
+            self.model.synapse.init_syn_states(v, syn_cache=syn_cache)
+            if (hasattr(self.model, "synapse") and hasattr(self.model.synapse, "init_syn_states"))
+            else None
+        )
 
         gcamp_cache = self.gcamp.build_step_cache(dt=dt_sim) if use_step_cache else None
         v_th_ca = gcamp_cache[0] if gcamp_cache is not None else self.gcamp.v_th_ca
@@ -1642,6 +1847,7 @@ class RecurrentNematode(PyroModule):
                     sensory_states=sensory_states,
                     syn_cache=syn_cache,
                     BackgroundCurrent=bg_cur,
+                    syn_states=syn_states,
                     **call_cache,
                 )
                 ca, b = self.gcamp.step(v, ca, b, dt=dt_sim, v_th_ca=v_th_ca, cached=gcamp_cache)
@@ -1878,6 +2084,8 @@ def readConnectome(
     wide_amp_priors: bool = False,
     evoked_syn_priors: bool = False,
     dimensionless: bool = False,
+    split_extrasynaptic: bool = False,
+    use_syn_filter: bool = False,
     aconnectome_ids_path: str = "./pumpprobe/pumpprobe/aconnectome_ids.txt",
     edgelist_path: str = "./data/herm_full_edgelist.csv",
     np_path: str = "./data/edgelist_NP.csv",
@@ -1947,21 +2155,30 @@ def readConnectome(
             wicks_erev_loc.append(loc_v)
             wicks_erev_scale.append(scale_v)
 
-    neuropeptide = pd.read_csv(np_path, header=None)[[0, 1]]
-    monoamine = pd.read_csv(ma_path, header=None)[[0, 1]]
-    extrasynaptic = pd.concat([neuropeptide, monoamine], ignore_index=True).drop_duplicates()
+    neuropeptide = pd.read_csv(np_path, header=None)[[0, 1]].drop_duplicates()
+    monoamine = pd.read_csv(ma_path, header=None)[[0, 1]].drop_duplicates()
 
-    for _, row in extrasynaptic.iterrows():
-        origin = _normalize_neuron_name(row[0])
-        target = _normalize_neuron_name(row[1])
-        if origin in name_to_idx and target in name_to_idx:
-            src_idx = name_to_idx[origin]
-            dst_idx = name_to_idx[target]
-            if src_idx == dst_idx:
-                continue
-            generic_src.append(src_idx)
-            generic_dst.append(dst_idx)
-            generic_w.append(1.0)
+    def _df_to_edges(df_pairs):
+        e_src, e_dst, e_w = [], [], []
+        seen = set()
+        for _, row in df_pairs.iterrows():
+            origin = _normalize_neuron_name(row[0])
+            target = _normalize_neuron_name(row[1])
+            if origin in name_to_idx and target in name_to_idx:
+                src_idx = name_to_idx[origin]
+                dst_idx = name_to_idx[target]
+                if src_idx == dst_idx or (src_idx, dst_idx) in seen:
+                    continue
+                seen.add((src_idx, dst_idx))
+                e_src.append(src_idx)
+                e_dst.append(dst_idx)
+                e_w.append(1.0)
+        return e_src, e_dst, e_w
+
+    np_src, np_dst, np_w = _df_to_edges(neuropeptide)
+    ma_src, ma_dst, ma_w = _df_to_edges(monoamine)
+    extrasynaptic = pd.concat([neuropeptide, monoamine], ignore_index=True).drop_duplicates()
+    generic_src, generic_dst, generic_w = _df_to_edges(extrasynaptic)
 
     if shuffle_seed is not None:
         rng = np.random.default_rng(int(shuffle_seed))
@@ -1972,6 +2189,10 @@ def readConnectome(
         wicks_dst = [int(perm[i]) for i in wicks_dst]
         generic_src = [int(perm[i]) for i in generic_src]
         generic_dst = [int(perm[i]) for i in generic_dst]
+        np_src = [int(perm[i]) for i in np_src]
+        np_dst = [int(perm[i]) for i in np_dst]
+        ma_src = [int(perm[i]) for i in ma_src]
+        ma_dst = [int(perm[i]) for i in ma_dst]
         # A permutation is injective, so non-self edges stay non-self.
     else:
         gap_src = [pair[0] for pair in gap_pairs]
@@ -1979,11 +2200,13 @@ def readConnectome(
     gap_w = [gap_pairs[pair] for pair in gap_pairs]
     print("Gap Junction: ", len(gap_src))
     print("Chemical Synapse: ", len(wicks_src))
-    print("Extrasynaptic Connection: ", len(generic_src))
+    print("Extrasynaptic Connection: ", len(generic_src), f"(NP={len(np_src)}, MA={len(ma_src)})")
     synapse_list = {
         "General": (gap_src, gap_dst, gap_w),
         "Wicks": (wicks_src, wicks_dst, wicks_w, wicks_erev_loc, wicks_erev_scale),
         "Generic": (generic_src, generic_dst, generic_w),
+        "NP": (np_src, np_dst, np_w),
+        "MA": (ma_src, ma_dst, ma_w),
     }
     if rnn:
         model = RNNematode(len(neuron_names), neuron_list, synapse_list)
@@ -2000,6 +2223,8 @@ def readConnectome(
             wide_amp_priors=wide_amp_priors,
             evoked_syn_priors=evoked_syn_priors,
             dimensionless=dimensionless,
+            split_extrasynaptic=split_extrasynaptic,
+            use_syn_filter=use_syn_filter,
         )
     model.register_buffer("sensory_mask", torch.from_numpy(sensory_mask))
     return model

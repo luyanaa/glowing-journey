@@ -34,6 +34,8 @@ def main() -> None:
     p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--direct-global-guide", action="store_true")
     p.add_argument("--use-extrasynaptic", action="store_true")
+    p.add_argument("--split-extrasynaptic", action="store_true")
+    p.add_argument("--syn-filter", action="store_true")
     p.add_argument("--prestim-oscillatory", action="store_true")
     p.add_argument("--dimensionless-physiology", action="store_true")
     p.add_argument("--latent-ssm", action="store_true")
@@ -58,12 +60,14 @@ def main() -> None:
 
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
-        use_extrasynaptic=args.use_extrasynaptic,
+        use_extrasynaptic=bool(args.use_extrasynaptic or args.split_extrasynaptic),
         per_edge_release=args.per_edge_release,
         per_neuron_stim_gain=args.per_neuron_stim_gain,
         wide_amp_priors=args.wide_amp_priors,
         evoked_syn_priors=args.evoked_syn_priors,
         dimensionless=args.dimensionless_physiology,
+        split_extrasynaptic=args.split_extrasynaptic,
+        use_syn_filter=args.syn_filter,
         shuffle_seed=args.shuffle_seed,
     )
     use_prestim = not args.no_prestim_encoder
@@ -124,7 +128,9 @@ def main() -> None:
         "wide_amp_priors": bool(args.wide_amp_priors),
         "evoked_syn_priors": bool(args.evoked_syn_priors),
         "direct_global_guide": bool(args.direct_global_guide),
-        "use_extrasynaptic": bool(args.use_extrasynaptic),
+        "use_extrasynaptic": bool(args.use_extrasynaptic or args.split_extrasynaptic),
+        "split_extrasynaptic": bool(args.split_extrasynaptic),
+        "syn_filter": bool(args.syn_filter),
         "prestim_oscillatory": bool(args.prestim_oscillatory),
         "dimensionless_physiology": bool(args.dimensionless_physiology),
         "latent_ssm": bool(args.latent_ssm),

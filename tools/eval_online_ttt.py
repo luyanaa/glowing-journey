@@ -757,7 +757,9 @@ def _load_checkpoint_model(
     tau_ca_t = ms.get("guide.tau_ca_loc_unconstrained")
     per_neuron_kinetics = args.per_neuron_kinetics or (tau_ca_t is not None and tau_ca_t.ndim >= 1 and tau_ca_t.numel() > 1)
     per_edge_release = args.per_edge_release or ("guide.v_rest_edge_loc_unconstrained" in ms_keys)
-    use_extrasyn = args.use_extrasynaptic or any("guide.extrasyn_gain_z" in k for k in ms_keys)
+    split_extrasyn = args.split_extrasynaptic or any("guide.extrasyn_np_gain_z" in k or "guide.extrasyn_ma_gain_z" in k for k in ms_keys)
+    use_syn_filter = args.syn_filter or any("guide.tau_syn_loc" in k for k in ms_keys)
+    use_extrasyn = bool(args.use_extrasynaptic or split_extrasyn or any("guide.extrasyn_gain_z" in k for k in ms_keys))
     use_prestim = (not args.no_prestim_encoder) and any("decoder.prestim_encoder." in k for k in ms_keys)
     prestim_oscillatory = args.prestim_oscillatory or any("decoder.prestim_encoder.osc_out" in k for k in ms_keys)
     use_ssm = args.latent_ssm or any("decoder.latent_ssm." in k for k in ms_keys)
@@ -774,6 +776,8 @@ def _load_checkpoint_model(
         wide_amp_priors=True,
         evoked_syn_priors=args.evoked_syn_priors,
         dimensionless=dimensionless,
+        split_extrasynaptic=split_extrasyn,
+        use_syn_filter=use_syn_filter,
         shuffle_seed=shuffle_seed,
     )
     rec = c302.RecurrentNematode(
@@ -838,6 +842,8 @@ def main() -> None:
     p.add_argument("--evoked-syn-priors", action="store_true")
     p.add_argument("--direct-global-guide", action="store_true")
     p.add_argument("--use-extrasynaptic", action="store_true")
+    p.add_argument("--split-extrasynaptic", action="store_true")
+    p.add_argument("--syn-filter", action="store_true")
     p.add_argument("--prestim-oscillatory", action="store_true")
     p.add_argument("--dimensionless-physiology", action="store_true")
     p.add_argument("--latent-ssm", action="store_true")
