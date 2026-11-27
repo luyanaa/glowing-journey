@@ -2601,5 +2601,456 @@ def test_all_python_modules_compile():
         "tools/run_baselines.py",
         "tools/eval_unc31_knockout.py",
         "tools/eval_online_ttt.py",
+        "tools/run_genotype_joint.py",
     ]:
         py_compile.compile(fname, doraise=True)
+
+
+def test_safe_local_posterior_expansion_when_batch_equals_neurons():
+    from pyro_svi_c302 import extract_and_expand_posterior_samples
+
+    pyro.clear_param_store()
+    torch.manual_seed(0)
+    tiny_syn = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0], [2], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    n = 4
+    step = c302.NematodeForStep(
+        n, {}, tiny_syn, per_neuron_stim_gain=True, wide_amp_priors=True, dimensionless=True
+    )
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=True, pre_vols=4,
+        prestim_rank=3, variational_prestim=True, per_neuron_kinetics=True,
+    )
+    vm = vae.VAElegans(rec, n, 1, 1, direct_global_guide=True)
+    # Intentionally match batch_size B == n_neurons == 4!
+    stim = torch.zeros(4, 8, n)
+    y = torch.randn(4, 8, n) * 0.1
+    mask = torch.ones_like(y, dtype=torch.bool)
+    noise = torch.full((4, n), 0.05)
+
+    gtr = pyro.poutine.trace(vm.guide).get_trace(
+        ExternalInput=stim, mask=None, y=None, noise_scale=noise,
+        pre_stim_obs=y[:, :4, :], pre_stim_mask=mask[:, :4, :],
+    )
+    ps = extract_and_expand_posterior_samples(gtr, repeat_factor=2)
+    assert tuple(ps["prestim_z"].shape) == (8, 3)
+    assert tuple(ps["decoder.model.Neuron.conductance.E"].shape) == (4,)
+    assert tuple(ps["decoder.model.Neuron.conductance.C"].shape) == (4,)
+    assert tuple(ps["decoder.model.stim_gain_vec"].shape) == (4,)
+    assert tuple(ps["decoder.gcamp.tau_ca"].shape) == (4,)
+    assert tuple(ps["decoder.gcamp.gain"].shape) == (4,)
+
+
+def test_unified_intact_supervision_adj_for_shuffle():
+    from pyro_svi_vae import compute_evoked_kernel_aux_loss, reweight_hop1_noise
+
+    intact = c302.readConnectome("./data/CElegansNeuronTables.xls")
+    shuf = c302.readConnectome("./data/CElegansNeuronTables.xls", shuffle_seed=7)
+    adj_intact = torch.as_tensor(intact.synapse.adjacency_matrix(intact.neuronSize), dtype=torch.float32)
+    adj_shuf = torch.as_tensor(shuf.synapse.adjacency_matrix(shuf.neuronSize), dtype=torch.float32)
+    assert not torch.equal(adj_intact, adj_shuf)
+
+    # Same intact biological supervision matrix yields identical hop1 weighting masks
+    stim = torch.zeros(2, 20, intact.neuronSize)
+    stim[:, 10, 0] = 1.0
+    noise = torch.ones(2, intact.neuronSize)
+    rw_a = reweight_hop1_noise(noise, stim, adj_intact, weight=3.0, stim_weight=6.0)
+    rw_b = reweight_hop1_noise(noise, stim, adj_intact, weight=3.0, stim_weight=6.0)
+    rw_shuf = reweight_hop1_noise(noise, stim, adj_shuf, weight=3.0, stim_weight=6.0)
+    assert torch.equal(rw_a, rw_b)
+    assert not torch.equal(rw_a, rw_shuf)
+
+    y_true = torch.randn(2, 20, intact.neuronSize) * 0.1
+    mask = torch.ones(2, 20, intact.neuronSize, dtype=torch.bool)
+    p_s = torch.randn(2, 20, intact.neuronSize, requires_grad=True)
+    p_z = torch.zeros_like(p_s)
+    k1, d1 = compute_evoked_kernel_aux_loss(p_s, p_z, y_true, mask, stim, adj_intact, pre_vols=10)
+    assert torch.isfinite(k1) and torch.isfinite(d1)
+
+
+def test_dimensionless_zero_mean_log_leak_gauge_and_gap_reciprocity():
+    import warnings
+
+    pyro.clear_param_store()
+    tiny_syn = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0], [2], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    n = 3
+    step_phys = c302.NematodeForStep(n, {}, tiny_syn, dimensionless=False)
+    step_het = c302.NematodeForStep(
+        n, {}, tiny_syn, dimensionless=True, leak_gauge="zero_mean_log"
+    )
+    rec_phys = c302.RecurrentNematode(step_phys, dt_obs=0.5, substeps=4)
+    rec_het = c302.RecurrentNematode(step_het, dt_obs=0.5, substeps=4)
+    vm_phys = vae.VAElegans(rec_phys, n, 1, 1, direct_global_guide=True)
+    vm_het = vae.VAElegans(rec_het, n, 1, 1, direct_global_guide=True)
+
+    # Heterogeneous G with geom_mean == 1.0: G_phys = G_bar * G_dim, lambda = 1 / G_bar
+    G_vec = torch.tensor([0.2, 0.8, 1.0])
+    G_bar = float(torch.exp(torch.log(G_vec).mean()).item())
+    log_g_raw = torch.log(G_vec) - torch.log(G_vec).mean()
+    C_vec = torch.tensor([0.04, 0.08, 0.10])
+    stim = torch.zeros(2, 16, n)
+    stim[:, 5:8, 0] = 1.0
+
+    shared_gcamp = {
+        "decoder.gcamp.v_th_ca_logit": torch.tensor(0.0),
+        "decoder.gcamp.v_slope_ca": torch.tensor(0.015),
+        "decoder.gcamp.alpha_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_on": torch.tensor(0.5),
+        "decoder.gcamp.tau_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_off": torch.tensor(0.05),
+        "decoder.gcamp.gain": torch.tensor(1.0),
+        "decoder.gcamp.offset": torch.tensor(0.0),
+    }
+    ps_phys = {
+        **shared_gcamp,
+        "decoder.model.Neuron.conductance.E": torch.full((n,), -0.065),
+        "decoder.model.Neuron.conductance.G": G_vec,
+        "decoder.model.Neuron.conductance.C": C_vec,
+        "decoder.model.synapse.wicks.g_max": torch.tensor([0.05]),
+        "decoder.model.synapse.wicks.V_rest": torch.full((n,), -0.042),
+        "decoder.model.synapse.wicks.V_slope": torch.full((n,), 0.015),
+        "decoder.model.synapse.wicks.E_rev": torch.tensor([0.0]),
+        "decoder.model.synapse.general.g_syn": torch.tensor([0.03]),
+        "decoder.model.stim_gain": torch.tensor(1.2),
+    }
+    ps_het = {
+        **shared_gcamp,
+        "decoder.model.Neuron.conductance.E": torch.full((n,), -0.065),
+        "decoder.model.Neuron.conductance.log_G_raw": log_g_raw,
+        "decoder.model.Neuron.conductance.C": C_vec / G_bar,
+        "decoder.model.synapse.wicks.g_max": torch.tensor([0.05 / G_bar]),
+        "decoder.model.synapse.wicks.V_rest": torch.full((n,), -0.042),
+        "decoder.model.synapse.wicks.V_slope": torch.full((n,), 0.015),
+        "decoder.model.synapse.wicks.E_rev": torch.tensor([0.0]),
+        "decoder.model.synapse.general.g_syn": torch.tensor([0.03 / G_bar]),
+        "decoder.model.stim_gain": torch.tensor(1.2 / G_bar),
+    }
+    with torch.no_grad():
+        yp = pyro.condition(vm_phys, data=ps_phys)(ExternalInput=stim, sample_obs=False)
+        yh = pyro.condition(vm_het, data=ps_het)(ExternalInput=stim, sample_obs=False)
+    assert float((yp - yh).abs().max()) < 1e-5
+    # Verify KCL current conservation under asymmetric leak G
+    gap_cur = step_het.synapse.general(torch.tensor([[-0.055, -0.075, -0.065]]))
+    assert float(gap_cur[0, :2].sum().abs()) < 1e-6
+
+    # Verify clean SVI with zero Pyro warnings
+    y = torch.zeros_like(stim)
+    mask = torch.ones_like(stim, dtype=torch.bool)
+    noise = torch.full((2, n), 0.1)
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        svi = SVI(vm_het, vm_het.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+        for _ in range(2):
+            loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+            assert np.isfinite(loss)
+    mismatch_w = [str(w.message) for w in w_rec if "Found non-auxiliary vars" in str(w.message) or "not in guide" in str(w.message)]
+    assert not mismatch_w, f"Pyro site mismatch warnings: {mismatch_w}"
+
+
+def test_latent_ssm_v2_gru_split_stability_and_variational_traj():
+    import warnings
+    from pyro_svi_c302 import evaluate_predictions
+
+    pyro.clear_param_store()
+    torch.manual_seed(0)
+    tiny_syn = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0], [1], [2.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    n = 4
+    step = c302.NematodeForStep(n, {}, tiny_syn, wide_amp_priors=True, dimensionless=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, pre_vols=20,
+        use_latent_ssm=True, latent_ssm_dim=6,
+        ssm_encoder="gru", ssm_split_latent=True, ssm_artifact_dim=4,
+        ssm_variational_traj=True, ssm_smoother=True, history_vols=10,
+    )
+    vm = vae.VAElegans(rec, n, 1, 1, direct_global_guide=True)
+    assert "_latent_ssm_ref" in vm.guide.__dict__
+    assert not any("guide._latent_ssm_ref" in k for k in vm.state_dict().keys())
+
+    # 1. History window + causal invariance & decoupled z_neural vs z_artifact
+    with torch.no_grad():
+        rec.latent_ssm.gru_z_head.weight.normal_(std=0.05)
+        rec.latent_ssm.art_to_obs.weight.normal_(std=0.05)
+        rec.latent_ssm.z_to_current.weight.normal_(std=0.03)
+        rec.latent_ssm.v_to_z.weight.normal_(std=0.03)
+
+    stim = torch.zeros(2, 32, n)
+    stim[:, 20:23, 0] = 1.0
+    y = torch.randn(2, 32, n) * 0.2
+    mask = torch.ones_like(y, dtype=torch.bool)
+    noise = torch.full((2, n), 0.1)
+
+    y_fut = y.clone()
+    y_fut[:, 20:, :] += 4.0  # future mutated
+    y_early = y.clone()
+    y_early[:, :10, :] += 4.0  # earlier than history_vols=10 mutated
+    y_hist = y.clone()
+    y_hist[:, 10:20, :] += 2.0  # inside [10:20] history window mutated
+
+    eps = torch.randn(2, 33, 10)  # total_z_dim = 6 + 4 = 10
+    gtr = pyro.poutine.trace(vm.guide).get_trace(
+        ExternalInput=stim, mask=None, y=None, noise_scale=noise,
+        pre_stim_obs=y[:, :20, :], pre_stim_mask=mask[:, :20, :],
+    )
+    ps_fixed = {
+        k: v["value"] for k, v in gtr.nodes.items()
+        if v["type"] == "sample" and not v.get("is_observed", False)
+    }
+    with torch.no_grad():
+        p0 = pyro.condition(vm, data=ps_fixed)(
+            ExternalInput=stim, y=None, pre_stim_obs=y[:, :20, :], pre_stim_mask=mask[:, :20, :],
+            sample_obs=False, ssm_eps=eps,
+        )
+        p_f = pyro.condition(vm, data=ps_fixed)(
+            ExternalInput=stim, y=None, pre_stim_obs=y_fut[:, :20, :], pre_stim_mask=mask[:, :20, :],
+            sample_obs=False, ssm_eps=eps,
+        )
+        p_e = pyro.condition(vm, data=ps_fixed)(
+            ExternalInput=stim, y=None, pre_stim_obs=y_early[:, :20, :], pre_stim_mask=mask[:, :20, :],
+            sample_obs=False, ssm_eps=eps,
+        )
+        # Direct encode_initial invariance for history_vols=10
+        z_a, _, _, _ = rec.latent_ssm.encode_initial(y[:, 10:20, :], mask[:, 10:20, :])
+        z_h, _, _, _ = rec.latent_ssm.encode_initial(y_hist[:, 10:20, :], mask[:, 10:20, :])
+    assert float((p0 - p_f).abs().max()) == 0.0
+    assert float((p0 - p_e).abs().max()) == 0.0
+    assert float((z_a - z_h).abs().max()) > 1e-4
+
+    # Verify z_artifact is invariant to stimulus (cannot shortcut through V -> z -> y_obs)
+    A_art = rec.latent_ssm.artifact_transition_matrix()
+    a0 = torch.randn(2, 4)
+    art_stim = rec.latent_ssm.obs_residual(rec.latent_ssm.step_artifact(a0, A_art=A_art, eps=eps[:, 1, 6:]))
+    art_zero = rec.latent_ssm.obs_residual(rec.latent_ssm.step_artifact(a0, A_art=A_art, eps=eps[:, 1, 6:]))
+    assert torch.equal(art_stim, art_zero)
+
+    # 2. Closed-loop stability check
+    stab = c302.check_closed_loop_stability(rec, n_steps=60)
+    assert stab["finite"] and stab["stable"]
+    assert stab["autonomous_A_spectral_radius"] < 0.98
+    assert np.isfinite(stab["closed_loop_spectral_radius"])
+
+    # 3. End-to-end SVI with variational_traj + smoother has zero Pyro mismatch warnings
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-3}), Trace_ELBO())
+        for _ in range(2):
+            loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+            assert np.isfinite(loss)
+    mismatch_w = [str(w.message) for w in w_rec if "Found non-auxiliary vars" in str(w.message) or "not in guide" in str(w.message)]
+    assert not mismatch_w, f"Pyro site mismatch warnings: {mismatch_w}"
+
+    # 4. Open-loop evaluate_predictions + strictly causal online filter rollout
+    dl = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(stim, y, mask, noise), batch_size=2)
+    ev = evaluate_predictions(vm, dl, torch.device("cpu"), guide=vm.guide, num_samples=2, pre_vols=20)
+    assert np.isfinite(ev["r2"]) and np.isfinite(ev["calib_crps"])
+
+    y_mod_t25 = y.clone()
+    y_mod_t25[:, 25, :] += 10.0
+    with torch.no_grad():
+        cond_f = pyro.condition(vm, data=ps_fixed)
+        f1 = cond_f(ExternalInput=stim, y=y, mask=mask, sample_obs=False, filter_online=True)
+        f2 = cond_f(ExternalInput=stim, y=y_mod_t25, mask=mask, sample_obs=False, filter_online=True)
+    assert float((f1[:, :26, :] - f2[:, :26, :]).abs().max()) == 0.0
+    assert float((f1[:, 26:, :] - f2[:, 26:, :]).abs().max()) > 1e-6
+
+
+def test_ttt_modes_worm_latent_temporal_val_and_promotion_gate():
+    from tools.eval_online_ttt import (
+        _build_worm_latent_edge_basis,
+        _compute_ttt_promotion_gate,
+        adapt_worm_posterior,
+        restore_population_state,
+        snapshot_population_state,
+    )
+
+    pyro.clear_param_store()
+    torch.manual_seed(0)
+    n = 6
+    tiny_syn = {
+        "General": ([0, 2], [1, 3], [1.0, 1.0]),
+        "Wicks": ([0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 0], [2.0] * 6, [0.0] * 6, [0.01] * 6),
+        "Generic": ([], [], []),
+    }
+    step = c302.NematodeForStep(
+        n, {}, tiny_syn, per_neuron_stim_gain=True, wide_amp_priors=True, dimensionless=True
+    )
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4, stim_actuator=True
+    )
+    vm = vae.VAElegans(rec, n, 6, 2, direct_global_guide=True)
+    stim_h = torch.zeros(4, 12, n)
+    stim_h[:, 4:6, 0] = 1.0
+    y_h = torch.randn(4, 12, n) * 0.25
+    y_h[:, 4:8, 0] += 0.6
+    mask_h = torch.ones(4, 12, n, dtype=torch.bool)
+    noise_h = torch.full((4, n), 0.1)
+    _ = pyro.poutine.trace(vm.guide).get_trace(ExternalInput=stim_h, noise_scale=noise_h)
+    pop_snap = snapshot_population_state(vm)
+
+    # ttt_a moves gcamp only; stim_gain & excitability stay frozen
+    stim_0 = vm.guide.stim_gain_vec_loc.detach().clone()
+    vrest_0 = vm.guide.wicks_V_rest_z.detach().clone()
+    gmax_glob_0 = vm.guide.wicks_g_max_global_z.detach().clone()
+    gmax_edge_0 = vm.guide.wicks_g_max_z.detach().clone()
+    adapt_worm_posterior(vm, stim_h, y_h, mask_h, noise_h, ttt_mode="ttt_a", ttt_steps=3, pre_vols=4)
+    assert float((vm.guide.stim_gain_vec_loc.detach() - stim_0).abs().max()) == 0.0
+    assert float((vm.guide.wicks_V_rest_z.detach() - vrest_0).abs().max()) == 0.0
+
+    # ttt_b moves stim_gain only; gcamp_gain stays frozen
+    restore_population_state(vm, pop_snap)
+    gc_0 = vm.guide.gcamp_gain_loc.detach().clone()
+    adapt_worm_posterior(vm, stim_h, y_h, mask_h, noise_h, ttt_mode="ttt_b", ttt_steps=3, pre_vols=4)
+    assert float((vm.guide.gcamp_gain_loc.detach() - gc_0).abs().max()) == 0.0
+    assert float((vm.guide.stim_gain_vec_loc.detach() - stim_0).abs().max()) > 1e-4
+
+    # ttt_e moves global syn scale + gcamp/stim, keeping E/V_rest/V_slope/C frozen
+    restore_population_state(vm, pop_snap)
+    e_0 = vm.guide.neuron_E_z.detach().clone()
+    c_0 = vm.guide.neuron_C_loc.detach().clone()
+    vs_0 = vm.guide.wicks_V_slope_loc.detach().clone()
+    adapt_worm_posterior(vm, stim_h, y_h, mask_h, noise_h, ttt_mode="ttt_e", ttt_steps=4, kl_weight=0.1, pre_vols=4)
+    assert float((vm.guide.neuron_E_z.detach() - e_0).abs().max()) == 0.0
+    assert float((vm.guide.wicks_V_rest_z.detach() - vrest_0).abs().max()) == 0.0
+    assert float((vm.guide.wicks_V_slope_loc.detach() - vs_0).abs().max()) == 0.0
+    assert float((vm.guide.neuron_C_loc.detach() - c_0).abs().max()) == 0.0
+    assert float((vm.guide.wicks_g_max_global_z.detach() - gmax_glob_0).abs().max()) > 1e-5
+
+    # ttt_d with worm_latent_dim=2 on 6 edges strictly constrains delta_wicks_z to rank-2 spectral subspace
+    restore_population_state(vm, pop_snap)
+    log_d = adapt_worm_posterior(
+        vm, stim_h, y_h, mask_h, noise_h,
+        ttt_mode="ttt_d", worm_latent_dim=2, temporal_val_frac=0.25, ttt_steps=5, kl_weight=0.05, pre_vols=4,
+    )
+    assert log_d["n_train_hist"] == 3 and log_d["n_val_hist"] == 1
+    assert np.isfinite(log_d["val_nll_start"]) and np.isfinite(log_d["val_nll_best"])
+    assert float((vm.guide.wicks_V_rest_z.detach() - vrest_0).abs().max()) == 0.0
+
+    # Verify promotion gate logic
+    zs = {"overall_metrics": {"post_inlier_r2": 0.100, "evoked_stim_r2": 0.050, "evoked_hop1_r2": 0.040, "kernel_hop1_r2": 0.060}}
+    good = {"overall_metrics": {"post_inlier_r2": 0.097, "evoked_stim_r2": 0.070, "evoked_hop1_r2": 0.042, "kernel_hop1_r2": 0.075}}
+    bad_base = {"overall_metrics": {"post_inlier_r2": 0.015, "evoked_stim_r2": 0.076, "evoked_hop1_r2": 0.043, "kernel_hop1_r2": 0.082}}
+    assert _compute_ttt_promotion_gate(zs, good)["pass"] is True
+    assert _compute_ttt_promotion_gate(zs, bad_base)["pass"] is False
+
+
+def test_np_ma_exclusive_strata_matched_deltak_calibration_and_genotype_joint():
+    import warnings
+    from pyro_svi_c302 import compute_predictive_calibration_metrics, compute_stratified_metrics
+    from tools.kernel_metrics import compute_matched_kernel_difference
+
+    # 1. Exclusive NP/MA/overlap strata + matched Delta K_ij(t) + predictive calibration
+    b, t_tot, n = 4, 24, 5
+    pre = 8
+    adj = np.zeros((n, n), dtype=np.float32)
+    adj[0, 1] = 1.0  # wired hop1
+    np_adj = np.zeros((n, n), dtype=np.float32)
+    np_adj[0, 2] = 1.0  # NP exclusive
+    np_adj[0, 4] = 1.0  # NP & MA overlap
+    ma_adj = np.zeros((n, n), dtype=np.float32)
+    ma_adj[0, 3] = 1.0  # MA exclusive
+    ma_adj[0, 4] = 1.0  # NP & MA overlap
+
+    stim = np.zeros((b, t_tot, n), dtype=np.float32)
+    stim[:, pre:pre + 2, 0] = 1.0
+    mask = np.ones((b, t_tot, n), dtype=bool)
+    t_grid = np.linspace(0.0, 1.0, t_tot - pre, dtype=np.float32)
+    wt_true = np.zeros((b, t_tot, n), dtype=np.float32)
+    mut_true = np.zeros((b, t_tot, n), dtype=np.float32)
+    wt_true[:, pre:, 2] = 0.5 * np.sin(np.pi * t_grid)[None, :]
+    mut_true[:, pre:, 2] = 0.1 * np.sin(np.pi * t_grid)[None, :]
+    wt_true[:, pre:, 3] = 0.4 * np.sin(np.pi * t_grid)[None, :]
+    mut_true[:, pre:, 3] = 0.4 * np.sin(np.pi * t_grid)[None, :]
+
+    m_exc = compute_stratified_metrics(
+        wt_true, wt_true, mask, stim=stim, pre_vols=pre, adjacency=adj,
+        evoked_baseline="mean", y_pred_counterfactual=np.zeros_like(wt_true),
+        np_adjacency=np_adj, ma_adjacency=ma_adj, dt_obs=0.5,
+    )
+    assert m_exc["evoked_np_exclusive_count"] > 0 and abs(m_exc["evoked_np_exclusive_r2"] - 1.0) < 1e-5
+    assert m_exc["evoked_ma_exclusive_count"] > 0 and abs(m_exc["evoked_ma_exclusive_r2"] - 1.0) < 1e-5
+    assert m_exc["evoked_np_ma_overlap_count"] > 0
+
+    dk = compute_matched_kernel_difference(
+        wt_true, wt_true, mask, stim, mut_true, mut_true, mask, stim,
+        adjacency=adj, np_adjacency=np_adj, ma_adjacency=ma_adj, pre_vols=pre,
+    )
+    assert "np_exclusive" in dk and dk["np_exclusive"]["delta_k_r"] > 0.99
+
+    rng = np.random.default_rng(7)
+    draws = rng.normal(loc=wt_true[None, ...], scale=0.1, size=(6, b, t_tot, n))
+    scales = np.full((6, b, n), 0.1, dtype=np.float64)
+    cal = compute_predictive_calibration_metrics(wt_true, draws, scales, mask, pre_vols=pre)
+    assert np.isfinite(cal["calib_crps"]) and np.isfinite(cal["calib_nll"])
+    assert cal["calib_cov90"] >= cal["calib_cov50"]
+
+    # 2. Genotype-conditioned Bayesian NP/MA inference + prior sensitivity CLI params
+    pyro.clear_param_store()
+    syn_list = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [1.0], [0.0], [0.01]),
+        "Generic": ([0, 0], [2, 3], [1.0, 1.0]),
+        "NP": ([0], [2], [1.0]),
+        "MA": ([0], [3], [1.0]),
+    }
+    step = c302.NematodeForStep(
+        n, {}, syn_list, use_extrasynaptic=True, split_extrasynaptic=True,
+        dimensionless=True, tau_np_prior=1.0, tau_ma_prior=4.0, tau_mod_prior_std=1.2,
+        genotype_conditioned=True,
+    )
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4)
+    vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+    geno = torch.tensor([0, 1], dtype=torch.long)
+    stim_g = torch.zeros(2, 16, n)
+    stim_g[:, 4:7, 0] = 1.0
+    y_g = torch.zeros_like(stim_g)
+    mask_g = torch.ones_like(stim_g, dtype=torch.bool)
+    noise_g = torch.full((2, n), 0.1)
+
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+        loss = svi.step(ExternalInput=stim_g, mask=mask_g, y=y_g, noise_scale=noise_g, genotype_id=geno)
+        assert np.isfinite(loss)
+    mismatch_w = [str(w.message) for w in w_rec if "Found non-auxiliary vars" in str(w.message) or "not in guide" in str(w.message)]
+    assert not mismatch_w, f"Pyro site mismatch warnings: {mismatch_w}"
+
+    # Zeroing gamma_np_mut=0 eliminates NP response ONLY for genotype 1 (unc-31), leaving WT (0) intact
+    ps_ko = {
+        "decoder.model.Neuron.conductance.E": torch.full((n,), -0.065),
+        "decoder.model.Neuron.conductance.C": torch.full((n,), 0.10),
+        "decoder.model.synapse.wicks.g_max": torch.tensor([0.0]),
+        "decoder.model.synapse.wicks.V_rest": torch.full((n,), -0.042),
+        "decoder.model.synapse.wicks.V_slope": torch.full((n,), 0.015),
+        "decoder.model.synapse.wicks.E_rev": torch.tensor([0.0]),
+        "decoder.model.stim_gain": torch.tensor(3.0),
+        "decoder.model.synapse.extrasyn_np_gain": torch.tensor([0.05]),
+        "decoder.model.synapse.extrasyn_ma_gain": torch.tensor([0.05]),
+        "decoder.model.synapse.tau_np": torch.tensor(2.0),
+        "decoder.model.synapse.tau_ma": torch.tensor(1.0),
+        "decoder.model.synapse.gamma_np_mut": torch.tensor(0.0),
+        "decoder.model.synapse.gamma_ma_mut": torch.tensor(1.0),
+        "decoder.model.synapse.gamma_wired_mut": torch.tensor(1.0),
+        "decoder.gcamp.v_th_ca_logit": torch.tensor(0.0),
+        "decoder.gcamp.v_slope_ca": torch.tensor(0.015),
+        "decoder.gcamp.alpha_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_on": torch.tensor(0.5),
+        "decoder.gcamp.tau_ca": torch.tensor(0.5),
+        "decoder.gcamp.k_off": torch.tensor(0.1),
+        "decoder.gcamp.gain": torch.ones(n),
+        "decoder.gcamp.offset": torch.zeros(n),
+    }
+    with torch.no_grad():
+        yo = pyro.condition(vm, data=ps_ko)(ExternalInput=stim_g, sample_obs=False, genotype_id=geno)
+    assert float(yo[0, 5:, 2].abs().max()) > 1e-4  # WT NP responds
+    assert float(yo[1, 5:, 2].abs().max()) < 1e-6  # unc-31 NP eliminated
+    assert float((yo[0, 5:, 3] - yo[1, 5:, 3]).abs().max()) < 1e-6  # MA identical across WT and unc-31

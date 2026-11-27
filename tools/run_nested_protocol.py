@@ -88,8 +88,18 @@ def main() -> None:
                    help="Directory with Stage-1 summary.json and fold{fi}/{tag}_seed{seed}/ checkpoints for Stage-2 warm start")
     p.add_argument("--freeze-non-prestim", action="store_true")
     p.add_argument("--dimensionless-physiology", action="store_true")
+    p.add_argument("--heterogeneous-leak-gauge", action="store_true")
     p.add_argument("--latent-ssm", action="store_true")
     p.add_argument("--latent-ssm-dim", default=16, type=int)
+    p.add_argument("--ssm-encoder", choices=["pooling", "gru"], default="pooling")
+    p.add_argument("--ssm-split-latent", action="store_true")
+    p.add_argument("--ssm-artifact-dim", default=8, type=int)
+    p.add_argument("--ssm-variational-traj", action="store_true")
+    p.add_argument("--ssm-smoother", action="store_true")
+    p.add_argument("--history-vols", default=0, type=int)
+    p.add_argument("--tau-np-prior", default=4.0, type=float)
+    p.add_argument("--tau-ma-prior", default=1.0, type=float)
+    p.add_argument("--tau-mod-prior-std", default=0.5, type=float)
     p.add_argument("--kernel-loss-weight", default=0.0, type=float)
     p.add_argument("--dynamics-loss-weight", default=0.0, type=float)
     p.add_argument("--pre-vols", default=10, type=int)
@@ -193,8 +203,24 @@ def main() -> None:
                 cmd.append("--freeze-non-prestim")
             if args.dimensionless_physiology:
                 cmd.append("--dimensionless-physiology")
+            if args.heterogeneous_leak_gauge:
+                cmd.append("--heterogeneous-leak-gauge")
             if args.latent_ssm:
                 cmd.extend(["--latent-ssm", "--latent-ssm-dim", str(args.latent_ssm_dim)])
+                cmd.extend(["--ssm-encoder", str(args.ssm_encoder)])
+                if args.ssm_split_latent:
+                    cmd.extend(["--ssm-split-latent", "--ssm-artifact-dim", str(args.ssm_artifact_dim)])
+                if args.ssm_variational_traj:
+                    cmd.append("--ssm-variational-traj")
+                if args.ssm_smoother:
+                    cmd.append("--ssm-smoother")
+                if args.history_vols > 0:
+                    cmd.extend(["--history-vols", str(args.history_vols)])
+            cmd.extend([
+                "--tau-np-prior", str(args.tau_np_prior),
+                "--tau-ma-prior", str(args.tau_ma_prior),
+                "--tau-mod-prior-std", str(args.tau_mod_prior_std),
+            ])
             if args.kernel_loss_weight > 0:
                 cmd.extend(["--kernel-loss-weight", str(args.kernel_loss_weight)])
             if args.dynamics_loss_weight > 0:
@@ -267,8 +293,24 @@ def main() -> None:
                 eval_cmd.append("--prestim-oscillatory")
             if args.dimensionless_physiology:
                 eval_cmd.append("--dimensionless-physiology")
+            if args.heterogeneous_leak_gauge:
+                eval_cmd.append("--heterogeneous-leak-gauge")
             if args.latent_ssm:
                 eval_cmd.extend(["--latent-ssm", "--latent-ssm-dim", str(args.latent_ssm_dim)])
+                eval_cmd.extend(["--ssm-encoder", str(args.ssm_encoder)])
+                if args.ssm_split_latent:
+                    eval_cmd.extend(["--ssm-split-latent", "--ssm-artifact-dim", str(args.ssm_artifact_dim)])
+                if args.ssm_variational_traj:
+                    eval_cmd.append("--ssm-variational-traj")
+                if args.ssm_smoother:
+                    eval_cmd.append("--ssm-smoother")
+                if args.history_vols > 0:
+                    eval_cmd.extend(["--history-vols", str(args.history_vols)])
+            eval_cmd.extend([
+                "--tau-np-prior", str(args.tau_np_prior),
+                "--tau-ma-prior", str(args.tau_ma_prior),
+                "--tau-mod-prior-std", str(args.tau_mod_prior_std),
+            ])
             if args.stim_actuator:
                 eval_cmd.append("--stim-actuator")
                 eval_cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])

@@ -156,3 +156,146 @@ def compute_pair_kernel_metrics(
         fft_p_arr = np.concatenate(fft_p)
         out[f"{prefix}_fft_r"] = _safe_pearson_r(fft_t_arr, fft_p_arr)
     return out
+
+
+def compute_matched_kernel_difference(
+    wt_true: np.ndarray,
+    wt_pred: np.ndarray,
+    wt_mask: np.ndarray,
+    wt_stim: np.ndarray,
+    mut_true: np.ndarray,
+    mut_pred: np.ndarray,
+    mut_mask: np.ndarray,
+    mut_stim: np.ndarray,
+    adjacency: np.ndarray,
+    np_adjacency: np.ndarray = None,
+    ma_adjacency: np.ndarray = None,
+    pre_vols: int = 10,
+    evoked_window_vols: int = 16,
+    dt_obs: float = 0.5,
+    min_trials: int = 2,
+    min_common_steps: int = 4,
+) -> Dict[str, Dict[str, float]]:
+    """Compute matched pair-level kernel differences Delta K_ij(t) = K_WT(t) - K_mut(t).
+
+    Matches identical (stim_signature, response_neuron) pairs present in both cohorts
+    and stratifies across all_downstream, wired_hop1, np_exclusive, ma_exclusive, and
+    np_ma_overlap.
+    """
+    t0 = int(pre_vols)
+    t_end = min(int(wt_true.shape[1]), int(mut_true.shape[1]), t0 + int(evoked_window_vols))
+    if t_end <= t0:
+        return {}
+
+    def _evoked_true(y_arr: np.ndarray, m_arr: np.ndarray) -> np.ndarray:
+        w = m_arr[:, :t0, :].astype(np.float64)
+        denom = np.maximum(w.sum(axis=1), 1.0)
+        base = (y_arr[:, :t0, :] * w).sum(axis=1) / denom
+        return np.asarray(y_arr, dtype=np.float64) - base[:, None, :]
+
+    def _group_kernels(yt_ev, yp_ev, m_arr, st_arr):
+        st_tgt = np.abs(st_arr).sum(axis=1) > 0
+        groups: Dict[Tuple[int, ...], List[int]] = {}
+        for b in range(st_arr.shape[0]):
+            sig = tuple(np.flatnonzero(st_tgt[b]).tolist())
+            if sig:
+                groups.setdefault(sig, []).append(b)
+        out: Dict[Tuple[Tuple[int, ...], int], Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        n_neu = st_arr.shape[2]
+        for sig, idxs in groups.items():
+            if len(idxs) < int(min_trials):
+                continue
+            m_g = m_arr[idxs, t0:t_end, :].astype(bool)
+            cnt_n = m_g.any(axis=1).sum(axis=0)
+            for j in np.flatnonzero(cnt_n >= int(min_trials)).tolist():
+                if j in sig:
+                    continue
+                mj = m_g[:, :, j]
+                cnt_t = mj.sum(axis=0)
+                ok = cnt_t >= 1
+                if int(ok.sum()) < int(min_common_steps):
+                    continue
+                den = np.maximum(cnt_t, 1).astype(np.float64)
+                kt = (yt_ev[idxs, t0:t_end, j] * mj).sum(axis=0) / den
+                kp = (yp_ev[idxs, t0:t_end, j] * mj).sum(axis=0) / den
+                out[(sig, int(j))] = (kt, kp, ok)
+        return out
+
+    wt_yt_ev = _evoked_true(wt_true, wt_mask)
+    mut_yt_ev = _evoked_true(mut_true, mut_mask)
+    wt_k = _group_kernels(wt_yt_ev, np.asarray(wt_pred, dtype=np.float64), wt_mask, wt_stim)
+    mut_k = _group_kernels(mut_yt_ev, np.asarray(mut_pred, dtype=np.float64), mut_mask, mut_stim)
+
+    matched_keys = sorted(set(wt_k.keys()) & set(mut_k.keys()))
+    if not matched_keys:
+        return {}
+
+    n_neurons = wt_true.shape[2]
+    adj_b = np.asarray(adjacency, dtype=bool)
+    np_b = np.asarray(np_adjacency, dtype=bool) if np_adjacency is not None else np.zeros((n_neurons, n_neurons), dtype=bool)
+    ma_b = np.asarray(ma_adjacency, dtype=bool) if ma_adjacency is not None else np.zeros((n_neurons, n_neurons), dtype=bool)
+
+    strata_pairs: Dict[str, List[Tuple[Tuple[int, ...], int]]] = {
+        "all_downstream": [],
+        "wired_hop1": [],
+        "np_exclusive": [],
+        "ma_exclusive": [],
+        "np_ma_overlap": [],
+    }
+    for key in matched_keys:
+        sig, j = key
+        sig_idx = list(sig)
+        is_w1 = bool(adj_b[sig_idx, j].any())
+        is_np = bool(np_b[sig_idx, j].any())
+        is_ma = bool(ma_b[sig_idx, j].any())
+        strata_pairs["all_downstream"].append(key)
+        if is_w1:
+            strata_pairs["wired_hop1"].append(key)
+        if is_np and not is_ma and not is_w1:
+            strata_pairs["np_exclusive"].append(key)
+        elif is_ma and not is_np and not is_w1:
+            strata_pairs["ma_exclusive"].append(key)
+        elif is_np and is_ma and not is_w1:
+            strata_pairs["np_ma_overlap"].append(key)
+
+    res: Dict[str, Dict[str, float]] = {}
+    for s_name, keys in strata_pairs.items():
+        if not keys:
+            continue
+        dk_t_list, dk_p_list = [], []
+        wt_auc_t, mut_auc_t, d_auc_t, d_auc_p = [], [], [], []
+        for key in keys:
+            kt_w, kp_w, ok_w = wt_k[key]
+            kt_m, kp_m, ok_m = mut_k[key]
+            ok = ok_w & ok_m
+            if int(ok.sum()) < int(min_common_steps):
+                continue
+            dkt = kt_w[ok] - kt_m[ok]
+            dkp = kp_w[ok] - kp_m[ok]
+            dk_t_list.append(dkt)
+            dk_p_list.append(dkp)
+            aw_t = _trapz(kt_w[ok], float(dt_obs))
+            am_t = _trapz(kt_m[ok], float(dt_obs))
+            aw_p = _trapz(kp_w[ok], float(dt_obs))
+            am_p = _trapz(kp_m[ok], float(dt_obs))
+            wt_auc_t.append(aw_t)
+            mut_auc_t.append(am_t)
+            d_auc_t.append(aw_t - am_t)
+            d_auc_p.append(aw_p - am_p)
+        if not dk_t_list:
+            continue
+        cat_t = np.concatenate(dk_t_list)
+        cat_p = np.concatenate(dk_p_list)
+        res[s_name] = {
+            "n_matched_pairs": int(len(dk_t_list)),
+            "n_points": int(cat_t.size),
+            "delta_k_r": _safe_pearson_r(cat_t, cat_p),
+            "delta_k_rmse": float(np.sqrt(mean_squared_error(cat_t, cat_p))),
+            "wt_auc_true_mean": float(np.mean(wt_auc_t)),
+            "mut_auc_true_mean": float(np.mean(mut_auc_t)),
+            "delta_auc_true_mean": float(np.mean(d_auc_t)),
+            "delta_auc_pred_mean": float(np.mean(d_auc_p)),
+            "delta_auc_r": _safe_pearson_r(np.asarray(d_auc_t), np.asarray(d_auc_p)),
+        }
+    return res
+

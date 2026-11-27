@@ -18,7 +18,13 @@ sys.path.insert(0, REPO)
 
 import c302
 import vae
-from pyro_svi_c302 import _prestim_baseline, compute_stratified_metrics, evaluate_predictions
+from pyro_svi_c302 import (
+    _prestim_baseline,
+    compute_stratified_metrics,
+    evaluate_predictions,
+    extract_and_expand_posterior_samples,
+)
+from tools.kernel_metrics import compute_matched_kernel_difference
 from tools.noise_ceiling import _compute_strata_masks, _split_half_ceiling
 from utils import RandiTrialDataset
 
@@ -48,8 +54,55 @@ def _build_ckpt_model(
     use_ssm = any("decoder.latent_ssm." in k for k in ms_keys)
     direct_guide = True
     dimensionless = "guide.neuron_G_loc_unconstrained" not in ms_keys
+    leak_gauge = (
+        "zero_mean_log"
+        if any(
+            k in ms_keys
+            for k in (
+                "guide.neuron_log_G_raw_loc",
+                "guide.neuron_log_G_raw_loc_unconstrained",
+            )
+        )
+        else "unit"
+    )
+    ssm_encoder = "gru" if any("decoder.latent_ssm.pre_gru." in k for k in ms_keys) else "pooling"
+    ssm_split = any("decoder.latent_ssm.art_to_obs." in k for k in ms_keys)
+    art_key = next(
+        (
+            k
+            for k in (
+                "decoder.latent_ssm.A_art_decay_logit",
+                "decoder.latent_ssm.A_art_decay_logit_unconstrained",
+            )
+            if k in ms_keys
+        ),
+        None,
+    )
+    ssm_art_dim = (
+        int(snap["MODEL_STATE"][art_key].numel())
+        if art_key is not None
+        else 8
+    )
+    ssm_vtraj = any("decoder.latent_ssm.q_traj_gru." in k for k in ms_keys)
+    ssm_smooth = any("decoder.latent_ssm.q_smooth_gru." in k for k in ms_keys)
     eff_pre = int(pre_vols) if pre_vols is not None else 10
-    ssm_dim = int(snap["MODEL_STATE"]["decoder.latent_ssm.A_diag_raw"].numel()) if "decoder.latent_ssm.A_diag_raw" in ms_keys else 16
+    decay_key = next(
+        (
+            k
+            for k in (
+                "decoder.latent_ssm.A_decay_logit",
+                "decoder.latent_ssm.A_decay_logit_unconstrained",
+                "decoder.latent_ssm.A_diag_raw",
+                "decoder.latent_ssm.A_diag_raw_unconstrained",
+            )
+            if k in ms_keys
+        ),
+        None,
+    )
+    if decay_key is not None:
+        ssm_dim = int(snap["MODEL_STATE"][decay_key].numel())
+    else:
+        ssm_dim = 16
 
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
@@ -58,6 +111,7 @@ def _build_ckpt_model(
         per_neuron_stim_gain=per_neuron_stim_gain,
         wide_amp_priors=True,
         dimensionless=dimensionless,
+        leak_gauge=leak_gauge,
         split_extrasynaptic=split_extrasyn,
         use_syn_filter=use_syn_filter,
         shuffle_seed=shuffle_seed,
@@ -78,6 +132,11 @@ def _build_ckpt_model(
         stim_tau_decay=0.4,
         use_latent_ssm=use_ssm,
         latent_ssm_dim=ssm_dim,
+        ssm_encoder=ssm_encoder,
+        ssm_split_latent=ssm_split,
+        ssm_artifact_dim=ssm_art_dim,
+        ssm_variational_traj=ssm_vtraj,
+        ssm_smoother=ssm_smooth,
     )
     model = vae.VAElegans(
         rec,
@@ -136,12 +195,7 @@ def _eval_ckpt(
                 ps_acc, pz_acc = None, None
                 for _ in range(num_samples):
                     tr = pyro.poutine.trace(guide).get_trace(**guide_kw)
-                    ps = {
-                        n: (site["value"].repeat(2, *([1] * (site["value"].dim() - 1)))
-                            if site["value"].dim() >= 1 and site["value"].shape[0] == B else site["value"])
-                        for n, site in tr.nodes.items()
-                        if site["type"] == "sample" and not site.get("is_observed", False)
-                    }
+                    ps = extract_and_expand_posterior_samples(tr, repeat_factor=2)
                     ps["decoder.model.synapse.extrasyn_gain"] = extra_zeros
                     out = pyro.condition(model, data=ps)(**stacked_kw)
                     ps_s = out[:B]
@@ -225,7 +279,8 @@ def _eval_split_knockout_rollout(
     zero_np: bool = False,
     zero_ma: bool = False,
     device: torch.device = torch.device("cpu"),
-) -> Dict[str, float]:
+    return_arrays: bool = False,
+):
     """Run paired counterfactual rollout with optional NP and/or MA gain ablation."""
     np.random.seed(eval_seed)
     torch.manual_seed(eval_seed)
@@ -240,6 +295,8 @@ def _eval_split_knockout_rollout(
     y_trues, y_preds, y_pred_cfs, masks, stims = [], [], [], [], []
     np_zeros = torch.zeros(len(getattr(syn, "NP_SRC", [])), device=device) if zero_np else None
     ma_zeros = torch.zeros(len(getattr(syn, "MA_SRC", [])), device=device) if zero_ma else None
+    if has_ssm:
+        total_z_dim = int(getattr(ssm_mod, "total_z_dim", ssm_mod.z_dim))
     with torch.no_grad():
         for batch in loader:
             stim, y, mask, noise = [b.to(device) for b in batch[:4]]
@@ -261,18 +318,13 @@ def _eval_split_knockout_rollout(
             ps_acc, pz_acc = None, None
             for _ in range(max(1, int(num_samples))):
                 tr = pyro.poutine.trace(model.guide).get_trace(**guide_kw)
-                ps = {
-                    n: (site["value"].repeat(2, *([1] * (site["value"].dim() - 1)))
-                        if site["value"].dim() >= 1 and site["value"].shape[0] == B else site["value"])
-                    for n, site in tr.nodes.items()
-                    if site["type"] == "sample" and not site.get("is_observed", False)
-                }
+                ps = extract_and_expand_posterior_samples(tr, repeat_factor=2)
                 if np_zeros is not None and len(np_zeros) > 0:
                     ps["decoder.model.synapse.extrasyn_np_gain"] = np_zeros
                 if ma_zeros is not None and len(ma_zeros) > 0:
                     ps["decoder.model.synapse.extrasyn_ma_gain"] = ma_zeros
                 if has_ssm:
-                    eps = torch.randn((B, stim.shape[1] + 1, int(ssm_mod.z_dim)), device=device, dtype=stim.dtype)
+                    eps = torch.randn((B, stim.shape[1] + 1, total_z_dim), device=device, dtype=stim.dtype)
                     out = pyro.condition(model, data=ps)(**stacked_kw, ssm_eps=torch.cat([eps, eps], dim=0))
                 else:
                     out = pyro.condition(model, data=ps)(**stacked_kw)
@@ -294,7 +346,8 @@ def _eval_split_knockout_rollout(
 
     m_np = compute_stratified_metrics(
         yt, yp, mk, stim=st, pre_vols=pre_vols, adjacency=adjacency,
-        evoked_baseline="mean", y_pred_counterfactual=ypc, np_adjacency=np_adj, dt_obs=dt_obs,
+        evoked_baseline="mean", y_pred_counterfactual=ypc,
+        np_adjacency=np_adj, ma_adjacency=ma_adj, dt_obs=dt_obs,
     )
     m_ma = compute_stratified_metrics(
         yt, yp, mk, stim=st, pre_vols=pre_vols, adjacency=adjacency,
@@ -311,9 +364,21 @@ def _eval_split_knockout_rollout(
         "evoked_ma_stratum_r": float(m_ma.get("evoked_np_only_r", float("nan"))),
         "evoked_ma_no_hop12_r2": float(m_ma.get("evoked_np_no_hop12_r2", float("nan"))),
         "evoked_ma_stratum_count": int(m_ma.get("evoked_np_only_count", 0)),
+        "evoked_np_exclusive_r2": float(m_np.get("evoked_np_exclusive_r2", float("nan"))),
+        "evoked_np_exclusive_r": float(m_np.get("evoked_np_exclusive_r", float("nan"))),
+        "evoked_np_exclusive_count": int(m_np.get("evoked_np_exclusive_count", 0)),
+        "evoked_np_exclusive_no_hop12_r2": float(m_np.get("evoked_np_exclusive_no_hop12_r2", float("nan"))),
+        "evoked_ma_exclusive_r2": float(m_np.get("evoked_ma_exclusive_r2", float("nan"))),
+        "evoked_ma_exclusive_r": float(m_np.get("evoked_ma_exclusive_r", float("nan"))),
+        "evoked_ma_exclusive_count": int(m_np.get("evoked_ma_exclusive_count", 0)),
+        "evoked_np_ma_overlap_r2": float(m_np.get("evoked_np_ma_overlap_r2", float("nan"))),
+        "evoked_np_ma_overlap_r": float(m_np.get("evoked_np_ma_overlap_r", float("nan"))),
+        "evoked_np_ma_overlap_count": int(m_np.get("evoked_np_ma_overlap_count", 0)),
         "kernel_hop1_r": float(m_np.get("kernel_hop1_r", float("nan"))),
         "kernel_hop1_peak_latency_mae_s": float(m_np.get("kernel_hop1_peak_latency_mae_s", float("nan"))),
     }
+    if return_arrays:
+        return out, (yt, yp - ypc, mk, st)
     return out
 
 
@@ -340,11 +405,15 @@ def evaluate_np_ma_double_dissociation(
         t_syn = torch.exp(guide.tau_syn_loc.detach()).cpu().numpy()
         timescales["tau_syn_median_s"] = float(np.median(t_syn))
 
-    def _run_cohort(ldr: DataLoader) -> Dict:
-        full = _eval_split_knockout_rollout(
+    def _run_cohort(ldr: DataLoader, capture_full: bool = False):
+        full_ret = _eval_split_knockout_rollout(
             model, ldr, adjacency, np_adj, ma_adj, pre_vols, num_samples, eval_seed,
-            zero_np=False, zero_ma=False, device=device,
+            zero_np=False, zero_ma=False, device=device, return_arrays=capture_full,
         )
+        if capture_full:
+            full, full_arrs = full_ret
+        else:
+            full, full_arrs = full_ret, None
         np_z = _eval_split_knockout_rollout(
             model, ldr, adjacency, np_adj, ma_adj, pre_vols, num_samples, eval_seed,
             zero_np=True, zero_ma=False, device=device,
@@ -357,7 +426,7 @@ def evaluate_np_ma_double_dissociation(
             model, ldr, adjacency, np_adj, ma_adj, pre_vols, num_samples, eval_seed,
             zero_np=True, zero_ma=True, device=device,
         )
-        return {
+        res_c = {
             "full": full,
             "np_zero": np_z,
             "ma_zero": ma_z,
@@ -366,17 +435,31 @@ def evaluate_np_ma_double_dissociation(
                 "evoked_np_stratum_r2": float(full["evoked_np_stratum_r2"] - np_z["evoked_np_stratum_r2"]),
                 "evoked_np_no_hop12_r2": float(full["evoked_np_no_hop12_r2"] - np_z["evoked_np_no_hop12_r2"]),
                 "evoked_np_stratum_r": float(full["evoked_np_stratum_r"] - np_z["evoked_np_stratum_r"]),
+                "evoked_np_exclusive_r2": float(full["evoked_np_exclusive_r2"] - np_z["evoked_np_exclusive_r2"]),
             },
             "delta_ma_knockout": {
                 "evoked_ma_stratum_r2": float(full["evoked_ma_stratum_r2"] - ma_z["evoked_ma_stratum_r2"]),
                 "evoked_ma_no_hop12_r2": float(full["evoked_ma_no_hop12_r2"] - ma_z["evoked_ma_no_hop12_r2"]),
                 "evoked_ma_stratum_r": float(full["evoked_ma_stratum_r"] - ma_z["evoked_ma_stratum_r"]),
+                "evoked_ma_exclusive_r2": float(full["evoked_ma_exclusive_r2"] - ma_z["evoked_ma_exclusive_r2"]),
             },
         }
+        return (res_c, full_arrs) if capture_full else res_c
 
-    res = {"timescales": timescales, "wt": _run_cohort(loader_wt)}
+    wt_res, wt_arrs = _run_cohort(loader_wt, capture_full=(loader_u31 is not None))
+    res = {"timescales": timescales, "wt": wt_res}
     if loader_u31 is not None:
-        res["unc31"] = _run_cohort(loader_u31)
+        u31_res, u31_arrs = _run_cohort(loader_u31, capture_full=True)
+        res["unc31"] = u31_res
+        res["matched_delta_kernel"] = compute_matched_kernel_difference(
+            wt_arrs[0], wt_arrs[1], wt_arrs[2], wt_arrs[3],
+            u31_arrs[0], u31_arrs[1], u31_arrs[2], u31_arrs[3],
+            adjacency=adjacency,
+            np_adjacency=np_adj,
+            ma_adjacency=ma_adj,
+            pre_vols=pre_vols,
+            dt_obs=float(getattr(model.decoder, "dt_obs", 0.5)),
+        )
     return res
 
 

@@ -38,8 +38,18 @@ def main() -> None:
     p.add_argument("--syn-filter", action="store_true")
     p.add_argument("--prestim-oscillatory", action="store_true")
     p.add_argument("--dimensionless-physiology", action="store_true")
+    p.add_argument("--heterogeneous-leak-gauge", action="store_true")
     p.add_argument("--latent-ssm", action="store_true")
     p.add_argument("--latent-ssm-dim", default=16, type=int)
+    p.add_argument("--ssm-encoder", choices=["pooling", "gru"], default="pooling")
+    p.add_argument("--ssm-split-latent", action="store_true")
+    p.add_argument("--ssm-artifact-dim", default=8, type=int)
+    p.add_argument("--ssm-variational-traj", action="store_true")
+    p.add_argument("--ssm-smoother", action="store_true")
+    p.add_argument("--history-vols", default=0, type=int)
+    p.add_argument("--tau-np-prior", default=4.0, type=float)
+    p.add_argument("--tau-ma-prior", default=1.0, type=float)
+    p.add_argument("--tau-mod-prior-std", default=0.5, type=float)
     p.add_argument("--stim-actuator", action="store_true")
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)
@@ -66,8 +76,12 @@ def main() -> None:
         wide_amp_priors=args.wide_amp_priors,
         evoked_syn_priors=args.evoked_syn_priors,
         dimensionless=args.dimensionless_physiology,
+        leak_gauge=("zero_mean_log" if args.heterogeneous_leak_gauge else "unit"),
         split_extrasynaptic=args.split_extrasynaptic,
         use_syn_filter=args.syn_filter,
+        tau_np_prior=args.tau_np_prior,
+        tau_ma_prior=args.tau_ma_prior,
+        tau_mod_prior_std=args.tau_mod_prior_std,
         shuffle_seed=args.shuffle_seed,
     )
     use_prestim = not args.no_prestim_encoder
@@ -87,6 +101,12 @@ def main() -> None:
         stim_tau_decay=args.stim_tau_decay,
         use_latent_ssm=args.latent_ssm,
         latent_ssm_dim=args.latent_ssm_dim,
+        ssm_encoder=args.ssm_encoder,
+        ssm_split_latent=args.ssm_split_latent,
+        ssm_artifact_dim=args.ssm_artifact_dim,
+        ssm_variational_traj=args.ssm_variational_traj,
+        ssm_smoother=args.ssm_smoother,
+        history_vols=args.history_vols,
     )
     model = vae.VAElegans(
         rec,
@@ -102,9 +122,14 @@ def main() -> None:
 
     # Always score against the intact biological adjacency; a shuffled model is a
     # control, not a new connectome definition.
-    intact = c302.readConnectome(os.path.join(REPO, "data/CElegansNeuronTables.xls"))
+    intact = c302.readConnectome(
+        os.path.join(REPO, "data/CElegansNeuronTables.xls"),
+        use_extrasynaptic=True,
+        split_extrasynaptic=True,
+    )
     adjacency = intact.synapse.adjacency_matrix(intact.neuronSize)
-    np_adjacency = intact.synapse.extrasynaptic_adjacency_matrix(intact.neuronSize)
+    np_adjacency = intact.synapse.np_adjacency_matrix(intact.neuronSize)
+    ma_adjacency = intact.synapse.ma_adjacency_matrix(intact.neuronSize)
     np.random.seed(args.eval_seed)
     torch.manual_seed(args.eval_seed)
     if torch.cuda.is_available():
@@ -119,6 +144,7 @@ def main() -> None:
         pre_vols=args.pre_vols,
         adjacency=adjacency,
         np_adjacency=np_adjacency,
+        ma_adjacency=ma_adjacency,
     )
     result = {
         "metrics": metrics,

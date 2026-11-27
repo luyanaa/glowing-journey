@@ -17,6 +17,7 @@ from pyro_svi_c302 import (
     DEFAULT_DATA_PATH,
     _save_snapshot,
     evaluate_predictions,
+    extract_and_expand_posterior_samples,
     format_eval_summary,
 )
 from utils import (
@@ -184,14 +185,7 @@ def _aux_kernel_step(
         guide_kw["drift_gate"] = drift_gate
 
     tr = pyro.poutine.trace(model.guide).get_trace(**guide_kw)
-    ps = {}
-    for name, site in tr.nodes.items():
-        if site["type"] == "sample" and not site.get("is_observed", False):
-            val = site["value"]
-            if val.dim() >= 1 and val.shape[0] == B:
-                ps[name] = val.repeat(2, *([1] * (val.dim() - 1)))
-            else:
-                ps[name] = val
+    ps = extract_and_expand_posterior_samples(tr, repeat_factor=2)
 
     stacked_kw = dict(
         ExternalInput=torch.cat([stim, torch.zeros_like(stim)], dim=0),
@@ -207,7 +201,7 @@ def _aux_kernel_step(
             g_cat = torch.cat([drift_gate, drift_gate], dim=1 if drift_gate.dim() == 3 else 0) if drift_gate.dim() >= 2 else drift_gate
             stacked_kw["drift_gate"] = g_cat
     if has_ssm:
-        z_dim = model.decoder.latent_ssm.z_dim
+        z_dim = int(getattr(model.decoder.latent_ssm, "total_z_dim", model.decoder.latent_ssm.z_dim))
         eps = torch.randn((B, n_t + 1, z_dim), device=stim.device, dtype=stim.dtype)
         stacked_kw["ssm_eps"] = torch.cat([eps, eps], dim=0)
 
@@ -313,6 +307,9 @@ def _set_extrasyn_only_trainable(module, extrasyn_only: bool, train_obs_sigma: b
                 ("extrasyn" in name)
                 or ("tau_np" in name)
                 or ("tau_ma" in name)
+                or ("gamma_np_mut" in name)
+                or ("gamma_ma_mut" in name)
+                or ("gamma_wired_mut" in name)
                 or (train_obs_sigma and "obs_sigma" in name)
             )
             param.requires_grad_(keep)
@@ -383,11 +380,33 @@ def main() -> None:
     parser.add_argument("--prestim-oscillatory", action="store_true",
                         help="Augment CausalPreStimEncoder with strictly causal damped oscillatory latent modes")
     parser.add_argument("--dimensionless-physiology", action="store_true",
-                        help="Fix leak conductance G=1.0 and sample tau_m=C/G and normalized conductances kappa=g/G")
+                        help="Fix leak conductance scale and sample tau_m=C/G and normalized conductances kappa=g/G")
+    parser.add_argument("--heterogeneous-leak-gauge", action="store_true",
+                        help="Use global zero-mean log leak gauge (geom_mean(G)=1) preserving gap reciprocity")
     parser.add_argument("--latent-ssm", action="store_true",
                         help="Enable autonomous discrete-time stochastic LatentNeuralSSM residual")
     parser.add_argument("--latent-ssm-dim", default=16, type=int,
                         help="Latent state dimension for LatentNeuralSSM (default: 16)")
+    parser.add_argument("--ssm-encoder", choices=["pooling", "gru"], default="pooling",
+                        help="Pre-stimulus sequence encoder for LatentNeuralSSM")
+    parser.add_argument("--ssm-split-latent", action="store_true",
+                        help="Separate neural state z_neural (current only) from autonomous z_artifact (obs residual only)")
+    parser.add_argument("--ssm-artifact-dim", default=8, type=int,
+                        help="Latent dimension for autonomous z_artifact when --ssm-split-latent is enabled")
+    parser.add_argument("--ssm-variational-traj", action="store_true",
+                        help="Sample variational latent trajectory posterior q_phi(z_t | z_{t-1}, y_{<=t})")
+    parser.add_argument("--ssm-smoother", action="store_true",
+                        help="Use bidirectional smoothing posterior during training when --ssm-variational-traj is enabled")
+    parser.add_argument("--history-vols", default=0, type=int,
+                        help="Optional trailing pre-stim window passed to SSM encoder (0 = use full pre_vols)")
+    parser.add_argument("--tau-np-prior", default=4.0, type=float,
+                        help="Prior median (seconds) for split neuropeptide timescale tau_np")
+    parser.add_argument("--tau-ma-prior", default=1.0, type=float,
+                        help="Prior median (seconds) for split monoamine timescale tau_ma")
+    parser.add_argument("--tau-mod-prior-std", default=0.5, type=float,
+                        help="Log-normal prior std for tau_np and tau_ma")
+    parser.add_argument("--use-model-adj-for-supervision", action="store_true",
+                        help="Legacy behavior: use shuffled connectome for loss reweighting/aux/val instead of intact biological adjacency")
     parser.add_argument("--kernel-loss-weight", default=0.0, type=float,
                         help="Auxiliary pair-level 1-hop response kernel K_ij(t) loss weight (0 disables)")
     parser.add_argument("--dynamics-loss-weight", default=0.0, type=float,
@@ -553,6 +572,7 @@ def main() -> None:
     )
 
     eff_extrasyn = bool(args.use_extrasynaptic or args.split_extrasynaptic)
+    leak_gauge = "zero_mean_log" if args.heterogeneous_leak_gauge else "unit"
     step_model = c302.readConnectome(
         "./data/CElegansNeuronTables.xls",
         use_extrasynaptic=eff_extrasyn,
@@ -561,15 +581,28 @@ def main() -> None:
         wide_amp_priors=args.wide_amp_priors,
         evoked_syn_priors=args.evoked_syn_priors,
         dimensionless=args.dimensionless_physiology,
+        leak_gauge=leak_gauge,
         split_extrasynaptic=args.split_extrasynaptic,
         use_syn_filter=args.syn_filter,
+        tau_np_prior=args.tau_np_prior,
+        tau_ma_prior=args.tau_ma_prior,
+        tau_mod_prior_std=args.tau_mod_prior_std,
         shuffle_seed=args.shuffle_connectome,
     )
-    adj_t = torch.as_tensor(
-        step_model.synapse.adjacency_matrix(step_model.neuronSize),
-        dtype=torch.float32,
-        device=device,
-    )
+    if args.shuffle_connectome is not None and not args.use_model_adj_for_supervision:
+        intact_ref = c302.readConnectome(
+            "./data/CElegansNeuronTables.xls",
+            use_extrasynaptic=True,
+            split_extrasynaptic=True,
+        )
+        supervision_adj = intact_ref.synapse.adjacency_matrix(intact_ref.neuronSize)
+        sup_np_adj = intact_ref.synapse.np_adjacency_matrix(intact_ref.neuronSize)
+        sup_ma_adj = intact_ref.synapse.ma_adjacency_matrix(intact_ref.neuronSize)
+    else:
+        supervision_adj = step_model.synapse.adjacency_matrix(step_model.neuronSize)
+        sup_np_adj = step_model.synapse.np_adjacency_matrix(step_model.neuronSize)
+        sup_ma_adj = step_model.synapse.ma_adjacency_matrix(step_model.neuronSize)
+    adj_t = torch.as_tensor(supervision_adj, dtype=torch.float32, device=device)
     rec_model = c302.RecurrentNematode(
         step_model,
         dt_obs=args.dt_obs,
@@ -586,6 +619,12 @@ def main() -> None:
         stim_tau_decay=args.stim_tau_decay,
         use_latent_ssm=args.latent_ssm,
         latent_ssm_dim=args.latent_ssm_dim,
+        ssm_encoder=args.ssm_encoder,
+        ssm_split_latent=args.ssm_split_latent,
+        ssm_artifact_dim=args.ssm_artifact_dim,
+        ssm_variational_traj=args.ssm_variational_traj,
+        ssm_smoother=args.ssm_smoother,
+        history_vols=args.history_vols,
     )
     model = vae.VAElegans(
         rec_model,
@@ -704,7 +743,10 @@ def main() -> None:
                     guide=model.guide,
                     num_samples=4,
                     pre_vols=args.pre_vols,
+                    adjacency=supervision_adj,
                     drift_gate_mode=gate_mode,
+                    np_adjacency=sup_np_adj,
+                    ma_adjacency=sup_ma_adj,
                 )
                 print(f"  Val  | {format_eval_summary(val_metrics)}")
             test_metrics = {}
@@ -716,7 +758,10 @@ def main() -> None:
                     guide=model.guide,
                     num_samples=4,
                     pre_vols=args.pre_vols,
+                    adjacency=supervision_adj,
                     drift_gate_mode=gate_mode,
+                    np_adjacency=sup_np_adj,
+                    ma_adjacency=sup_ma_adj,
                 )
                 print(f"  Test | {format_eval_summary(test_metrics)}")
             _save_snapshot(os.path.join(args.snapshot_dir, f"vae_epoch_{epoch+1}.pt"), model, model.guide, epoch + 1)

@@ -303,14 +303,10 @@ def _posterior_predict_pair(model, stim: torch.Tensor, mask: torch.Tensor, noise
         guide_kw["drift_gate"] = None
 
     p_stim_list, p_zero_list = [], []
+    from pyro_svi_c302 import extract_and_expand_posterior_samples
     for _ in range(num_samples):
         tr = pyro.poutine.trace(model.guide).get_trace(**guide_kw)
-        ps = {
-            name: (site["value"].repeat(2, *([1] * (site["value"].dim() - 1)))
-                   if site["value"].dim() >= 1 and site["value"].shape[0] == B else site["value"])
-            for name, site in tr.nodes.items()
-            if site["type"] == "sample" and not site.get("is_observed", False)
-        }
+        ps = extract_and_expand_posterior_samples(tr, repeat_factor=2)
         cond = pyro.condition(model, data=ps)
         out = cond(**stacked_kw)
         p_stim_list.append(out[:B].cpu().numpy())

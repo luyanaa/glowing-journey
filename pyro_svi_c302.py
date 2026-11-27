@@ -1,14 +1,16 @@
 import argparse
 import inspect
 import json
+import math
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pyro
 from pyro.infer import MCMC, NUTS, Predictive, SVI, Trace_ELBO
 from pyro.infer.autoguide import AutoDiagonalNormal, AutoLowRankMultivariateNormal
+from scipy.special import erf
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 import torch
@@ -26,6 +28,157 @@ from utils import (
 
 
 DEFAULT_DATA_PATH = resolve_default_data_path()
+
+LOCAL_LATENT_SITE_NAMES = frozenset(
+    {"prestim_z", "ssm_z0", "ssm_a0", "ssm_z_neural_0", "ssm_z_artifact_0", "ssm_z_traj"}
+)
+
+
+def is_local_sample_site(name: str, site: dict) -> bool:
+    """Return True iff `site` is a per-trial local latent rather than a global parameter."""
+    if name in LOCAL_LATENT_SITE_NAMES or name.startswith("ssm_z_t"):
+        return True
+    for frame in site.get("cond_indep_stack", ()):
+        if getattr(frame, "name", None) == "batch":
+            return True
+    return False
+
+
+def extract_and_expand_posterior_samples(
+    guide_trace, repeat_factor: int = 1
+) -> Dict[str, torch.Tensor]:
+    """Extract unobserved sample sites and expand ONLY explicit local latent sites."""
+    ps: Dict[str, torch.Tensor] = {}
+    rep = int(repeat_factor)
+    for name, site in guide_trace.nodes.items():
+        if site["type"] != "sample" or site.get("is_observed", False) or name == "batch":
+            continue
+        val = site["value"]
+        if (
+            rep > 1
+            and is_local_sample_site(name, site)
+            and torch.is_tensor(val)
+            and val.dim() >= 1
+        ):
+            ps[name] = val.repeat(rep, *([1] * (val.dim() - 1)))
+        else:
+            ps[name] = val
+    return ps
+
+
+def _calibration_sums_for_batch(
+    y_true: np.ndarray,
+    y_pred_draws: np.ndarray,
+    obs_scales: np.ndarray,
+    mask: np.ndarray,
+    pre_vols: int = 10,
+) -> Dict[str, float]:
+    """Accumulate CRPS, mixture NLL, coverage, and interval width sums for a batch."""
+    keys = (
+        "count", "crps_sum", "nll_sum", "cov50_sum", "cov90_sum", "width50_sum", "width90_sum",
+        "inlier_count", "inlier_crps_sum", "inlier_nll_sum", "inlier_cov50_sum", "inlier_cov90_sum",
+    )
+    zeros = {k: 0.0 for k in keys}
+    if y_true.ndim != 3 or int(pre_vols) >= y_true.shape[1]:
+        return zeros
+
+    t0 = max(0, int(pre_vols))
+    m_post = mask[:, t0:, :].astype(bool)
+    if not np.any(m_post):
+        return zeros
+
+    yt_all = np.asarray(y_true[:, t0:, :], dtype=np.float64)
+    draws_all = np.asarray(y_pred_draws[:, :, t0:, :], dtype=np.float64)  # (S, B, T_post, N)
+    scales_all = np.asarray(obs_scales, dtype=np.float64)
+    if scales_all.ndim == 3:
+        # (S, B, N) -> broadcast over post time
+        scales_all = np.broadcast_to(scales_all[:, :, None, :], draws_all.shape)
+    elif scales_all.ndim == 4 and scales_all.shape[2] == y_true.shape[1]:
+        scales_all = scales_all[:, :, t0:, :]
+    else:
+        scales_all = np.broadcast_to(scales_all, draws_all.shape)
+    scales_all = np.maximum(scales_all, 1e-4)
+
+    # Extract 1-D arrays over observed post-stim entries: shape (S, M) and (M,)
+    yt = yt_all[m_post]
+    mu_s = draws_all[:, m_post]
+    sig_s = scales_all[:, m_post]
+    S = max(1, mu_s.shape[0])
+
+    mu = mu_s.mean(axis=0)
+    var_ep = np.var(mu_s, axis=0)
+    var_al = np.mean(sig_s * sig_s, axis=0)
+    sig_tot = np.sqrt(np.maximum(var_ep + var_al, 1e-8))
+
+    z = (yt - mu) / sig_tot
+    phi = np.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    Phi = 0.5 * (1.0 + erf(z / math.sqrt(2.0)))
+    crps = sig_tot * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
+
+    log_comp = -0.5 * math.log(2.0 * math.pi) - np.log(sig_s) - 0.5 * ((yt[None, :] - mu_s) / sig_s) ** 2
+    max_lc = np.max(log_comp, axis=0)
+    log_mix = max_lc + np.log(np.mean(np.exp(log_comp - max_lc[None, :]), axis=0))
+    nll = -log_mix
+
+    z50 = 0.67448975
+    z90 = 1.64485363
+    abs_err = np.abs(yt - mu)
+    cov50 = (abs_err <= z50 * sig_tot).astype(np.float64)
+    cov90 = (abs_err <= z90 * sig_tot).astype(np.float64)
+    w50 = 2.0 * z50 * sig_tot
+    w90 = 2.0 * z90 * sig_tot
+
+    inl = np.abs(yt) <= 3.0
+    out = {
+        "count": float(yt.size),
+        "crps_sum": float(np.sum(crps)),
+        "nll_sum": float(np.sum(nll)),
+        "cov50_sum": float(np.sum(cov50)),
+        "cov90_sum": float(np.sum(cov90)),
+        "width50_sum": float(np.sum(w50)),
+        "width90_sum": float(np.sum(w90)),
+        "inlier_count": float(np.sum(inl)),
+        "inlier_crps_sum": float(np.sum(crps[inl])) if np.any(inl) else 0.0,
+        "inlier_nll_sum": float(np.sum(nll[inl])) if np.any(inl) else 0.0,
+        "inlier_cov50_sum": float(np.sum(cov50[inl])) if np.any(inl) else 0.0,
+        "inlier_cov90_sum": float(np.sum(cov90[inl])) if np.any(inl) else 0.0,
+    }
+    return out
+
+
+def _finalize_calibration_sums(sums: Dict[str, float]) -> Dict[str, float]:
+    n = max(sums.get("count", 0.0), 0.0)
+    if n <= 0:
+        return {}
+    out = {
+        "calib_n_obs": int(n),
+        "calib_crps": float(sums["crps_sum"] / n),
+        "calib_nll": float(sums["nll_sum"] / n),
+        "calib_cov50": float(sums["cov50_sum"] / n),
+        "calib_cov90": float(sums["cov90_sum"] / n),
+        "calib_width50": float(sums["width50_sum"] / n),
+        "calib_width90": float(sums["width90_sum"] / n),
+    }
+    ni = max(sums.get("inlier_count", 0.0), 0.0)
+    if ni > 0:
+        out["calib_inlier_crps"] = float(sums["inlier_crps_sum"] / ni)
+        out["calib_inlier_nll"] = float(sums["inlier_nll_sum"] / ni)
+        out["calib_inlier_cov50"] = float(sums["inlier_cov50_sum"] / ni)
+        out["calib_inlier_cov90"] = float(sums["inlier_cov90_sum"] / ni)
+    return out
+
+
+def compute_predictive_calibration_metrics(
+    y_true: np.ndarray,
+    y_pred_draws: np.ndarray,
+    obs_scales: np.ndarray,
+    mask: np.ndarray,
+    pre_vols: int = 10,
+) -> Dict[str, float]:
+    """Compute CRPS, Gaussian-mixture NLL, 50%/90% coverage, and interval widths."""
+    return _finalize_calibration_sums(
+        _calibration_sums_for_batch(y_true, y_pred_draws, obs_scales, mask, pre_vols=pre_vols)
+    )
 
 
 def _save_snapshot(snapshot_path: str, model, guide, epoch: int) -> None:
@@ -91,6 +244,7 @@ def compute_stratified_metrics(
     evoked_window_vols: int = 16,
     y_pred_counterfactual: Optional[np.ndarray] = None,
     np_adjacency: Optional[np.ndarray] = None,
+    ma_adjacency: Optional[np.ndarray] = None,
     dt_obs: float = 0.5,
 ) -> Dict[str, float]:
     """Compute overall, inlier (|y|<=3), direct-stimulated, and connectome hop-stratified metrics."""
@@ -292,6 +446,16 @@ def compute_stratified_metrics(
                     ("evoked_np_no_hop12", np_hit & (~stim_target) & (~hop1_neu) & (~hop2_neu)),
                     ("evoked_np_no_wired_path", np_hit & (~stim_target) & (~wired_neu)),
                 ]
+                if ma_adjacency is not None and ma_adjacency.shape == (n_neurons, n_neurons):
+                    ma_adj = ma_adjacency.astype(bool)
+                    ma_hit = (stim_target.astype(np.int32) @ ma_adj.astype(np.int32)) > 0
+                    np_strata.extend([
+                        ("evoked_np_exclusive", np_hit & (~ma_hit) & (~stim_target) & (~hop1_neu)),
+                        ("evoked_np_exclusive_no_hop12", np_hit & (~ma_hit) & (~stim_target) & (~hop1_neu) & (~hop2_neu)),
+                        ("evoked_ma_exclusive", ma_hit & (~np_hit) & (~stim_target) & (~hop1_neu)),
+                        ("evoked_ma_exclusive_no_hop12", ma_hit & (~np_hit) & (~stim_target) & (~hop1_neu) & (~hop2_neu)),
+                        ("evoked_np_ma_overlap", np_hit & ma_hit & (~stim_target) & (~hop1_neu)),
+                    ])
                 for np_prefix, np_neu in np_strata:
                     np_sub = np.zeros_like(valid)
                     np_sub[:, t0:t_ev_end, :] = np_neu[:, None, :] & valid[:, t0:t_ev_end, :]
@@ -332,14 +496,9 @@ def evaluate_predictions(
     counterfactual_evoked: bool = True,
     evoked_window_vols: int = 16,
     np_adjacency: Optional[np.ndarray] = None,
+    ma_adjacency: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    """Evaluate posterior predictive GCaMP fit with overall, stimulated, and downstream metrics.
-
-    When ``counterfactual_evoked`` is true, the evoked prediction is the paired
-    difference between the actual-stimulus and zero-stimulus rollouts with the
-    same sampled model parameters.  This removes the pre-stim encoder drift
-    from the prediction without relying on a noisy linear extrapolation.
-    """
+    """Evaluate posterior predictive GCaMP fit with overall, stimulated, downstream, and calibration metrics."""
     if posterior_samples is not None:
         predictive = Predictive(model, posterior_samples=posterior_samples, return_sites=("_RETURN",))
     else:
@@ -352,6 +511,7 @@ def evaluate_predictions(
     )
     ssm_mod = getattr(dec, "latent_ssm", None)
     has_ssm = ssm_mod is not None
+    total_ssm_dim = int(getattr(ssm_mod, "total_z_dim", getattr(ssm_mod, "z_dim", 16))) if has_ssm else 0
     has_history = has_prestim or has_ssm
     adj = adjacency if adjacency is not None else _extract_adjacency(model)
     adj_t = (
@@ -373,6 +533,7 @@ def evaluate_predictions(
     y_pred_cfs = []
     masks = []
     stims = []
+    calib_sums: Dict[str, float] = {}
     with torch.no_grad():
         for batch in data_loader:
             stim, y, mask, noise = [b.to(device, non_blocking=True) for b in batch]
@@ -403,6 +564,7 @@ def evaluate_predictions(
                 model_kwargs["sample_obs"] = False
                 model_kwargs_zero["sample_obs"] = False
 
+            draw_scales = []
             if counterfactual_evoked:
                 stim_returns = []
                 zero_returns = []
@@ -437,14 +599,19 @@ def evaluate_predictions(
                         ps = posterior_samples
                     else:
                         gtrace = pyro.poutine.trace(guide).get_trace(**guide_kwargs)
-                        ps = {
-                            name: site["value"]
-                            for name, site in gtrace.nodes.items()
-                            if site["type"] == "sample" and name != "batch"
-                        }
+                        ps = extract_and_expand_posterior_samples(gtrace, repeat_factor=2 if can_stack else 1)
+                    obs_sig_raw = ps["decoder.obs_sigma"] if "decoder.obs_sigma" in ps else 0.15
+                    obs_sig = torch.clamp(
+                        torch.as_tensor(obs_sig_raw, device=device, dtype=stim.dtype), min=1e-3
+                    )
+                    if obs_sig.dim() >= 1 and obs_sig.numel() > 1:
+                        obs_sig = obs_sig.mean()
+                    scale_draw = torch.sqrt((obs_sig * 0.5) ** 2 + noise ** 2)
+                    draw_scales.append(scale_draw.cpu().numpy())
+
                     eps_draw = (
                         torch.randn(
-                            (bsz, stim.shape[1] + 1, int(ssm_mod.z_dim)),
+                            (bsz, stim.shape[1] + 1, total_ssm_dim),
                             device=device,
                             dtype=stim.dtype,
                         )
@@ -452,18 +619,12 @@ def evaluate_predictions(
                         else None
                     )
                     if can_stack:
-                        pz = ps.get("prestim_z")
-                        if torch.is_tensor(pz) and pz.dim() >= 2 and pz.shape[0] == bsz:
-                            ps_run = {k: v for k, v in ps.items() if k != "batch"}
-                            ps_run["prestim_z"] = torch.cat([pz, pz], dim=0)
-                        else:
-                            ps_run = {k: v for k, v in ps.items() if k != "batch"}
                         if eps_draw is not None:
-                            both_out = pyro.condition(model, data=ps_run)(
+                            both_out = pyro.condition(model, data=ps)(
                                 **stacked_kwargs, ssm_eps=torch.cat([eps_draw, eps_draw], dim=0)
                             )
                         else:
-                            both_out = pyro.condition(model, data=ps_run)(**stacked_kwargs)
+                            both_out = pyro.condition(model, data=ps)(**stacked_kwargs)
                         if both_out.dim() == 4:
                             both_out = both_out.mean(dim=0)
                         s_out, z_out = both_out.chunk(2, dim=0)
@@ -481,27 +642,49 @@ def evaluate_predictions(
                             z_out = z_out.mean(dim=0)
                     stim_returns.append(s_out)
                     zero_returns.append(z_out)
-                pred_mean = torch.stack(stim_returns).mean(dim=0)
+                pred_stack = torch.stack(stim_returns, dim=0)
+                pred_mean = pred_stack.mean(dim=0)
                 pred_cf = torch.stack(zero_returns).mean(dim=0)
+                draws_np = pred_stack.cpu().numpy()
+                scales_np = np.stack(draw_scales, axis=0)
             else:
-                if has_prestim:
-                    samples = predictive(**guide_kwargs)
-                else:
-                    samples = predictive(**guide_kwargs)
-                pred_mean = samples["_RETURN"].mean(dim=0)
+                samples = predictive(**guide_kwargs)
+                draws_t = samples["_RETURN"]
+                if draws_t.dim() == 3:
+                    draws_t = draws_t.unsqueeze(0)
+                pred_mean = draws_t.mean(dim=0)
                 pred_cf = None
-            y_trues.append(y.cpu().numpy())
+                draws_np = draws_t.cpu().numpy()
+                obs_sig_val = (
+                    torch.exp(guide.obs_sigma_loc.detach())
+                    if (guide is not None and hasattr(guide, "obs_sigma_loc"))
+                    else 0.15
+                )
+                obs_sig = torch.clamp(
+                    torch.as_tensor(obs_sig_val, device=device, dtype=stim.dtype),
+                    min=1e-3,
+                )
+                scale_one = torch.sqrt((obs_sig * 0.5) ** 2 + noise ** 2).cpu().numpy()
+                scales_np = np.broadcast_to(scale_one[None, ...], (draws_np.shape[0], *scale_one.shape))
+
+            y_np = y.cpu().numpy()
+            m_np = mask.bool().cpu().numpy()
+            bsum = _calibration_sums_for_batch(y_np, draws_np, scales_np, m_np, pre_vols=pre_vols)
+            for ck, cv in bsum.items():
+                calib_sums[ck] = calib_sums.get(ck, 0.0) + cv
+
+            y_trues.append(y_np)
             y_preds.append(pred_mean.cpu().numpy())
             if pred_cf is not None:
                 y_pred_cfs.append(pred_cf.cpu().numpy())
-            masks.append(mask.bool().cpu().numpy())
+            masks.append(m_np)
             stims.append(stim.cpu().numpy())
 
     if not y_trues:
         return {"r2": float("nan"), "mae": float("nan"), "rmse": float("nan")}
 
     dt_obs = float(getattr(getattr(model, "decoder", model), "dt_obs", 0.5))
-    return compute_stratified_metrics(
+    out_metrics = compute_stratified_metrics(
         np.concatenate(y_trues, axis=0),
         np.concatenate(y_preds, axis=0),
         np.concatenate(masks, axis=0),
@@ -512,8 +695,11 @@ def evaluate_predictions(
         evoked_window_vols=evoked_window_vols,
         y_pred_counterfactual=np.concatenate(y_pred_cfs, axis=0) if y_pred_cfs else None,
         np_adjacency=np_adjacency,
+        ma_adjacency=ma_adjacency,
         dt_obs=dt_obs,
     )
+    out_metrics.update(_finalize_calibration_sums(calib_sums))
+    return out_metrics
 
 
 def _build_datasets(args) -> Tuple[DataLoader, DataLoader, Dict[str, int]]:

@@ -208,17 +208,25 @@ class VAEGuide(PyroModule):
         use_extrasynaptic: bool = False,
         extra_dim: int = 0,
         dimensionless: bool = False,
+        leak_gauge: str = "unit",
         split_extrasynaptic: bool = False,
         np_dim: int = 0,
         ma_dim: int = 0,
         use_syn_filter: bool = False,
         tau_syn_dim: int = 0,
+        tau_np_prior: float = 4.0,
+        tau_ma_prior: float = 1.0,
+        tau_mod_prior_std: float = 0.5,
+        genotype_conditioned: bool = False,
+        ssm_variational_traj: bool = False,
+        history_vols: int = 0,
     ):
         super().__init__()
         self.wide_amp_priors = bool(wide_amp_priors)
         self.evoked_syn_priors = bool(evoked_syn_priors)
         self.direct_global_guide = bool(direct_global_guide)
         self.dimensionless = bool(dimensionless)
+        self.leak_gauge = str(leak_gauge)
         cond_scale = 2.0 if self.dimensionless else 1.0
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
@@ -236,6 +244,12 @@ class VAEGuide(PyroModule):
         self.ma_dim = int(ma_dim)
         self.use_syn_filter = bool(use_syn_filter)
         self.tau_syn_dim = int(tau_syn_dim) if int(tau_syn_dim) > 0 else int(wicks_dim)
+        self.tau_np_prior = float(tau_np_prior)
+        self.tau_ma_prior = float(tau_ma_prior)
+        self.tau_mod_prior_std = float(tau_mod_prior_std)
+        self.genotype_conditioned = bool(genotype_conditioned)
+        self.ssm_variational_traj = bool(ssm_variational_traj)
+        self.history_vols = int(history_vols)
 
         if e_rev_prior is not None and self.wicks_dim > 0:
             e_prior = torch.as_tensor(e_rev_prior, dtype=torch.float32).detach().clone().reshape(self.wicks_dim)
@@ -255,6 +269,11 @@ class VAEGuide(PyroModule):
             if self.dimensionless:
                 self.register_buffer("neuron_G_loc", torch.zeros(self.neuron_dim))
                 self.register_buffer("neuron_G_scale", torch.full((self.neuron_dim,), 0.15))
+                if self.leak_gauge == "zero_mean_log":
+                    self.neuron_log_G_raw_loc = PyroParam(torch.zeros(self.neuron_dim))
+                    self.neuron_log_G_raw_scale = PyroParam(
+                        torch.full((self.neuron_dim,), 0.15), constraint=constraints.interval(1e-3, 1.0)
+                    )
                 c_init = math.log(0.10)
             else:
                 self.neuron_G_loc = PyroParam(torch.full((self.neuron_dim,), math.log(0.5)))
@@ -312,29 +331,40 @@ class VAEGuide(PyroModule):
             self.register_buffer("_ema_gap_scale", torch.ones(self.gap_dim))
 
         if self.use_extrasynaptic and self.split_extrasynaptic:
+            tau_scale_hi = max(1.0, 2.0 * self.tau_mod_prior_std)
             if self.np_dim > 0:
                 self.extrasyn_np_gain_z = PyroParam(torch.zeros(self.np_dim))
                 self.extrasyn_np_gain_scale = PyroParam(
                     torch.full((self.np_dim,), 0.0005), constraint=constraints.interval(1e-5, 0.01)
                 )
-                self.tau_np_loc = PyroParam(torch.tensor(math.log(4.0)))
+                self.tau_np_loc = PyroParam(torch.tensor(math.log(max(self.tau_np_prior, 0.05))))
                 self.tau_np_scale = PyroParam(
-                    torch.tensor(0.3), constraint=constraints.interval(1e-3, 1.0)
+                    torch.tensor(min(0.3, 0.8 * self.tau_mod_prior_std)),
+                    constraint=constraints.interval(1e-3, tau_scale_hi),
                 )
             if self.ma_dim > 0:
                 self.extrasyn_ma_gain_z = PyroParam(torch.zeros(self.ma_dim))
                 self.extrasyn_ma_gain_scale = PyroParam(
                     torch.full((self.ma_dim,), 0.0005), constraint=constraints.interval(1e-5, 0.01)
                 )
-                self.tau_ma_loc = PyroParam(torch.tensor(math.log(1.0)))
+                self.tau_ma_loc = PyroParam(torch.tensor(math.log(max(self.tau_ma_prior, 0.05))))
                 self.tau_ma_scale = PyroParam(
-                    torch.tensor(0.3), constraint=constraints.interval(1e-3, 1.0)
+                    torch.tensor(min(0.3, 0.8 * self.tau_mod_prior_std)),
+                    constraint=constraints.interval(1e-3, tau_scale_hi),
                 )
         elif self.use_extrasynaptic and self.extra_dim > 0:
             self.extrasyn_gain_z = PyroParam(torch.zeros(self.extra_dim))
             self.extrasyn_gain_scale = PyroParam(
                 torch.full((self.extra_dim,), 0.0005), constraint=constraints.interval(1e-5, 0.01)
             )
+
+        if self.genotype_conditioned:
+            self.gamma_np_mut_loc = PyroParam(torch.tensor(0.0))
+            self.gamma_np_mut_scale = PyroParam(torch.tensor(0.25), constraint=constraints.interval(1e-3, 1.5))
+            self.gamma_ma_mut_loc = PyroParam(torch.tensor(0.0))
+            self.gamma_ma_mut_scale = PyroParam(torch.tensor(0.25), constraint=constraints.interval(1e-3, 1.5))
+            self.gamma_wired_mut_loc = PyroParam(torch.tensor(0.0))
+            self.gamma_wired_mut_scale = PyroParam(torch.tensor(0.15), constraint=constraints.interval(1e-3, 1.0))
 
         if self.use_syn_filter and self.wicks_dim > 0 and self.tau_syn_dim > 0:
             self.tau_syn_loc = PyroParam(torch.full((self.tau_syn_dim,), math.log(0.6)))
@@ -479,6 +509,7 @@ class VAEGuide(PyroModule):
         pre_stim_obs: Optional[torch.Tensor] = None,
         pre_stim_mask: Optional[torch.Tensor] = None,
         drift_gate: Optional[torch.Tensor] = None,
+        genotype_id: Optional[torch.Tensor] = None,
     ) -> None:
         if self.direct_global_guide:
             neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale = self._direct_global_params()
@@ -519,6 +550,14 @@ class VAEGuide(PyroModule):
             pyro.sample(
                 "decoder.model.Neuron.conductance.G",
                 dist.LogNormal(neuron_loc[1], neuron_scale[1]).to_event(1),
+            )
+        elif self.leak_gauge == "zero_mean_log":
+            pyro.sample(
+                "decoder.model.Neuron.conductance.log_G_raw",
+                dist.Normal(
+                    self.neuron_log_G_raw_loc - self.neuron_log_G_raw_loc.mean(),
+                    self.neuron_log_G_raw_scale,
+                ).to_event(1),
             )
         pyro.sample(
             "decoder.model.Neuron.conductance.C",
@@ -588,6 +627,19 @@ class VAEGuide(PyroModule):
                 "decoder.model.synapse.extrasyn_gain",
                 dist.Normal(ex_scale * self.extrasyn_gain_z, self.extrasyn_gain_scale).to_event(1),
             )
+        if self.genotype_conditioned:
+            pyro.sample(
+                "decoder.model.synapse.gamma_np_mut",
+                dist.LogNormal(self.gamma_np_mut_loc, self.gamma_np_mut_scale),
+            )
+            pyro.sample(
+                "decoder.model.synapse.gamma_ma_mut",
+                dist.LogNormal(self.gamma_ma_mut_loc, self.gamma_ma_mut_scale),
+            )
+            pyro.sample(
+                "decoder.model.synapse.gamma_wired_mut",
+                dist.LogNormal(self.gamma_wired_mut_loc, self.gamma_wired_mut_scale),
+            )
 
         if self.per_neuron_stim_gain:
             pyro.sample(
@@ -623,7 +675,9 @@ class VAEGuide(PyroModule):
             dist.Normal(self.gcamp_offset_loc, self.gcamp_offset_scale).to_event(1),
         )
 
-        if self.prestim_q is not None:
+        ssm_ref = getattr(self, "_latent_ssm_ref", None)
+        use_ssm_q = bool(self.ssm_variational_traj and ssm_ref is not None)
+        if self.prestim_q is not None or use_ssm_q:
             ref = ExternalInput if ExternalInput is not None else (y if y is not None else VoltageClamp)
             batch_size = 1 if (ref is None or ref.dim() == 2) else ref.shape[0]
             dev = self.v_th_ca_loc.device
@@ -638,17 +692,64 @@ class VAEGuide(PyroModule):
                 t_cut = min(self.pre_vols, y.shape[1])
                 y_pre = y[:, :t_cut, :]
                 m_pre = None if mask is None else mask[:, :t_cut, :]
-            if y_pre is not None and y_pre.shape[1] > 0:
-                if y_pre.dim() == 2:
-                    y_pre = y_pre.unsqueeze(0)
-                    if m_pre is not None and m_pre.dim() == 2:
-                        m_pre = m_pre.unsqueeze(0)
-                z_loc, z_scale = self.prestim_q(y_pre, m_pre)
-            else:
-                z_loc = torch.zeros(batch_size, self.prestim_rank, device=dev, dtype=dt)
-                z_scale = torch.ones_like(z_loc)
+            if y_pre is not None and y_pre.dim() == 2:
+                y_pre = y_pre.unsqueeze(0)
+                if m_pre is not None and m_pre.dim() == 2:
+                    m_pre = m_pre.unsqueeze(0)
+
+            if self.prestim_q is not None:
+                if y_pre is not None and y_pre.shape[1] > 0:
+                    z_loc, z_scale = self.prestim_q(y_pre, m_pre)
+                else:
+                    z_loc = torch.zeros(batch_size, self.prestim_rank, device=dev, dtype=dt)
+                    z_scale = torch.ones_like(z_loc)
+
+            if use_ssm_q:
+                if y_pre is not None and y_pre.shape[1] > 0:
+                    t_pre_len = y_pre.shape[1]
+                    hk = t_pre_len if self.history_vols <= 0 else max(1, min(t_pre_len, int(self.history_vols)))
+                    y_pre_s = y_pre[:, t_pre_len - hk:t_pre_len, :]
+                    m_pre_s = None if m_pre is None else m_pre[:, t_pre_len - hk:t_pre_len, :]
+                    z0_loc, z0_sc, _, _ = ssm_ref.encode_initial(y_pre_s, m_pre_s)
+                else:
+                    z0_loc = torch.zeros(batch_size, ssm_ref.total_z_dim, device=dev, dtype=dt)
+                    z0_sc = torch.ones_like(z0_loc)
+                q_loc_seq, q_sc_seq = None, None
+                if y is not None:
+                    y_full = y.unsqueeze(0) if y.dim() == 2 else y
+                    m_full = None if mask is None else (mask.unsqueeze(0) if mask.dim() == 2 else mask)
+                    if ExternalInput is not None:
+                        s_full = ExternalInput.unsqueeze(0) if ExternalInput.dim() == 2 else ExternalInput
+                    else:
+                        s_full = torch.zeros_like(y_full)
+                    inject_t = max(0, min(self.pre_vols, y_full.shape[1]))
+                    if y_full.shape[1] > inject_t:
+                        q_loc_seq, q_sc_seq = ssm_ref.encode_traj_posterior(
+                            y_full[:, inject_t:, :],
+                            None if m_full is None else m_full[:, inject_t:, :],
+                            s_full[:, inject_t:, :],
+                            allow_smoother=bool(ssm_ref.use_smoother),
+                        )
+
             with batch_plate:
-                pyro.sample("prestim_z", dist.Normal(z_loc, z_scale).to_event(1))
+                if self.prestim_q is not None:
+                    pyro.sample("prestim_z", dist.Normal(z_loc, z_scale).to_event(1))
+                if use_ssm_q:
+                    pyro.sample(
+                        "ssm_z0",
+                        dist.Normal(z0_loc[:, :ssm_ref.z_dim], z0_sc[:, :ssm_ref.z_dim]).to_event(1),
+                    )
+                    if ssm_ref.split_obs_latent:
+                        pyro.sample(
+                            "ssm_a0",
+                            dist.Normal(z0_loc[:, ssm_ref.z_dim:], z0_sc[:, ssm_ref.z_dim:]).to_event(1),
+                        )
+                    if q_loc_seq is not None:
+                        for k_t in range(q_loc_seq.shape[1]):
+                            pyro.sample(
+                                f"ssm_z_t{k_t}",
+                                dist.Normal(q_loc_seq[:, k_t, :], q_sc_seq[:, k_t, :]).to_event(1),
+                            )
 
 
 class VAElegans(PyroModule):
@@ -698,11 +799,20 @@ class VAElegans(PyroModule):
         wicks_mod = getattr(syn_mod, "wicks", None)
         use_syn_filter = bool(getattr(wicks_mod, "use_syn_filter", False))
         tau_syn_dim = int(neuron_dim) if (wicks_mod is not None and getattr(wicks_mod, "share_presynaptic", False)) else int(wicks_dim)
-        dimensionless = bool(
-            getattr(getattr(getattr(getattr(model, "model", None), "Neuron", None), "conductance", None), "dimensionless", False)
-        )
+        cond_mod = getattr(getattr(getattr(model, "model", None), "Neuron", None), "conductance", None)
+        dimensionless = bool(getattr(cond_mod, "dimensionless", False))
+        leak_gauge = str(getattr(cond_mod, "leak_gauge", "unit"))
+        tau_np_prior = float(getattr(syn_mod, "tau_np_prior", 4.0))
+        tau_ma_prior = float(getattr(syn_mod, "tau_ma_prior", 1.0))
+        tau_mod_prior_std = float(getattr(syn_mod, "tau_mod_prior_std", 0.5))
+        genotype_conditioned = bool(getattr(syn_mod, "genotype_conditioned", False))
+        ssm_mod = getattr(model, "latent_ssm", None)
+        ssm_variational_traj = bool(getattr(ssm_mod, "variational_traj", False)) if ssm_mod is not None else False
+        history_vols = int(getattr(model, "history_vols", 0))
         self.direct_global_guide = bool(direct_global_guide)
         self.dimensionless = dimensionless
+        self.leak_gauge = leak_gauge
+        self.genotype_conditioned = genotype_conditioned
         self.guide = VAEGuide(
             neuron_dim, wicks_dim, gap_dim,
             e_rev_prior=e_rev_prior,
@@ -720,12 +830,21 @@ class VAElegans(PyroModule):
             use_extrasynaptic=use_extrasynaptic,
             extra_dim=extra_dim,
             dimensionless=dimensionless,
+            leak_gauge=leak_gauge,
             split_extrasynaptic=split_extrasynaptic,
             np_dim=np_dim,
             ma_dim=ma_dim,
             use_syn_filter=use_syn_filter,
             tau_syn_dim=tau_syn_dim,
+            tau_np_prior=tau_np_prior,
+            tau_ma_prior=tau_ma_prior,
+            tau_mod_prior_std=tau_mod_prior_std,
+            genotype_conditioned=genotype_conditioned,
+            ssm_variational_traj=ssm_variational_traj,
+            history_vols=history_vols,
         )
+        # Non-module reference prevents duplicate Pyro/PyTorch state_dict registration of latent_ssm
+        object.__setattr__(self.guide, "_latent_ssm_ref", ssm_mod)
         self.decoder = model
         self.neuron_dim = int(neuron_dim)
         self.wicks_dim = int(wicks_dim)
@@ -834,6 +953,8 @@ class VAElegans(PyroModule):
         drift_gate: Optional[torch.Tensor] = None,
         sample_obs: bool = True,
         ssm_eps: Optional[torch.Tensor] = None,
+        genotype_id: Optional[torch.Tensor] = None,
+        filter_online: bool = False,
     ) -> torch.Tensor:
         return self.decoder(
             ExternalInput=ExternalInput,
@@ -847,4 +968,6 @@ class VAElegans(PyroModule):
             drift_gate=drift_gate,
             sample_obs=sample_obs,
             ssm_eps=ssm_eps,
+            genotype_id=genotype_id,
+            filter_online=filter_online,
         )
