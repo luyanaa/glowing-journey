@@ -1,0 +1,152 @@
+{
+  "checkpoint": "/content/p5ab_out/s1b_split_np_ma/fold0/intact_seed42/vae_epoch_15.pt",
+  "wt_cache": "/content/randi_causal_pre40.npz",
+  "unc31_cache": "/content/randi_unc31_pre40.npz",
+  "split_file": "/content/p5ab_out/s1b_split_np_ma/fold_0.json",
+  "substeps": 4,
+  "pre_vols": 40,
+  "num_samples": 16,
+  "double_dissociation": {
+    "timescales": {
+      "tau_np_median_s": 1.999884009361267,
+      "tau_ma_median_s": 0.46974751353263855,
+      "tau_syn_median_s": 0.5933223366737366
+    },
+    "wt": {
+      "full": {
+        "post_inlier_r2": 0.029390811920166016,
+        "evoked_hop1_r2": 0.03498487925664795,
+        "evoked_np_stratum_r2": 0.008376828892126653,
+        "evoked_np_stratum_r": 0.12956974627635326,
+        "evoked_np_no_hop12_r2": 0.001011596184443908,
+        "evoked_np_stratum_count": 63392,
+        "evoked_ma_stratum_r2": 0.002318531732315332,
+        "evoked_ma_stratum_r": 0.07529883706941112,
+        "evoked_ma_no_hop12_r2": -0.00137821961392115,
+        "evoked_ma_stratum_count": 14144,
+        "kernel_hop1_r": 0.28822707747366555,
+        "kernel_hop1_peak_latency_mae_s": 2.596514745308311
+      },
+      "np_zero": {
+        "post_inlier_r2": 0.028891384601593018,
+        "evoked_hop1_r2": 0.03500988368229019,
+        "evoked_np_stratum_r2": 0.007803577561186104,
+        "evoked_np_stratum_r": 0.12301174386382017,
+        "evoked_np_no_hop12_r2": 0.0006480698452329126,
+        "evoked_np_stratum_count": 63392,
+        "evoked_ma_stratum_r2": 0.0024722809938777512,
+        "evoked_ma_stratum_r": 0.08281194790753266,
+        "evoked_ma_no_hop12_r2": -0.0013170652747327427,
+        "evoked_ma_stratum_count": 14144,
+        "kernel_hop1_r": 0.2877819024355114,
+        "kernel_hop1_peak_latency_mae_s": 2.611260053619303
+      },
+      "ma_zero": {
+        "post_inlier_r2": 0.029176831245422363,
+        "evoked_hop1_r2": 0.03495362242338218,
+        "evoked_np_stratum_r2": 0.008439035480436341,
+        "evoked_np_stratum_r": 0.12980965170989064,
+        "evoked_np_no_hop12_r2": 0.0009400665098006078,
+        "evoked_np_stratum_count": 63392,
+        "evoked_ma_stratum_r2": 0.002308794357649302,
+        "evoked_ma_stratum_r": 0.08327922197240192,
+        "evoked_ma_no_hop12_r2": -0.0012095865243886283,
+        "evoked_ma_stratum_count": 14144,
+        "kernel_hop1_r": 0.28777790600673825,
+        "kernel_hop1_peak_latency_mae_s": 2.603217158176944
+      },
+      "both_zero": {
+        "post_inlier_r2": 0.028576672077178955,
+        "evoked_hop1_r2": 0.03494014509877241,
+        "evoked_np_stratum_r2": 0.0078014557522113614,
+        "evoked_np_stratum_r": 0.12246395275511189,
+        "evoked_np_no_hop12_r2": 0.0005514160471882246,
+        "evoked_np_stratum_count": 63392,
+        "evoked_ma_stratum_r2": 0.002363773691938409,
+        "evoked_ma_stratum_r": 0.08594938494977976,
+        "evoked_ma_no_hop12_r2": -0.001253740267792569,
+        "evoked_ma_stratum_count": 14144,
+        "kernel_hop1_r": 0.2873906834214614,
+        "kernel_hop1_peak_latency_mae_s": 2.611260053619303
+      },
+      "delta_np_knockout": {
+        "evoked_np_stratum_r2": 0.0005732513309405496,
+        "evoked_np_no_hop12_r2": 0.00036352633921099553,
+        "evoked_np_stratum_r": 0.006558002412533084
+      },
+      "delta_ma_knockout": {
+        "evoked_ma_stratum_r2": 9.737374666030085e-06,
+        "evoked_ma_no_hop12_r2": -0.00016863308953252165,
+        "evoked_ma_stratum_r": -0.0079803849029908
+      }
+    },
+    "unc31": {
+      "full": {
+        "post_inlier_r2": 0.031498730182647705,
+        "evoked_hop1_r2": 0.03467351846578126,
+        "evoked_np_stratum_r2": 0.0033680434304185214,
+        "evoked_np_stratum_r": 0.06772347563351626,
+        "evoked_np_no_hop12_r2": 0.0008090086128931251,
+        "evoked_np_stratum_count": 51712,
+        "evoked_ma_stratum_r2": 0.002775290771028338,
+        "evoked_ma_stratum_r": 0.15758446268312662,
+        "evoked_ma_no_hop12_r2": -0.003970672966836508,
+        "evoked_ma_stratum_count": 10112,
+        "kernel_hop1_r": 0.27901643973371587,
+        "kernel_hop1_peak_latency_mae_s": 2.7855392156862746
+      },
+      "np_zero": {
+        "post_inlier_r2": 0.030659615993499756,
+        "evoked_hop1_r2": 0.03476174678387545,
+        "evoked_np_stratum_r2": 0.0024728285342554557,
+        "evoked_np_stratum_r": 0.05477369287002577,
+        "evoked_np_no_hop12_r2": 0.0002254984580515318,
+        "evoked_np_stratum_count": 51712,
+        "evoked_ma_stratum_r2": 0.0026752868841017907,
+        "evoked_ma_stratum_r": 0.1557089467662884,
+        "evoked_ma_no_hop12_r2": -0.0038776135693696645,
+        "evoked_ma_stratum_count": 10112,
+        "kernel_hop1_r": 0.2793030000017376,
+        "kernel_hop1_peak_latency_mae_s": 2.7745098039215685
+      },
+      "ma_zero": {
+        "post_inlier_r2": 0.031369149684906006,
+        "evoked_hop1_r2": 0.03472881275103212,
+        "evoked_np_stratum_r2": 0.003344785022084018,
+        "evoked_np_stratum_r": 0.06707994723918935,
+        "evoked_np_no_hop12_r2": 0.0007037259941848895,
+        "evoked_np_stratum_count": 51712,
+        "evoked_ma_stratum_r2": 0.003219704030313242,
+        "evoked_ma_stratum_r": 0.20713248411334767,
+        "evoked_ma_no_hop12_r2": -0.0037157625224513158,
+        "evoked_ma_stratum_count": 10112,
+        "kernel_hop1_r": 0.2785940934089005,
+        "kernel_hop1_peak_latency_mae_s": 2.7892156862745097
+      },
+      "both_zero": {
+        "post_inlier_r2": 0.030352473258972168,
+        "evoked_hop1_r2": 0.03478515720169506,
+        "evoked_np_stratum_r2": 0.0023886575816577382,
+        "evoked_np_stratum_r": 0.053379787978109335,
+        "evoked_np_no_hop12_r2": 8.497468885748649e-05,
+        "evoked_np_stratum_count": 51712,
+        "evoked_ma_stratum_r2": 0.0029855710620507736,
+        "evoked_ma_stratum_r": 0.19840691250426384,
+        "evoked_ma_no_hop12_r2": -0.003769986647960577,
+        "evoked_ma_stratum_count": 10112,
+        "kernel_hop1_r": 0.27901671892728735,
+        "kernel_hop1_peak_latency_mae_s": 2.7732843137254903
+      },
+      "delta_np_knockout": {
+        "evoked_np_stratum_r2": 0.0008952148961630657,
+        "evoked_np_no_hop12_r2": 0.0005835101548415933,
+        "evoked_np_stratum_r": 0.012949782763490486
+      },
+      "delta_ma_knockout": {
+        "evoked_ma_stratum_r2": -0.0004444132592849037,
+        "evoked_ma_no_hop12_r2": -0.0002549104443851924,
+        "evoked_ma_stratum_r": -0.04954802143022105
+      }
+    }
+  }
+}
