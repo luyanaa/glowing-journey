@@ -3247,6 +3247,20 @@ def test_worm_latent_generative_factor_and_ttt_d():
     assert yp.shape == (1, 10, n) and ycf.shape == (1, 10, n)
     restore_population_state(vm, snap)
 
+    # Round-trip checkpoint detection & strict state_dict loading for Pyro _unconstrained worm_b/U_chem keys
+    sd = {k: v.detach().clone() for k, v in vm.state_dict().items()}
+    u_key = next((k for k in ("decoder.U_chem_unconstrained", "decoder.U_chem") if k in sd), None)
+    w_key = next((k for k in ("guide.worm_b_loc_unconstrained", "guide.worm_b_loc") if k in sd), None)
+    assert u_key is not None and w_key is not None
+    pyro.clear_param_store()
+    step2 = c302.NematodeForStep(n, {}, syn_list, dimensionless=True)
+    rec2 = c302.RecurrentNematode(
+        step2, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4,
+        worm_latent_dim=int(sd[u_key].shape[1]), num_worms=int(sd[w_key].shape[0]),
+    )
+    vm2 = vae.VAElegans(rec2, n, 1, 0, direct_global_guide=True)
+    vm2.load_state_dict(sd, strict=True)
+
 
 def test_hardened_genotype_joint_messenger_calib_and_identifiability():
     """Hardened genotype joint skips gamma_wired_mut when fixed, calibrates strain obs, reweights ELBO, and reports Fisher corr."""

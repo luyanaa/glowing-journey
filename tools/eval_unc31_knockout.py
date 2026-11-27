@@ -114,8 +114,13 @@ def _build_ckpt_model(
     else:
         ssm_dim = 16
     ssm_state_observer = any("decoder.latent_ssm.obs_local_fc1." in k for k in ms_keys)
-    worm_dim_ckpt = int(snap["MODEL_STATE"]["decoder.U_chem"].shape[1]) if "decoder.U_chem" in ms_keys else 0
-    num_worms_ckpt = int(snap["MODEL_STATE"]["guide.worm_b_loc"].shape[0]) if "guide.worm_b_loc" in ms_keys else 0
+    u_chem_t = next((snap["MODEL_STATE"][k] for k in ("decoder.U_chem_unconstrained", "decoder.U_chem") if k in ms_keys), None)
+    worm_b_t = next(
+        (snap["MODEL_STATE"][k] for k in ("guide.worm_b_loc_unconstrained", "guide.worm_b_loc", "decoder.worm_b_unconstrained", "decoder.worm_b") if k in ms_keys),
+        None,
+    )
+    worm_dim_ckpt = int(u_chem_t.shape[1]) if u_chem_t is not None else 0
+    num_worms_ckpt = int(worm_b_t.shape[0]) if worm_b_t is not None else 0
 
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),

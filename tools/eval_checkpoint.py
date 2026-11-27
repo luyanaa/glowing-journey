@@ -92,8 +92,13 @@ def main() -> None:
     use_prestim = not args.no_prestim_encoder
     snap = torch.load(args.checkpoint, map_location=device, weights_only=False)
     ms = snap["MODEL_STATE"]
-    worm_dim_ckpt = int(ms["decoder.U_chem"].shape[1]) if "decoder.U_chem" in ms else int(args.worm_latent_dim)
-    num_worms_ckpt = int(ms["guide.worm_b_loc"].shape[0]) if "guide.worm_b_loc" in ms else 0
+    u_chem_t = next((ms[k] for k in ("decoder.U_chem_unconstrained", "decoder.U_chem") if k in ms), None)
+    worm_b_t = next(
+        (ms[k] for k in ("guide.worm_b_loc_unconstrained", "guide.worm_b_loc", "decoder.worm_b_unconstrained", "decoder.worm_b") if k in ms),
+        None,
+    )
+    worm_dim_ckpt = int(u_chem_t.shape[1]) if u_chem_t is not None else int(args.worm_latent_dim)
+    num_worms_ckpt = int(worm_b_t.shape[0]) if worm_b_t is not None else 0
     rec = c302.RecurrentNematode(
         step,
         dt_obs=0.5,
