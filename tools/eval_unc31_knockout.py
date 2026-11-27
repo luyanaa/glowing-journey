@@ -39,6 +39,10 @@ def _build_ckpt_model(
     shuffle_seed: Optional[int] = None,
     device: torch.device = torch.device("cpu"),
     pre_vols: Optional[int] = None,
+    evoked_syn_priors: bool = False,
+    tau_np_prior: float = 4.0,
+    tau_ma_prior: float = 1.0,
+    tau_mod_prior_std: float = 0.5,
 ):
     pyro.clear_param_store()
     snap = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -110,10 +114,14 @@ def _build_ckpt_model(
         per_edge_release=per_edge_release,
         per_neuron_stim_gain=per_neuron_stim_gain,
         wide_amp_priors=True,
+        evoked_syn_priors=evoked_syn_priors,
         dimensionless=dimensionless,
         leak_gauge=leak_gauge,
         split_extrasynaptic=split_extrasyn,
         use_syn_filter=use_syn_filter,
+        tau_np_prior=tau_np_prior,
+        tau_ma_prior=tau_ma_prior,
+        tau_mod_prior_std=tau_mod_prior_std,
         shuffle_seed=shuffle_seed,
     )
     rec = c302.RecurrentNematode(
@@ -473,6 +481,10 @@ def main():
     p.add_argument("--substeps", default=4, type=int)
     p.add_argument("--pre-vols", default=10, type=int)
     p.add_argument("--num-samples", default=8, type=int)
+    p.add_argument("--evoked-syn-priors", action="store_true")
+    p.add_argument("--tau-np-prior", default=4.0, type=float)
+    p.add_argument("--tau-ma-prior", default=1.0, type=float)
+    p.add_argument("--tau-mod-prior-std", default=0.5, type=float)
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -500,6 +512,10 @@ def main():
             shuffle_seed=None,
             device=device,
             pre_vols=args.pre_vols,
+            evoked_syn_priors=args.evoked_syn_priors,
+            tau_np_prior=args.tau_np_prior,
+            tau_ma_prior=args.tau_ma_prior,
+            tau_mod_prior_std=args.tau_mod_prior_std,
         )
         dd = evaluate_np_ma_double_dissociation(
             model, loader_wt, loader_u31, adj, np_adj, ma_adj,

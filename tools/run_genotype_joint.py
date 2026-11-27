@@ -209,16 +209,24 @@ def main() -> None:
     ma_adj = step.synapse.ma_adjacency_matrix(step.neuronSize)
     adj_t = torch.as_tensor(adj, dtype=torch.float32, device=device)
 
+    snap = torch.load(args.init_from, map_location=device, weights_only=False)
+    ms_keys = set(snap["MODEL_STATE"].keys())
+    per_neuron_kinetics = any(
+        "tau_ca_vec" in k
+        or "k_off_vec" in k
+        or (k == "guide.tau_ca_loc_unconstrained" and snap["MODEL_STATE"][k].numel() > 1)
+        for k in ms_keys
+    )
+
     rec = c302.RecurrentNematode(
         step, dt_obs=0.5, substeps=args.substeps, use_prestim_encoder=False,
-        pre_vols=args.pre_vols, per_neuron_kinetics=True, stim_actuator=True,
+        pre_vols=args.pre_vols, per_neuron_kinetics=per_neuron_kinetics, stim_actuator=True,
         stim_tau_rise=0.08, stim_tau_decay=0.4,
     )
     model = vae.VAElegans(
         rec, step.neuronSize, len(step.synapse.Wicks_SRC), len(step.synapse.Gap_Junction_SRC),
         direct_global_guide=True,
     ).to(device)
-    snap = torch.load(args.init_from, map_location=device, weights_only=False)
     skipped, missing, unexpected = _load_compatible_state_dict(model, snap["MODEL_STATE"])
     print(f"Warm-start from {args.init_from}: skipped={len(skipped)} missing={len(missing)}", flush=True)
     if args.freeze_wired_connectome:
