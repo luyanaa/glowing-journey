@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -480,11 +480,12 @@ class WicksSynapse(PyroModule):
         inputSignal: torch.Tensor,
         cached: Optional[Tuple[torch.Tensor, ...]] = None,
         pre_act: Optional[torch.Tensor] = None,
+        edge_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (synaptic_drive_current, postsynaptic_conductance_sum) for semi-implicit integration."""
         if self.inputSize == 0:
             return torch.zeros_like(inputSignal), torch.zeros_like(inputSignal)
-        if self.share_presynaptic and not self.per_edge_release:
+        if self.share_presynaptic and not self.per_edge_release and edge_scale is None:
             mats = (
                 cached
                 if cached is not None
@@ -505,6 +506,8 @@ class WicksSynapse(PyroModule):
         dim = 0 if inputSignal.dim() == 1 else 1
         if pre_act is not None:
             act = pre_act
+            if self.share_presynaptic and not self.per_edge_release and act.shape[-1] != self.inputSize:
+                act = torch.index_select(act, dim, self.synapseInput)
         else:
             pre_v = torch.index_select(inputSignal, dim, self.synapseInput)
             if self.per_edge_release:
@@ -513,6 +516,9 @@ class WicksSynapse(PyroModule):
                     self.V_slope[self.synapseInput] * torch.exp(self.v_slope_edge_logdelta),
                     min=1e-3,
                 )
+            elif self.share_presynaptic:
+                v_rest = self.V_rest[self.synapseInput]
+                slope = torch.clamp(self.V_slope[self.synapseInput], min=1e-3)
             else:
                 v_rest = self.V_rest
                 slope = torch.clamp(self.V_slope, min=1e-3)
@@ -520,6 +526,8 @@ class WicksSynapse(PyroModule):
         g = torch.clamp(self.g_max, min=0.0)
         e_rev = torch.clamp(self.E_rev, min=-0.095, max=0.030)
         g_eff = g * self.synapseWeight * act
+        if edge_scale is not None:
+            g_eff = g_eff * edge_scale
         drive.index_add_(dim, self.synapseOutput, g_eff * e_rev)
         cond.index_add_(dim, self.synapseOutput, g_eff)
         return drive, cond
@@ -590,6 +598,7 @@ class synapseLayer(PyroModule):
         tau_ma_prior: float = 1.0,
         tau_mod_prior_std: float = 0.5,
         genotype_conditioned: bool = False,
+        fix_wired_mut: bool = False,
     ):
         super().__init__()
         self.per_edge_release = bool(per_edge_release)
@@ -602,6 +611,7 @@ class synapseLayer(PyroModule):
         self.tau_ma_prior = float(tau_ma_prior)
         self.tau_mod_prior_std = float(tau_mod_prior_std)
         self.genotype_conditioned = bool(genotype_conditioned)
+        self.fix_wired_mut = bool(fix_wired_mut)
         cond_scale = 2.0 if self.dimensionless else 1.0
         wicks_tuple = synapseList["Wicks"]
         self.Wicks_SRC, self.Wicks_DST, self.Wicks_Weight = wicks_tuple[:3]
@@ -664,7 +674,8 @@ class synapseLayer(PyroModule):
         if self.genotype_conditioned:
             self.gamma_np_mut = _sample_lognormal(self, 0.0, 0.8)
             self.gamma_ma_mut = _sample_lognormal(self, 0.0, 0.8)
-            self.gamma_wired_mut = _sample_lognormal(self, 0.0, 0.25)
+            if not self.fix_wired_mut:
+                self.gamma_wired_mut = _sample_lognormal(self, 0.0, 0.25)
 
     def build_step_cache(
         self, n_neurons: int, device: torch.device, dtype: torch.dtype, dt: float = timeStep
@@ -758,6 +769,7 @@ class synapseLayer(PyroModule):
         syn_states: Optional[Dict[str, torch.Tensor]] = None,
         dt: float = timeStep,
         genotype_id: Optional[torch.Tensor] = None,
+        edge_scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         wicks_cache = None if syn_cache is None else syn_cache.get("wicks")
         gen_cache = None if syn_cache is None else syn_cache.get("general")
@@ -796,7 +808,9 @@ class synapseLayer(PyroModule):
             pre_act = alpha_syn * syn_states["chem"] + (1.0 - alpha_syn) * act_inst
             syn_states["chem"] = pre_act
 
-        drive_w, cond_w = self.wicks.forward_terms(inputSignal, cached=wicks_cache, pre_act=pre_act)
+        drive_w, cond_w = self.wicks.forward_terms(
+            inputSignal, cached=wicks_cache, pre_act=pre_act, edge_scale=edge_scale
+        )
         drive_g, cond_g = self.general.forward_terms(inputSignal, cached=gen_cache)
         drive = drive_w + drive_g
         cond = cond_w + cond_g
@@ -807,11 +821,12 @@ class synapseLayer(PyroModule):
             is_mut = (genotype_id.to(device=inputSignal.device) > 0).to(dtype=inputSignal.dtype)
             if inputSignal.dim() >= 2 and is_mut.dim() == 1:
                 is_mut = is_mut.unsqueeze(-1)
-            g_wired = 1.0 + is_mut * (
-                torch.clamp(self.gamma_wired_mut.to(device=inputSignal.device, dtype=inputSignal.dtype), min=0.05, max=10.0) - 1.0
-            )
-            drive = drive * g_wired
-            cond = cond * g_wired
+            if not self.fix_wired_mut:
+                g_wired = 1.0 + is_mut * (
+                    torch.clamp(self.gamma_wired_mut.to(device=inputSignal.device, dtype=inputSignal.dtype), min=0.05, max=10.0) - 1.0
+                )
+                drive = drive * g_wired
+                cond = cond * g_wired
             g_np = 1.0 + is_mut * (
                 torch.clamp(self.gamma_np_mut.to(device=inputSignal.device, dtype=inputSignal.dtype), min=0.0, max=10.0) - 1.0
             )
@@ -1386,6 +1401,8 @@ class LatentNeuralSSM(PyroModule):
         artifact_dim: int = 8,
         variational_traj: bool = False,
         use_smoother: bool = False,
+        state_observer: bool = False,
+        min_decay: float = 0.0,
     ):
         super().__init__()
         if encoder_type not in ("pooling", "gru"):
@@ -1398,6 +1415,8 @@ class LatentNeuralSSM(PyroModule):
         self.total_z_dim = self.z_dim + self.artifact_dim
         self.variational_traj = bool(variational_traj)
         self.use_smoother = bool(use_smoother)
+        self.state_observer = bool(state_observer)
+        self.min_decay = float(min_decay)
 
         # Scale-invariant multi-window causal summary encoder (works for pre_vols >= 1)
         self.pre_global_fc1 = PyroModule[nn.Linear](self.neuron_size * 4, 64)
@@ -1408,7 +1427,12 @@ class LatentNeuralSSM(PyroModule):
         self.local_fc2 = PyroModule[nn.Linear](16, 2)  # (delta_v0, delta_ca0)
 
         # Autonomous stable transition & closed-loop membrane feedback + residual readouts
-        self.A_decay_logit = PyroParam(torch.full((self.z_dim,), 2.2))
+        init_decay_logits = (
+            torch.linspace(-1.5, 2.5, self.z_dim)
+            if self.min_decay > 0.0
+            else torch.full((self.z_dim,), 2.2)
+        )
+        self.A_decay_logit = PyroParam(init_decay_logits)
         self.S_skew = PyroParam(torch.zeros(self.z_dim, self.z_dim))
         self.sigma_eta_log = PyroParam(torch.full((self.z_dim,), math.log(0.04)))
 
@@ -1450,6 +1474,20 @@ class LatentNeuralSSM(PyroModule):
                     self.pre_art_fc2.bias.zero_()
             with torch.no_grad():
                 self.art_to_obs.weight.zero_()
+
+        if self.state_observer:
+            self.obs_local_fc1 = PyroModule[nn.Linear](2, 16)
+            self.obs_local_fc2 = PyroModule[nn.Linear](16, 4)  # (dv, dca, db, dsyn)
+            self.ar_decay_logit = PyroParam(torch.tensor(2.2))
+            self.ar_gain_logit = PyroParam(torch.tensor(-4.0))
+            self.ar_k_logit = PyroParam(torch.tensor(-0.5))
+            if self.split_obs_latent:
+                self.K_art_obs = PyroModule[nn.Linear](self.neuron_size, self.artifact_dim, bias=False)
+            with torch.no_grad():
+                self.obs_local_fc2.weight.mul_(0.02)
+                self.obs_local_fc2.bias.zero_()
+                if self.split_obs_latent:
+                    self.K_art_obs.weight.mul_(0.02)
 
         if self.variational_traj:
             self.q_traj_in = PyroModule[nn.Linear](self.neuron_size * 3, 48)
@@ -1533,8 +1571,12 @@ class LatentNeuralSSM(PyroModule):
         return z0_loc, z0_scale, delta_v0, delta_ca0
 
     def transition_matrix(self) -> torch.Tensor:
-        """Build stable discrete-time transition matrix A (spectral radius < 0.98)."""
-        decay = 0.98 * torch.sigmoid(self.A_decay_logit)
+        """Build stable discrete-time transition matrix A (spectral radius < 0.985)."""
+        if self.min_decay > 0.0:
+            lo = min(max(self.min_decay, 0.0), 0.98)
+            decay = lo + (0.985 - lo) * torch.sigmoid(self.A_decay_logit)
+        else:
+            decay = 0.98 * torch.sigmoid(self.A_decay_logit)
         skew = 0.5 * (self.S_skew - self.S_skew.T)
         rot = torch.linalg.matrix_exp(skew)
         return decay.unsqueeze(1) * rot
@@ -1653,6 +1695,66 @@ class LatentNeuralSSM(PyroModule):
             sig = self.sigma_eta().unsqueeze(0).expand_as(loc)
         return loc, sig
 
+    def step_ar(self, ar_state: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Strictly autonomous per-neuron AR persistence state (decays post-stim without V/stim input)."""
+        if ar_state is None or not self.state_observer:
+            return ar_state
+        decay = 0.985 * torch.sigmoid(self.ar_decay_logit)
+        return ar_state * decay
+
+    def ar_residual(self, ar_state: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if ar_state is None or not self.state_observer:
+            return None
+        gain = 0.30 * torch.sigmoid(self.ar_gain_logit)
+        return gain * ar_state
+
+    def assimilate_full_state(
+        self,
+        v: torch.Tensor,
+        ca: torch.Tensor,
+        b: torch.Tensor,
+        syn_states: Optional[Dict[str, torch.Tensor]],
+        ssm_z: torch.Tensor,
+        y_obs_t: torch.Tensor,
+        mask_t: torch.Tensor,
+        y_pred_t: torch.Tensor,
+        ssm_art: Optional[torch.Tensor] = None,
+        ar_state: Optional[torch.Tensor] = None,
+        update_physics: bool = True,
+    ):
+        """Phase 8A causal continuous physiological observer update x_{t|t} = x_{t|t-1} + K(y_t - H(x_{t|t-1}))."""
+        m = (mask_t.to(device=v.device, dtype=v.dtype) > 0.5).to(dtype=v.dtype)
+        innov = torch.nan_to_num(y_obs_t.to(device=v.device, dtype=v.dtype) - y_pred_t, nan=0.0) * m
+        ssm_z_next = ssm_z + torch.tanh(self.K_obs(innov))
+        ssm_art_next = ssm_art
+        if ssm_art is not None and self.split_obs_latent and hasattr(self, "K_art_obs"):
+            ssm_art_next = ssm_art + torch.tanh(self.K_art_obs(innov))
+
+        if not self.state_observer:
+            return v, ca, b, syn_states, ssm_z_next, ssm_art_next, ar_state
+
+        k_ar = torch.sigmoid(self.ar_k_logit)
+        ar_next = None if ar_state is None else torch.clamp(ar_state + k_ar * torch.tanh(innov), min=-4.0, max=4.0)
+        if not update_physics:
+            return v, ca, b, syn_states, ssm_z_next, ssm_art_next, ar_next
+
+        obs_in = torch.stack([torch.clamp(innov, -5.0, 5.0), m], dim=-1)
+        delta = self.obs_local_fc2(F.silu(self.obs_local_fc1(obs_in))) * m.unsqueeze(-1)
+        v_next = torch.clamp(v + 0.015 * torch.tanh(delta[..., 0]), min=-0.12, max=0.05)
+        ca_next = torch.clamp(ca + 0.25 * torch.tanh(delta[..., 1]), min=1e-4, max=20.0)
+        b_next = torch.clamp(b + 0.15 * torch.tanh(delta[..., 2]), min=1e-4, max=0.999)
+
+        new_syn = syn_states
+        if syn_states is not None:
+            ds = 0.15 * torch.tanh(delta[..., 3])
+            new_syn = dict(syn_states)
+            if "chem" in new_syn and new_syn["chem"].shape == ds.shape:
+                new_syn["chem"] = torch.clamp(new_syn["chem"] + ds, min=0.0, max=1.0)
+            for mod_key in ("np", "ma"):
+                if mod_key in new_syn and new_syn[mod_key].shape == ds.shape:
+                    new_syn[mod_key] = torch.clamp(new_syn[mod_key] + 0.5 * ds, min=0.0, max=1.0)
+        return v_next, ca_next, b_next, new_syn, ssm_z_next, ssm_art_next, ar_next
+
 
 class NematodeForStep(PyroModule):
     """Single-step continuous-time connectome + optional BNN residual current."""
@@ -1677,6 +1779,7 @@ class NematodeForStep(PyroModule):
         tau_ma_prior: float = 1.0,
         tau_mod_prior_std: float = 0.5,
         genotype_conditioned: bool = False,
+        fix_wired_mut: bool = False,
     ):
         super().__init__()
         self.register_buffer("_dev_ref", torch.tensor(0.0))
@@ -1706,6 +1809,7 @@ class NematodeForStep(PyroModule):
             tau_ma_prior=tau_ma_prior,
             tau_mod_prior_std=tau_mod_prior_std,
             genotype_conditioned=genotype_conditioned,
+            fix_wired_mut=fix_wired_mut,
         )
         # Optogenetic Chrimson cation-channel conductance (nS, or dimensionless kappa=g/G when dimensionless=True)
         self.stim_e_rev = 0.0
@@ -1736,9 +1840,16 @@ class NematodeForStep(PyroModule):
         stim_gain_cached: Optional[torch.Tensor] = None,
         syn_states: Optional[Dict[str, torch.Tensor]] = None,
         genotype_id: Optional[torch.Tensor] = None,
+        edge_scale: Optional[torch.Tensor] = None,
+        stim_scale_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         drive_cur, syn_cond = self.synapse.forward_terms(
-            Prev, syn_cache=syn_cache, syn_states=syn_states, dt=dt, genotype_id=genotype_id
+            Prev,
+            syn_cache=syn_cache,
+            syn_states=syn_states,
+            dt=dt,
+            genotype_id=genotype_id,
+            edge_scale=edge_scale,
         )
         if self.bnn_residual is not None:
             drive_cur = drive_cur + self.bnn_residual(Prev)
@@ -1751,6 +1862,8 @@ class NematodeForStep(PyroModule):
                 if stim_gain_cached is not None
                 else (self.stim_gain_vec if self.per_neuron_stim_gain else self.stim_gain)
             )
+            if stim_scale_override is not None:
+                gain = gain * stim_scale_override
             g_opt_pos = gain * torch.clamp(ExternalInput, min=0.0)
             g_opt_neg = gain * torch.clamp(-ExternalInput, min=0.0)
             ext_current = g_opt_pos * self.stim_e_rev + g_opt_neg * self.stim_e_inh
@@ -1871,6 +1984,11 @@ class RecurrentNematode(PyroModule):
         ssm_variational_traj: bool = False,
         ssm_smoother: bool = False,
         history_vols: int = 0,
+        ssm_state_observer: bool = False,
+        ssm_min_decay: float = 0.0,
+        worm_latent_dim: int = 0,
+        num_worms: int = 0,
+        strain_obs_calib: bool = False,
     ):
         super().__init__()
         self.model = model
@@ -1896,6 +2014,11 @@ class RecurrentNematode(PyroModule):
         self.ssm_variational_traj = bool(ssm_variational_traj)
         self.ssm_smoother = bool(ssm_smoother)
         self.history_vols = int(history_vols)
+        self.ssm_state_observer = bool(ssm_state_observer)
+        self.ssm_min_decay = float(ssm_min_decay)
+        self.worm_latent_dim = max(0, int(worm_latent_dim))
+        self.num_worms = max(0, int(num_worms))
+        self.strain_obs_calib = bool(strain_obs_calib)
 
         self.register_buffer("_dev_ref", torch.tensor(0.0))
         neuron_size = getattr(model, "neuronSize", 300)
@@ -1915,10 +2038,25 @@ class RecurrentNematode(PyroModule):
                 artifact_dim=self.ssm_artifact_dim,
                 variational_traj=self.ssm_variational_traj,
                 use_smoother=self.ssm_smoother,
+                state_observer=self.ssm_state_observer,
+                min_decay=self.ssm_min_decay,
             )
             if self.use_latent_ssm
             else None
         )
+        if self.worm_latent_dim > 0:
+            wicks_n = max(1, len(getattr(getattr(model, "synapse", None), "Wicks_SRC", [])))
+            self.U_chem = PyroParam(torch.randn(wicks_n, self.worm_latent_dim) * 0.05)
+            self.U_stim = PyroParam(torch.randn(neuron_size, self.worm_latent_dim) * 0.05)
+            self.U_gain = PyroParam(torch.randn(neuron_size, self.worm_latent_dim) * 0.05)
+            if self.num_worms > 0:
+                self.worm_b = _sample_normal(
+                    self, 0.0, 1.0, shape=(self.num_worms, self.worm_latent_dim), to_event=2
+                )
+        if self.strain_obs_calib:
+            self.gcamp_gain_mut = _sample_lognormal(self, 0.0, 0.25)
+            self.gcamp_offset_mut = _sample_normal(self, 0.0, 0.08)
+            self.stim_gain_mut = _sample_lognormal(self, 0.0, 0.25)
         # Dimensionless observation noise multiplier (when noise_scale is provided) or base std
         self.obs_sigma = _sample_lognormal(self, math.log(0.15), 0.5)
 
@@ -1938,7 +2076,10 @@ class RecurrentNematode(PyroModule):
         ssm_z0_sample: Optional[torch.Tensor] = None,
         ssm_a0_sample: Optional[torch.Tensor] = None,
         traj_batch_plate=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        worm_id: Optional[torch.Tensor] = None,
+        worm_b_override: Optional[torch.Tensor] = None,
+        return_latent_traj: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         batch_size, n_t, n_neurons = stim_input.shape
         dt_sim = dt_obs / max(1, self.substeps)
 
@@ -1990,6 +2131,40 @@ class RecurrentNematode(PyroModule):
         gcamp_gain = gcamp_cache[7] if gcamp_cache is not None else self.gcamp.gain
         gcamp_offset = gcamp_cache[8] if gcamp_cache is not None else self.gcamp.offset
 
+        worm_edge_scale = None
+        stim_scale_override = None
+        if self.worm_latent_dim > 0:
+            worm_b_table = self.worm_b if (self.num_worms > 0 and hasattr(self, "worm_b")) else None
+            b_w = None
+            if worm_b_override is not None:
+                b_w = worm_b_override.to(device=stim_input.device, dtype=stim_input.dtype)
+                if b_w.dim() == 1:
+                    b_w = b_w.unsqueeze(0)
+                if b_w.shape[0] == 1 and batch_size > 1:
+                    b_w = b_w.expand(batch_size, -1)
+            elif worm_b_table is not None and worm_id is not None:
+                wid = worm_id.to(device=stim_input.device, dtype=torch.long).reshape(-1)
+                valid = (wid >= 0) & (wid < self.num_worms)
+                safe_wid = torch.clamp(wid, 0, self.num_worms - 1)
+                b_raw = worm_b_table.to(device=stim_input.device, dtype=stim_input.dtype)[safe_wid]
+                b_w = torch.where(valid.unsqueeze(-1), b_raw, torch.zeros_like(b_raw))
+            if b_w is not None:
+                worm_edge_scale = torch.exp(torch.clamp(0.35 * (b_w @ self.U_chem.T), -2.0, 2.0))
+                stim_scale_override = torch.exp(torch.clamp(0.35 * (b_w @ self.U_stim.T), -2.0, 2.0))
+                gain_mult = torch.exp(torch.clamp(0.35 * (b_w @ self.U_gain.T), -2.0, 2.0))
+                gcamp_gain = gcamp_gain * gain_mult
+
+        if self.strain_obs_calib:
+            mut_gain_g = torch.clamp(self.gcamp_gain_mut.to(device=stim_input.device, dtype=stim_input.dtype), min=0.2, max=5.0)
+            mut_off_g = self.gcamp_offset_mut.to(device=stim_input.device, dtype=stim_input.dtype)
+            mut_stim_g = torch.clamp(self.stim_gain_mut.to(device=stim_input.device, dtype=stim_input.dtype), min=0.2, max=5.0)
+            if genotype_id is not None:
+                is_mut = (genotype_id.to(device=stim_input.device) > 0).to(dtype=stim_input.dtype).unsqueeze(-1)
+                gcamp_gain = gcamp_gain * (1.0 + is_mut * (mut_gain_g - 1.0))
+                gcamp_offset = gcamp_offset + is_mut * mut_off_g
+                stim_strain = 1.0 + is_mut * (mut_stim_g - 1.0)
+                stim_scale_override = stim_strain if stim_scale_override is None else (stim_scale_override * stim_strain)
+
         prestim_state = None
         inject_t = max(0, min(self.pre_vols, n_t))
         if self.prestim_encoder is not None and pre_stim_obs is not None and inject_t > 0:
@@ -2040,6 +2215,8 @@ class RecurrentNematode(PyroModule):
         ssm_sigma = None
         ssm_A_art = None
         ssm_sig_art = None
+        ar_state = None
+        has_pre_data = False
         if self.latent_ssm is not None:
             ssm_A = self.latent_ssm.transition_matrix()
             ssm_sigma = self.latent_ssm.sigma_eta()
@@ -2052,55 +2229,77 @@ class RecurrentNematode(PyroModule):
                     dtype=stim_input.dtype,
                 )
             has_pre_data = pre_stim_obs is not None and inject_t > 0
-            if has_pre_data:
-                hist_k = inject_t if self.history_vols <= 0 else max(1, min(inject_t, int(self.history_vols)))
-                h_start = inject_t - hist_k
-                y_pre_ssm = pre_stim_obs[:, h_start:inject_t, :]
-                m_pre_ssm = None if pre_stim_mask is None else pre_stim_mask[:, h_start:inject_t, :]
-                z0_loc, z0_sc, ssm_dv0, ssm_dca0 = self.latent_ssm.encode_initial(
-                    y_pre_ssm, m_pre_ssm, dt_obs=dt_obs
-                )
-            if ssm_z0_sample is not None:
-                ssm_z = ssm_z0_sample
-            elif has_pre_data:
-                ssm_z = z0_loc[:, :z_dim] + z0_sc[:, :z_dim] * ssm_eps[:, 0, :z_dim]
-            else:
-                ssm_z = torch.zeros(
-                    (batch_size, z_dim),
-                    device=stim_input.device,
-                    dtype=stim_input.dtype,
-                )
-            if self.latent_ssm.split_obs_latent:
-                ssm_A_art = self.latent_ssm.artifact_transition_matrix()
-                ssm_sig_art = self.latent_ssm.sigma_art()
-                if ssm_a0_sample is not None:
-                    ssm_art = ssm_a0_sample
-                elif has_pre_data:
-                    ssm_art = z0_loc[:, z_dim:] + z0_sc[:, z_dim:] * ssm_eps[:, 0, z_dim:]
+            if self.latent_ssm.state_observer:
+                ar_state = torch.zeros_like(v)
+                if ssm_z0_sample is not None:
+                    ssm_z = ssm_z0_sample
                 else:
-                    ssm_art = torch.zeros(
-                        (batch_size, self.latent_ssm.artifact_dim),
+                    ssm_z = torch.zeros((batch_size, z_dim), device=stim_input.device, dtype=stim_input.dtype)
+                if self.latent_ssm.split_obs_latent:
+                    ssm_A_art = self.latent_ssm.artifact_transition_matrix()
+                    ssm_sig_art = self.latent_ssm.sigma_art()
+                    ssm_art = (
+                        ssm_a0_sample
+                        if ssm_a0_sample is not None
+                        else torch.zeros((batch_size, self.latent_ssm.artifact_dim), device=stim_input.device, dtype=stim_input.dtype)
+                    )
+            else:
+                if has_pre_data:
+                    hist_k = inject_t if self.history_vols <= 0 else max(1, min(inject_t, int(self.history_vols)))
+                    h_start = inject_t - hist_k
+                    y_pre_ssm = pre_stim_obs[:, h_start:inject_t, :]
+                    m_pre_ssm = None if pre_stim_mask is None else pre_stim_mask[:, h_start:inject_t, :]
+                    z0_loc, z0_sc, ssm_dv0, ssm_dca0 = self.latent_ssm.encode_initial(
+                        y_pre_ssm, m_pre_ssm, dt_obs=dt_obs
+                    )
+                if ssm_z0_sample is not None:
+                    ssm_z = ssm_z0_sample
+                elif has_pre_data:
+                    ssm_z = z0_loc[:, :z_dim] + z0_sc[:, :z_dim] * ssm_eps[:, 0, :z_dim]
+                else:
+                    ssm_z = torch.zeros(
+                        (batch_size, z_dim),
                         device=stim_input.device,
                         dtype=stim_input.dtype,
                     )
+                if self.latent_ssm.split_obs_latent:
+                    ssm_A_art = self.latent_ssm.artifact_transition_matrix()
+                    ssm_sig_art = self.latent_ssm.sigma_art()
+                    if ssm_a0_sample is not None:
+                        ssm_art = ssm_a0_sample
+                    elif has_pre_data:
+                        ssm_art = z0_loc[:, z_dim:] + z0_sc[:, z_dim:] * ssm_eps[:, 0, z_dim:]
+                    else:
+                        ssm_art = torch.zeros(
+                            (batch_size, self.latent_ssm.artifact_dim),
+                            device=stim_input.device,
+                            dtype=stim_input.dtype,
+                        )
 
         call_cache = {"neuron_cache": neuron_cache, "stim_gain_cached": stim_gain_cached} if neuron_cache is not None else {}
         if has_geno:
             call_cache["genotype_id"] = genotype_id
+        if worm_edge_scale is not None:
+            call_cache["edge_scale"] = worm_edge_scale
+        if stim_scale_override is not None:
+            call_cache["stim_scale_override"] = stim_scale_override
 
+        z_post_traj = [] if (return_latent_traj and self.latent_ssm is not None) else None
+        is_observer = bool(self.latent_ssm is not None and self.latent_ssm.state_observer)
         for t in range(n_t):
             if t == inject_t:
                 if prestim_state is not None:
                     delta_v0, delta_ca0 = prestim_state[0], prestim_state[1]
                     v = v + delta_v0
                     ca = torch.clamp(ca + delta_ca0, min=1e-4)
-                if ssm_dv0 is not None:
+                if ssm_dv0 is not None and not is_observer:
                     v = v + ssm_dv0
                     ca = torch.clamp(ca + ssm_dca0, min=1e-4)
 
             ssm_cur = None
-            if ssm_z is not None and t >= inject_t:
-                if traj_batch_plate is not None and self.latent_ssm.variational_traj:
+            ar_res = None
+            if ssm_z is not None and (is_observer or t >= inject_t):
+                if t >= inject_t and traj_batch_plate is not None and self.latent_ssm.variational_traj:
                     p_loc = self.latent_ssm.step_latent(
                         ssm_z, v, e_rest, A_mat=ssm_A, eps=None
                     )
@@ -2109,15 +2308,23 @@ class RecurrentNematode(PyroModule):
                             f"ssm_z_t{t - inject_t}",
                             dist.Normal(p_loc, ssm_sigma).to_event(1),
                         )
-                else:
+                elif t >= inject_t:
                     ssm_z = self.latent_ssm.step_latent(
                         ssm_z, v, e_rest, A_mat=ssm_A, eps=ssm_eps[:, t + 1, :self.latent_ssm.z_dim], sigma=ssm_sigma
                     )
+                else:
+                    ssm_z = self.latent_ssm.step_latent(ssm_z, v, e_rest, A_mat=ssm_A, eps=None)
                 ssm_cur = self.latent_ssm.latent_current(ssm_z)
                 if ssm_art is not None:
+                    art_eps = ssm_eps[:, t + 1, self.latent_ssm.z_dim:] if t >= inject_t else None
                     ssm_art = self.latent_ssm.step_artifact(
-                        ssm_art, A_art=ssm_A_art, eps=ssm_eps[:, t + 1, self.latent_ssm.z_dim:], sigma=ssm_sig_art
+                        ssm_art, A_art=ssm_A_art, eps=art_eps, sigma=ssm_sig_art
                     )
+                if ar_state is not None:
+                    ar_state = self.latent_ssm.step_ar(ar_state)
+                    ar_res = self.latent_ssm.ar_residual(ar_state)
+            if z_post_traj is not None and t >= inject_t:
+                z_post_traj.append(ssm_z)
 
             ext_t = stim_input[:, t, :]
             clamp_t = None if voltage_clamp is None else voltage_clamp[:, t, :]
@@ -2148,11 +2355,19 @@ class RecurrentNematode(PyroModule):
                 )
                 ca, b = self.gcamp.step(v, ca, b, dt=dt_sim, v_th_ca=v_th_ca, cached=gcamp_cache)
             y_t = gcamp_gain * (b - b_baseline) + gcamp_offset
-            if ssm_art is not None and t >= inject_t:
+            if ssm_art is not None and (is_observer or t >= inject_t):
                 y_t = y_t + self.latent_ssm.obs_residual(ssm_art)
-            elif ssm_z is not None and t >= inject_t and not self.latent_ssm.split_obs_latent:
+            elif ssm_z is not None and (is_observer or t >= inject_t) and not self.latent_ssm.split_obs_latent:
                 y_t = y_t + self.latent_ssm.obs_residual(ssm_z)
+            if ar_res is not None:
+                y_t = y_t + ar_res
             y_preds.append(y_t)
+            if is_observer and t < inject_t and has_pre_data and t < pre_stim_obs.shape[1]:
+                m_pre_t = torch.ones_like(y_t) if pre_stim_mask is None else pre_stim_mask[:, t, :]
+                v, ca, b, syn_states, ssm_z, ssm_art, ar_state = self.latent_ssm.assimilate_full_state(
+                    v, ca, b, syn_states, ssm_z, pre_stim_obs[:, t, :], m_pre_t, y_t,
+                    ssm_art=ssm_art, ar_state=ar_state, update_physics=True,
+                )
             if return_trajectories:
                 v_traj.append(v)
                 ca_traj.append(ca)
@@ -2164,9 +2379,12 @@ class RecurrentNematode(PyroModule):
             )
             y_pred = torch.cat([y_pred[:, :inject_t, :], y_pred[:, inject_t:, :] + post_drift], dim=1)
 
-        if not return_trajectories:
-            return y_pred, None, None
-        return y_pred, torch.stack(v_traj, dim=1), torch.stack(ca_traj, dim=1)
+        v_out = torch.stack(v_traj, dim=1) if return_trajectories else None
+        ca_out = torch.stack(ca_traj, dim=1) if return_trajectories else None
+        if return_latent_traj:
+            z_out = torch.stack(z_post_traj, dim=1) if z_post_traj else None
+            return y_pred, v_out, ca_out, z_out
+        return y_pred, v_out, ca_out
 
     def simulate(
         self,
@@ -2218,6 +2436,8 @@ class RecurrentNematode(PyroModule):
         ssm_eps: Optional[torch.Tensor] = None,
         genotype_id: Optional[torch.Tensor] = None,
         filter_online: bool = False,
+        worm_id: Optional[torch.Tensor] = None,
+        worm_b_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if filter_online:
             if ExternalInput is None or y is None:
@@ -2306,6 +2526,8 @@ class RecurrentNematode(PyroModule):
             ssm_z0_sample=ssm_z0_sample,
             ssm_a0_sample=ssm_a0_sample,
             traj_batch_plate=(batch_plate if y_obs is not None else None),
+            worm_id=worm_id,
+            worm_b_override=worm_b_override,
         )
         if not sample_obs and y_obs is None:
             return y_pred.squeeze(0) if squeezed else y_pred
@@ -2420,7 +2642,13 @@ class RecurrentNematode(PyroModule):
         ssm_A = self.latent_ssm.transition_matrix()
         ssm_A_art = self.latent_ssm.artifact_transition_matrix() if self.latent_ssm.split_obs_latent else None
         z_dim = self.latent_ssm.z_dim
-        if inject_t > 0:
+        is_obs = bool(self.latent_ssm.state_observer)
+        ar_state = torch.zeros_like(v) if is_obs else None
+        if is_obs:
+            ssm_z = torch.zeros((batch_size, z_dim), device=stim_input.device, dtype=stim_input.dtype)
+            ssm_art = torch.zeros((batch_size, self.latent_ssm.artifact_dim), device=stim_input.device, dtype=stim_input.dtype) if self.latent_ssm.split_obs_latent else None
+            ssm_dv0, ssm_dca0 = None, None
+        elif inject_t > 0:
             hist_k = inject_t if self.history_vols <= 0 else max(1, min(inject_t, int(self.history_vols)))
             z0_loc, _, ssm_dv0, ssm_dca0 = self.latent_ssm.encode_initial(
                 pre_y[:, inject_t - hist_k:inject_t, :],
@@ -2439,15 +2667,19 @@ class RecurrentNematode(PyroModule):
         decay_decay = math.exp(-dt_sim / max(self.stim_tau_decay, 1e-6))
         preds = []
         for t in range(n_t):
-            if t == inject_t and ssm_dv0 is not None:
+            if t == inject_t and ssm_dv0 is not None and not is_obs:
                 v = v + ssm_dv0
                 ca = torch.clamp(ca + ssm_dca0, min=1e-4)
             ssm_cur = None
-            if t >= inject_t:
+            ar_res = None
+            if is_obs or t >= inject_t:
                 ssm_z = self.latent_ssm.step_latent(ssm_z, v, e_rest, A_mat=ssm_A, eps=None)
                 ssm_cur = self.latent_ssm.latent_current(ssm_z)
                 if ssm_art is not None:
                     ssm_art = self.latent_ssm.step_artifact(ssm_art, A_art=ssm_A_art, eps=None)
+                if ar_state is not None:
+                    ar_state = self.latent_ssm.step_ar(ar_state)
+                    ar_res = self.latent_ssm.ar_residual(ar_state)
             ext_t = stim_input[:, t, :]
             for _ in range(self.substeps):
                 if self.stim_actuator:
@@ -2465,13 +2697,22 @@ class RecurrentNematode(PyroModule):
                 )
                 ca, b = self.gcamp.step(v, ca, b, dt=dt_sim, v_th_ca=v_th_ca, cached=gcamp_cache)
             y_t = gcamp_gain * (b - b_baseline) + gcamp_offset
-            if ssm_art is not None and t >= inject_t:
+            if ssm_art is not None and (is_obs or t >= inject_t):
                 y_t = y_t + self.latent_ssm.obs_residual(ssm_art)
-            elif t >= inject_t and not self.latent_ssm.split_obs_latent:
+            elif (is_obs or t >= inject_t) and not self.latent_ssm.split_obs_latent:
                 y_t = y_t + self.latent_ssm.obs_residual(ssm_z)
+            if ar_res is not None:
+                y_t = y_t + ar_res
             preds.append(y_t)
             # Assimilate current frame y_obs[:, t, :] ONLY AFTER producing causal prediction y_t
-            if t >= inject_t:
+            if is_obs:
+                obs_f = pre_y[:, t, :] if (t < inject_t and t < pre_y.shape[1]) else y_obs[:, t, :]
+                m_f = (torch.ones_like(y_t) if pre_m is None else pre_m[:, t, :]) if (t < inject_t and t < pre_y.shape[1]) else obs_mask[:, t, :]
+                v, ca, b, syn_states, ssm_z, ssm_art, ar_state = self.latent_ssm.assimilate_full_state(
+                    v, ca, b, syn_states, ssm_z, obs_f, m_f, y_t,
+                    ssm_art=ssm_art, ar_state=ar_state, update_physics=True,
+                )
+            elif t >= inject_t:
                 ssm_z = self.latent_ssm.filter_step(ssm_z, y_obs[:, t, :], obs_mask[:, t, :], y_t)
         out = torch.stack(preds, dim=1)
         return out.squeeze(0) if squeezed else out
@@ -2608,6 +2849,72 @@ def _nt_to_reversal_prior(nt_str: str, wide_amp_priors: bool = False) -> Tuple[f
     return -0.025, 0.035
 
 
+def _rewire_edges_disjoint(
+    src: List[int],
+    dst: List[int],
+    n_neurons: int,
+    forbidden: set,
+    rng: np.random.Generator,
+    undirected: bool = False,
+) -> Tuple[List[int], List[int]]:
+    """Degree-preserving Maslov-Sneppen rewiring guaranteed disjoint from ``forbidden`` edges."""
+    if not src:
+        return [], []
+    perm = rng.permutation(n_neurons)
+    if undirected:
+        edges = [(min(int(perm[u]), int(perm[v])), max(int(perm[u]), int(perm[v]))) for u, v in zip(src, dst)]
+    else:
+        edges = [(int(perm[u]), int(perm[v])) for u, v in zip(src, dst)]
+    used = set(edges)
+
+    for idx in range(len(edges)):
+        u, v = edges[idx]
+        if (u, v) not in forbidden and (not undirected or (v, u) not in forbidden):
+            continue
+        swapped = False
+        for _ in range(256):
+            j = int(rng.integers(0, len(edges)))
+            if j == idx:
+                continue
+            uj, vj = edges[j]
+            if undirected:
+                cand1 = (min(u, vj), max(u, vj))
+                cand2 = (min(uj, v), max(uj, v))
+                ok1 = u != vj and cand1 not in forbidden and (cand1[1], cand1[0]) not in forbidden and cand1 not in used
+                ok2 = uj != v and cand2 not in forbidden and (cand2[1], cand2[0]) not in forbidden and cand2 not in used
+            else:
+                cand1 = (u, vj)
+                cand2 = (uj, v)
+                ok1 = u != vj and cand1 not in forbidden and cand1 not in used
+                ok2 = uj != v and cand2 not in forbidden and cand2 not in used
+            if ok1 and ok2 and cand1 != cand2:
+                used.discard((u, v))
+                used.discard((uj, vj))
+                edges[idx] = cand1
+                edges[j] = cand2
+                used.add(cand1)
+                used.add(cand2)
+                swapped = True
+                break
+        if not swapped:
+            used.discard((u, v))
+            picked = None
+            for cand_v in rng.permutation(n_neurons):
+                cv = int(cand_v)
+                if cv == u:
+                    continue
+                cand = (min(u, cv), max(u, cv)) if undirected else (u, cv)
+                if cand not in forbidden and (not undirected or (cand[1], cand[0]) not in forbidden) and cand not in used:
+                    picked = cand
+                    break
+            if picked is None:
+                picked = (u, v)
+            edges[idx] = picked
+            used.add(picked)
+
+    return [e[0] for e in edges], [e[1] for e in edges]
+
+
 def readConnectome(
     path: str = "./data/CElegansNeuronTables.xls",
     rnn: bool = False,
@@ -2632,6 +2939,8 @@ def readConnectome(
     np_path: str = "./data/edgelist_NP.csv",
     ma_path: str = "./data/edgelist_MA.csv",
     shuffle_seed: Optional[int] = None,
+    shuffle_disjoint: bool = False,
+    fix_wired_mut: bool = False,
 ):
     """Build C. elegans connectome step model aligned to the 300 canonical neuron IDs.
 
@@ -2723,18 +3032,42 @@ def readConnectome(
 
     if shuffle_seed is not None:
         rng = np.random.default_rng(int(shuffle_seed))
-        perm = rng.permutation(len(neuron_names))
-        gap_src = [int(perm[pair[0]]) for pair in gap_pairs]
-        gap_dst = [int(perm[pair[1]]) for pair in gap_pairs]
-        wicks_src = [int(perm[i]) for i in wicks_src]
-        wicks_dst = [int(perm[i]) for i in wicks_dst]
-        generic_src = [int(perm[i]) for i in generic_src]
-        generic_dst = [int(perm[i]) for i in generic_dst]
-        np_src = [int(perm[i]) for i in np_src]
-        np_dst = [int(perm[i]) for i in np_dst]
-        ma_src = [int(perm[i]) for i in ma_src]
-        ma_dst = [int(perm[i]) for i in ma_dst]
-        # A permutation is injective, so non-self edges stay non-self.
+        if shuffle_disjoint:
+            raw_gap_src = [pair[0] for pair in gap_pairs]
+            raw_gap_dst = [pair[1] for pair in gap_pairs]
+            forbidden_wired = (
+                set(zip(wicks_src, wicks_dst))
+                | set(zip(raw_gap_src, raw_gap_dst))
+                | set(zip(raw_gap_dst, raw_gap_src))
+            )
+            gap_src, gap_dst = _rewire_edges_disjoint(
+                raw_gap_src, raw_gap_dst, len(neuron_names), forbidden_wired, rng, undirected=True
+            )
+            wicks_src, wicks_dst = _rewire_edges_disjoint(
+                wicks_src, wicks_dst, len(neuron_names), forbidden_wired, rng, undirected=False
+            )
+            generic_src, generic_dst = _rewire_edges_disjoint(
+                generic_src, generic_dst, len(neuron_names), set(zip(generic_src, generic_dst)), rng, undirected=False
+            )
+            np_src, np_dst = _rewire_edges_disjoint(
+                np_src, np_dst, len(neuron_names), set(zip(np_src, np_dst)), rng, undirected=False
+            )
+            ma_src, ma_dst = _rewire_edges_disjoint(
+                ma_src, ma_dst, len(neuron_names), set(zip(ma_src, ma_dst)), rng, undirected=False
+            )
+        else:
+            perm = rng.permutation(len(neuron_names))
+            gap_src = [int(perm[pair[0]]) for pair in gap_pairs]
+            gap_dst = [int(perm[pair[1]]) for pair in gap_pairs]
+            wicks_src = [int(perm[i]) for i in wicks_src]
+            wicks_dst = [int(perm[i]) for i in wicks_dst]
+            generic_src = [int(perm[i]) for i in generic_src]
+            generic_dst = [int(perm[i]) for i in generic_dst]
+            np_src = [int(perm[i]) for i in np_src]
+            np_dst = [int(perm[i]) for i in np_dst]
+            ma_src = [int(perm[i]) for i in ma_src]
+            ma_dst = [int(perm[i]) for i in ma_dst]
+            # A permutation is injective, so non-self edges stay non-self.
     else:
         gap_src = [pair[0] for pair in gap_pairs]
         gap_dst = [pair[1] for pair in gap_pairs]
@@ -2771,6 +3104,7 @@ def readConnectome(
             tau_ma_prior=tau_ma_prior,
             tau_mod_prior_std=tau_mod_prior_std,
             genotype_conditioned=genotype_conditioned,
+            fix_wired_mut=fix_wired_mut,
         )
     model.register_buffer("sensory_mask", torch.from_numpy(sensory_mask))
     return model

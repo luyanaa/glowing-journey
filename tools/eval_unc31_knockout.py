@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pyro
+from sklearn.model_selection import GroupKFold
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -23,6 +24,11 @@ from pyro_svi_c302 import (
     compute_stratified_metrics,
     evaluate_predictions,
     extract_and_expand_posterior_samples,
+)
+from tools.eval_online_ttt import (
+    adapt_worm_posterior,
+    restore_population_state,
+    snapshot_population_state,
 )
 from tools.kernel_metrics import compute_matched_kernel_difference
 from tools.noise_ceiling import _compute_strata_masks, _split_half_ceiling
@@ -107,6 +113,9 @@ def _build_ckpt_model(
         ssm_dim = int(snap["MODEL_STATE"][decay_key].numel())
     else:
         ssm_dim = 16
+    ssm_state_observer = any("decoder.latent_ssm.obs_local_fc1." in k for k in ms_keys)
+    worm_dim_ckpt = int(snap["MODEL_STATE"]["decoder.U_chem"].shape[1]) if "decoder.U_chem" in ms_keys else 0
+    num_worms_ckpt = int(snap["MODEL_STATE"]["guide.worm_b_loc"].shape[0]) if "guide.worm_b_loc" in ms_keys else 0
 
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
@@ -145,6 +154,9 @@ def _build_ckpt_model(
         ssm_artifact_dim=ssm_art_dim,
         ssm_variational_traj=ssm_vtraj,
         ssm_smoother=ssm_smooth,
+        ssm_state_observer=ssm_state_observer,
+        worm_latent_dim=worm_dim_ckpt,
+        num_worms=num_worms_ckpt,
     )
     model = vae.VAElegans(
         rec,
@@ -471,6 +483,93 @@ def evaluate_np_ma_double_dissociation(
     return res
 
 
+def summarize_dataset_recordings(ds: RandiTrialDataset) -> Dict[str, object]:
+    """Summarize trial and unique recording coverage of a cached dataset."""
+    recs = sorted({int(m["rec_id"]) for m in ds.meta})
+    return {
+        "n_trials": int(len(ds)),
+        "n_recordings": int(len(recs)),
+        "rec_ids": recs,
+    }
+
+
+def evaluate_unc31_tier1_calib_cv(
+    model: vae.VAElegans,
+    ds_u31: RandiTrialDataset,
+    loader_wt: DataLoader,
+    adjacency: np.ndarray,
+    np_adj: np.ndarray,
+    ma_adj: np.ndarray,
+    pre_vols: int = 10,
+    n_folds: int = 3,
+    ttt_steps: int = 10,
+    ttt_lr: float = 0.03,
+    kl_weight: float = 1.0,
+    num_samples: int = 8,
+    eval_seed: int = 42,
+    device: torch.device = torch.device("cpu"),
+) -> Dict[str, object]:
+    """Primary WT-frozen unc-31 validation: Tier-1 observation calibration CV + double dissociation."""
+    pop_snap = snapshot_population_state(model)
+    groups = np.asarray([int(m["rec_id"]) for m in ds_u31.meta], dtype=np.int64)
+    idx = np.arange(len(ds_u31))
+    uniq = np.unique(groups)
+    k = max(2, min(int(n_folds), int(uniq.size)))
+    gkf = GroupKFold(n_splits=k)
+    folds_out = []
+    try:
+        for fi, (tr_idx, te_idx) in enumerate(gkf.split(idx, groups=groups)):
+            restore_population_state(model, pop_snap)
+            stim_h = ds_u31.stim_inputs[tr_idx].to(device)
+            y_h = ds_u31.y[tr_idx].to(device)
+            mask_h = ds_u31.obs_mask[tr_idx].to(device)
+            noise_h = ds_u31.noise_scale[tr_idx].to(device)
+            calib_log = adapt_worm_posterior(
+                model,
+                stim_hist=stim_h,
+                y_hist=y_h,
+                mask_hist=mask_h,
+                noise_hist=noise_h,
+                tier="tier1",
+                ttt_mode="auto",
+                ttt_steps=ttt_steps,
+                ttt_lr=ttt_lr,
+                kl_weight=kl_weight,
+                adapt_obs_sigma=True,
+                pre_vols=pre_vols,
+                seed=int(eval_seed) + fi,
+            )
+            ldr_te = DataLoader(Subset(ds_u31, te_idx.tolist()), batch_size=len(te_idx), shuffle=False)
+            dd_te = evaluate_np_ma_double_dissociation(
+                model, loader_wt, ldr_te, adjacency, np_adj, ma_adj,
+                pre_vols=pre_vols, num_samples=num_samples, eval_seed=eval_seed + fi, device=device,
+            )
+            folds_out.append({
+                "fold": fi,
+                "n_train_trials": int(len(tr_idx)),
+                "n_test_trials": int(len(te_idx)),
+                "calib_log": calib_log,
+                "unc31_double_dissociation": dd_te["unc31"],
+            })
+    finally:
+        restore_population_state(model, pop_snap)
+
+    np_deltas = [f["unc31_double_dissociation"]["delta_np_knockout"]["evoked_np_stratum_r2"] for f in folds_out]
+    ma_deltas = [f["unc31_double_dissociation"]["delta_ma_knockout"]["evoked_ma_stratum_r2"] for f in folds_out]
+    h1_full = [f["unc31_double_dissociation"]["full"]["evoked_hop1_r2"] for f in folds_out]
+    return {
+        "n_folds": len(folds_out),
+        "ttt_steps": int(ttt_steps),
+        "cv_summary": {
+            "evoked_hop1_r2_mean": float(np.nanmean(h1_full)),
+            "evoked_hop1_r2_std": float(np.nanstd(h1_full, ddof=1)) if len(h1_full) > 1 else 0.0,
+            "delta_np_r2_mean": float(np.nanmean(np_deltas)),
+            "delta_ma_r2_mean": float(np.nanmean(ma_deltas)),
+        },
+        "folds": folds_out,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--unc31-cache", default="/tmp/randi_unc31_causal.npz")
@@ -478,6 +577,10 @@ def main():
     p.add_argument("--split-file", default=f"{RUNS_BASE}/p15_5f_s1/fold_0.json")
     p.add_argument("--out", default=os.path.join(REPO, "report/data/phase4_unc31_knockout_eval.json"))
     p.add_argument("--split-checkpoint", default=None, help="Run NP/MA double dissociation on one split-extrasynaptic checkpoint")
+    p.add_argument("--unc31-tier1-calib", action="store_true",
+                   help="Also run GroupKFold Tier-1 observation calibration on unc-31 with WT connectome frozen")
+    p.add_argument("--calib-folds", default=3, type=int)
+    p.add_argument("--calib-steps", default=10, type=int)
     p.add_argument("--substeps", default=4, type=int)
     p.add_argument("--pre-vols", default=10, type=int)
     p.add_argument("--num-samples", default=8, type=int)
@@ -526,11 +629,19 @@ def main():
             "wt_cache": args.wt_cache,
             "unc31_cache": args.unc31_cache,
             "split_file": args.split_file,
+            "wt_recording_counts": summarize_dataset_recordings(ds_wt),
+            "unc31_recording_counts": summarize_dataset_recordings(ds_u31),
             "substeps": int(args.substeps),
             "pre_vols": int(args.pre_vols),
             "num_samples": int(args.num_samples),
             "double_dissociation": dd,
         }
+        if args.unc31_tier1_calib:
+            out["unc31_tier1_calib_cv"] = evaluate_unc31_tier1_calib_cv(
+                model, ds_u31, loader_wt, adj, np_adj, ma_adj,
+                pre_vols=args.pre_vols, n_folds=args.calib_folds,
+                ttt_steps=args.calib_steps, num_samples=args.num_samples, device=device,
+            )
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w") as fh:
             json.dump(out, fh, indent=2)

@@ -46,6 +46,10 @@ def main() -> None:
     p.add_argument("--ssm-artifact-dim", default=8, type=int)
     p.add_argument("--ssm-variational-traj", action="store_true")
     p.add_argument("--ssm-smoother", action="store_true")
+    p.add_argument("--ssm-state-observer", action="store_true")
+    p.add_argument("--ssm-min-decay", default=0.0, type=float)
+    p.add_argument("--worm-latent-dim", default=0, type=int)
+    p.add_argument("--shuffle-disjoint", action="store_true")
     p.add_argument("--history-vols", default=0, type=int)
     p.add_argument("--tau-np-prior", default=4.0, type=float)
     p.add_argument("--tau-ma-prior", default=1.0, type=float)
@@ -83,8 +87,13 @@ def main() -> None:
         tau_ma_prior=args.tau_ma_prior,
         tau_mod_prior_std=args.tau_mod_prior_std,
         shuffle_seed=args.shuffle_seed,
+        shuffle_disjoint=args.shuffle_disjoint,
     )
     use_prestim = not args.no_prestim_encoder
+    snap = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ms = snap["MODEL_STATE"]
+    worm_dim_ckpt = int(ms["decoder.U_chem"].shape[1]) if "decoder.U_chem" in ms else int(args.worm_latent_dim)
+    num_worms_ckpt = int(ms["guide.worm_b_loc"].shape[0]) if "guide.worm_b_loc" in ms else 0
     rec = c302.RecurrentNematode(
         step,
         dt_obs=0.5,
@@ -107,6 +116,10 @@ def main() -> None:
         ssm_variational_traj=args.ssm_variational_traj,
         ssm_smoother=args.ssm_smoother,
         history_vols=args.history_vols,
+        ssm_state_observer=bool(args.ssm_state_observer or any("decoder.latent_ssm.obs_local_fc1." in k for k in ms)),
+        ssm_min_decay=float(args.ssm_min_decay),
+        worm_latent_dim=worm_dim_ckpt,
+        num_worms=num_worms_ckpt,
     )
     model = vae.VAElegans(
         rec,
@@ -115,7 +128,6 @@ def main() -> None:
         len(rec.model.synapse.Gap_Junction_SRC),
         direct_global_guide=args.direct_global_guide,
     ).to(device)
-    snap = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(snap["MODEL_STATE"])
     pyro.get_param_store().set_state(snap["PARAM_STORE"])
     model.eval()

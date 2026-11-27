@@ -3054,3 +3054,313 @@ def test_np_ma_exclusive_strata_matched_deltak_calibration_and_genotype_joint():
     assert float(yo[0, 5:, 2].abs().max()) > 1e-4  # WT NP responds
     assert float(yo[1, 5:, 2].abs().max()) < 1e-6  # unc-31 NP eliminated
     assert float((yo[0, 5:, 3] - yo[1, 5:, 3]).abs().max()) < 1e-6  # MA identical across WT and unc-31
+
+
+def test_randi_missing_gcamp_strict_guard_and_disjoint_shuffle(tmp_path):
+    """Missing *_gcamp.txt emits a warning by default, raises with strict_recordings=True, and disjoint rewiring has 0 overlap."""
+    import warnings
+    from utils import AtlasLoader
+
+    rec_dir = tmp_path / "exported_data"
+    rec_dir.mkdir()
+    # One complete recording (id=1) and one missing gcamp (id=2)
+    np.savetxt(rec_dir / "1_t.txt", np.arange(20, dtype=np.float32) * 0.5)
+    np.savetxt(rec_dir / "1_gcamp.txt", np.ones((20, 2), dtype=np.float32))
+    np.savetxt(rec_dir / "1_stim_neurons.txt", np.array([1], dtype=np.int64), fmt="%d")
+    np.savetxt(rec_dir / "1_stim_volume_i.txt", np.array([5], dtype=np.int64), fmt="%d")
+    (rec_dir / "1_labels.txt").write_text("ADAL\nADAR\n")
+    np.savetxt(rec_dir / "2_t.txt", np.arange(20, dtype=np.float32) * 0.5)
+
+    ids_ok, ids_missing = AtlasLoader._discover_recording_ids_with_missing(str(rec_dir))
+    assert ids_ok == [1] and ids_missing == [2]
+
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        ds_warn = AtlasLoader(str(tmp_path), strain="wild-type", strict_recordings=False)
+        assert len(ds_warn.recordings) == 1
+    assert any("missing" in str(w.message).lower() for w in w_rec)
+
+    try:
+        AtlasLoader(str(tmp_path), strain="wild-type", strict_recordings=True)
+        raise AssertionError("Expected FileNotFoundError with strict_recordings=True")
+    except FileNotFoundError:
+        pass
+
+    # Disjoint Maslov-Sneppen rewiring has 0 overlap with intact connectome and preserves edge count
+    intact = c302.readConnectome("./data/CElegansNeuronTables.xls", use_extrasynaptic=True, split_extrasynaptic=True)
+    disjoint = c302.readConnectome(
+        "./data/CElegansNeuronTables.xls",
+        use_extrasynaptic=True,
+        split_extrasynaptic=True,
+        shuffle_seed=7,
+        shuffle_disjoint=True,
+    )
+    intact_wired = (
+        set(zip(intact.synapse.Wicks_SRC, intact.synapse.Wicks_DST))
+        | set(zip(intact.synapse.Gap_Junction_SRC, intact.synapse.Gap_Junction_DST))
+        | set(zip(intact.synapse.Gap_Junction_DST, intact.synapse.Gap_Junction_SRC))
+    )
+    dis_wicks = set(zip(disjoint.synapse.Wicks_SRC, disjoint.synapse.Wicks_DST))
+    dis_gap = set(zip(disjoint.synapse.Gap_Junction_SRC, disjoint.synapse.Gap_Junction_DST))
+    assert len(disjoint.synapse.Wicks_SRC) == len(intact.synapse.Wicks_SRC)
+    assert len(disjoint.synapse.Gap_Junction_SRC) == len(intact.synapse.Gap_Junction_SRC)
+    assert len(dis_wicks & intact_wired) == 0
+    assert len(dis_gap & intact_wired) == 0
+
+
+def test_phase8a_state_observer_causality_slow_decay_and_full_filter():
+    """Phase 8A state observer assimilates strictly pre_vols causally, obeys min_decay, and runs full-state online filtering."""
+    pyro.clear_param_store()
+    n = 6
+    syn_list = {
+        "General": ([0], [1], [1.0]),
+        "Wicks": ([0, 1], [2, 3], [1.0, 1.0], [0.0, 0.0], [0.01, 0.01]),
+    }
+    step = c302.NematodeForStep(n, {}, syn_list, dimensionless=True, use_syn_filter=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4,
+        use_latent_ssm=True, latent_ssm_dim=6, ssm_encoder="gru",
+        ssm_split_latent=True, ssm_artifact_dim=3,
+        ssm_variational_traj=False, ssm_state_observer=True, ssm_min_decay=0.85,
+    )
+    with torch.no_grad():
+        rec.latent_ssm.obs_local_fc2.weight.fill_(0.25)
+        rec.latent_ssm.K_obs.weight.fill_(0.15)
+        rec.latent_ssm.K_art_obs.weight.fill_(0.1)
+        A = rec.latent_ssm.transition_matrix()
+        eig_mags = torch.linalg.eigvals(A).abs()
+        assert float(eig_mags.min().item()) >= 0.849
+        assert float(eig_mags.max().item()) <= 0.99
+
+    stim = torch.zeros(1, 10, n)
+    stim[:, 4:6, 0] = 1.0
+    y_pre_a = torch.randn(1, 10, n) * 0.3
+    y_pre_b = y_pre_a.clone()
+    y_pre_b[:, 4:, :] += 50.0  # future perturbation must have zero effect on open-loop prediction
+    mask = torch.ones(1, 10, n, dtype=torch.bool)
+    eps0 = torch.zeros(1, 11, rec.latent_ssm.total_z_dim)
+
+    with torch.no_grad():
+        pyro.set_rng_seed(0)
+        torch.manual_seed(0)
+        out_a, _, _, z_a = rec._rollout(
+            stim, None, 0.5, pre_stim_obs=y_pre_a[:, :4, :], pre_stim_mask=mask[:, :4, :],
+            ssm_eps=eps0, return_latent_traj=True,
+        )
+        pyro.set_rng_seed(0)
+        torch.manual_seed(0)
+        out_b, _, _, z_b = rec._rollout(
+            stim, None, 0.5, pre_stim_obs=y_pre_b, pre_stim_mask=mask, ssm_eps=eps0, return_latent_traj=True,
+        )
+        assert z_a is not None and z_a.shape == (1, 6, 6)
+        assert torch.allclose(out_a, out_b, atol=1e-6)
+
+        y_pre_c = y_pre_a.clone()
+        y_pre_c[:, :4, :] += 1.5
+        pyro.set_rng_seed(0)
+        torch.manual_seed(0)
+        out_c, _, _ = rec._rollout(stim, None, 0.5, pre_stim_obs=y_pre_c[:, :4, :], pre_stim_mask=mask[:, :4, :], ssm_eps=eps0)
+        assert float((out_a[:, 4:, :] - out_c[:, 4:, :]).abs().max().item()) > 1e-4
+
+        # Strictly causal online filtering at frame t must ignore y[:, t+1:, :]
+        pyro.set_rng_seed(0)
+        torch.manual_seed(0)
+        f_a = rec.rollout_online_filter(stim, y_pre_a, mask)
+        pyro.set_rng_seed(0)
+        torch.manual_seed(0)
+        f_b = rec.rollout_online_filter(stim, y_pre_b, mask)
+        assert torch.allclose(f_a[:, :5, :], f_b[:, :5, :], atol=1e-6)
+
+
+def test_multi_horizon_rollout_and_overshooting_losses():
+    """Open-loop multi-horizon rollout & latent overshooting losses backprop cleanly through LatentNeuralSSM."""
+    import pyro_svi_vae
+
+    pyro.clear_param_store()
+    n = 5
+    syn_list = {"General": ([], [], []), "Wicks": ([0], [1], [1.0], [0.0], [0.01])}
+    step = c302.NematodeForStep(n, {}, syn_list, dimensionless=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4,
+        use_latent_ssm=True, latent_ssm_dim=4, ssm_encoder="gru",
+        ssm_variational_traj=True, ssm_smoother=True, ssm_state_observer=True, ssm_min_decay=0.85,
+    )
+    vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+    aux_opt = torch.optim.Adam(vm.parameters(), lr=1e-3)
+    stim = torch.zeros(2, 12, n)
+    stim[:, 4:6, 0] = 1.0
+    y = torch.randn(2, 12, n) * 0.2
+    mask = torch.ones(2, 12, n, dtype=torch.bool)
+    noise = torch.full((2, n), 0.1)
+
+    loss_val = pyro_svi_vae._aux_rollout_overshoot_step(
+        vm, aux_opt, stim, y, mask, noise, pre_vols=4, rollout_w=0.5, overshoot_w=0.5,
+    )
+    assert np.isfinite(loss_val) and loss_val >= 0.0
+
+
+def test_worm_latent_generative_factor_and_ttt_d():
+    """Trainable generative worm latent factor b_w trains in SVI and adapts in TTT-D."""
+    import warnings
+    from tools.eval_online_ttt import (
+        _predict_single_trial_counterfactual,
+        adapt_worm_posterior,
+        restore_population_state,
+        snapshot_population_state,
+    )
+
+    pyro.clear_param_store()
+    n = 6
+    syn_list = {"General": ([], [], []), "Wicks": ([0], [1], [1.0], [0.0], [0.01])}
+    step = c302.NematodeForStep(n, {}, syn_list, dimensionless=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4,
+        worm_latent_dim=3, num_worms=4,
+    )
+    vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+    stim = torch.zeros(2, 10, n)
+    stim[:, 4:6, 0] = 1.0
+    y = torch.randn(2, 10, n) * 0.2
+    mask = torch.ones(2, 10, n, dtype=torch.bool)
+    noise = torch.full((2, n), 0.1)
+    worm_ids = torch.tensor([0, 2], dtype=torch.long)
+
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        svi = SVI(vm, vm.guide, pyro.optim.ClippedAdam({"lr": 1e-2}), Trace_ELBO())
+        elbo = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise, worm_id=worm_ids)
+        assert np.isfinite(elbo)
+    mismatch_w = [str(w.message) for w in w_rec if "Found non-auxiliary vars" in str(w.message) or "not in guide" in str(w.message)]
+    assert not mismatch_w, f"Pyro site mismatch warnings: {mismatch_w}"
+
+    snap = snapshot_population_state(vm)
+    log = adapt_worm_posterior(
+        vm, stim_hist=stim, y_hist=y, mask_hist=mask, noise_hist=noise,
+        tier="tier1", ttt_mode="ttt_d", ttt_steps=3, ttt_lr=0.05, kl_weight=1.0, pre_vols=4,
+    )
+    assert "_worm_b_tensor" in log
+    bw = log.pop("_worm_b_tensor")
+    assert bw.shape == (1, 3) and float(bw.abs().max().item()) > 0.0
+    yp, ycf = _predict_single_trial_counterfactual(
+        vm, stim[:1], y[:1], mask[:1], noise[:1], num_samples=1, pre_vols=4, eval_seed=42, worm_b_override=bw,
+    )
+    assert yp.shape == (1, 10, n) and ycf.shape == (1, 10, n)
+    restore_population_state(vm, snap)
+
+
+def test_hardened_genotype_joint_messenger_calib_and_identifiability():
+    """Hardened genotype joint skips gamma_wired_mut when fixed, calibrates strain obs, reweights ELBO, and reports Fisher corr."""
+    import warnings
+    from torch.utils.data import DataLoader, TensorDataset
+    from tools.run_genotype_joint import (
+        _CohortObsScaleMessenger,
+        compute_elbo_obs_weights,
+        compute_joint_identifiability_diagnostics,
+    )
+
+    pyro.clear_param_store()
+    n = 6
+    syn_list = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [1.0], [0.0], [0.01]),
+        "Generic": ([0, 0], [2, 3], [1.0, 1.0]),
+        "NP": ([0], [2], [1.0]),
+        "MA": ([0], [3], [1.0]),
+    }
+    step = c302.NematodeForStep(
+        n, {}, syn_list, use_extrasynaptic=True, split_extrasynaptic=True,
+        dimensionless=True, genotype_conditioned=True, fix_wired_mut=True,
+    )
+    assert not hasattr(step.synapse, "gamma_wired_mut")
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4, strain_obs_calib=True,
+    )
+    vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+    assert not hasattr(vm.guide, "gamma_wired_mut_loc")
+    assert hasattr(vm.guide, "gcamp_gain_mut_loc")
+
+    stim = torch.zeros(4, 10, n)
+    stim[:, 4:6, 0] = 1.0
+    y = torch.randn(4, 10, n) * 0.2
+    y[2:] += 2.0
+    mask = torch.ones(4, 10, n, dtype=torch.bool)
+    noise = torch.full((4, n), 0.1)
+    geno = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    w_imp = compute_elbo_obs_weights(100, 20, 2, 2, "importance_weighted", torch.device("cpu"))
+    w_bal = compute_elbo_obs_weights(100, 20, 2, 2, "balanced_50_50", torch.device("cpu"))
+    assert abs(float(w_imp[0] / w_imp[2]) - 5.0) < 1e-5
+    assert abs(float(w_bal[0] / w_bal[2]) - 1.0) < 1e-5
+
+    elbo_fn = pyro.infer.Trace_ELBO()
+    pyro.set_rng_seed(0)
+    with _CohortObsScaleMessenger(w_imp):
+        loss_imp = elbo_fn.loss(vm, vm.guide, ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=120, genotype_id=geno)
+    pyro.set_rng_seed(0)
+    with _CohortObsScaleMessenger(w_bal):
+        loss_bal = elbo_fn.loss(vm, vm.guide, ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=120, genotype_id=geno)
+    assert abs(loss_imp - loss_bal) > 10.0
+
+    with warnings.catch_warnings(record=True) as w_rec:
+        warnings.simplefilter("always")
+        optim = pyro.optim.ClippedAdam({"lr": 1e-2})
+        with _CohortObsScaleMessenger(w_imp):
+            svi = SVI(vm, vm.guide, optim, Trace_ELBO())
+            loss = svi.step(ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=120, genotype_id=geno)
+            assert np.isfinite(loss)
+    mismatch_w = [str(w.message) for w in w_rec if "Found non-auxiliary vars" in str(w.message) or "not in guide" in str(w.message)]
+    assert not mismatch_w, f"Pyro site mismatch warnings: {mismatch_w}"
+
+    ldr_wt = DataLoader(TensorDataset(stim[:2], y[:2], mask[:2], noise[:2]), batch_size=2)
+    ldr_u31 = DataLoader(TensorDataset(stim[2:], y[2:], mask[2:], noise[2:]), batch_size=2)
+    ident = compute_joint_identifiability_diagnostics(vm, ldr_wt, ldr_u31, pre_vols=4, device=torch.device("cpu"))
+    assert "gamma_np_mut" in ident["param_names"]
+    assert "gamma_wired_mut" not in ident["param_names"]
+    corr = np.asarray(ident["fisher_corr"])
+    assert corr.shape[0] == len(ident["param_names"]) and np.allclose(np.diag(corr), 1.0)
+
+
+def test_eval_unc31_knockout_tier1_calib_cv_and_recording_counts():
+    """WT-frozen unc-31 Tier-1 calibration CV preserves synaptic weights and reports recording summary."""
+    from torch.utils.data import DataLoader, TensorDataset
+    from tools.eval_unc31_knockout import evaluate_unc31_tier1_calib_cv, summarize_dataset_recordings
+    from utils import RandiTrialDataset
+
+    pyro.clear_param_store()
+    n = 6
+    syn_list = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [1.0], [0.0], [0.01]),
+        "Generic": ([0, 0], [2, 3], [1.0, 1.0]),
+        "NP": ([0], [2], [1.0]),
+        "MA": ([0], [3], [1.0]),
+    }
+    step = c302.NematodeForStep(n, {}, syn_list, use_extrasynaptic=True, split_extrasynaptic=True, dimensionless=True)
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4)
+    vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+
+    b, t = 8, 12
+    stim = torch.zeros(b, t, n)
+    stim[:, 4:6, 0] = 1.0
+    y = torch.randn(b, t, n) * 0.2
+    mask = torch.ones(b, t, n, dtype=torch.bool)
+    noise = torch.full((b, n), 0.1)
+    dts = torch.full((b,), 0.5)
+    meta = [{"rec_id": i // 2, "stim_neuron_idx": 0} for i in range(b)]
+    ds_u31 = RandiTrialDataset(stim, y, mask, noise, dts, meta)
+    rec_sum = summarize_dataset_recordings(ds_u31)
+    assert rec_sum["n_trials"] == 8 and rec_sum["n_recordings"] == 4
+
+    adj = step.synapse.adjacency_matrix(n)
+    np_adj = step.synapse.np_adjacency_matrix(n)
+    ma_adj = step.synapse.ma_adjacency_matrix(n)
+    ldr_wt = DataLoader(TensorDataset(stim[:2], y[:2], mask[:2], noise[:2]), batch_size=2)
+    w_before = vm.guide.wicks_g_max_z.detach().clone()
+
+    res = evaluate_unc31_tier1_calib_cv(
+        vm, ds_u31, ldr_wt, adj, np_adj, ma_adj,
+        pre_vols=4, n_folds=2, ttt_steps=2, num_samples=1,
+    )
+    assert res["n_folds"] == 2
+    assert "delta_np_r2_mean" in res["cv_summary"]
+    assert torch.allclose(vm.guide.wicks_g_max_z, w_before)

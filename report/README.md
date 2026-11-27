@@ -729,6 +729,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 | `glowing-journey_runs/phase15_hier_direct_5fold_2026-11-25/` | Order #2: Phase 1.5 Folds 1–4 Stage-1 & Stage-2 bundles and merged 5-fold summaries |
 | `glowing-journey_runs/phase3_oscillatory_stage2_fold0_2026-11-25/` | Order #3: Phase 3 Fold-0 (`--prestim-oscillatory`) Stage-2 bundle, summary, and checkpoints |
 | `glowing-journey_runs/phase5ab_fold0_2026-11-26/` | Phase 5A+5B+6 Fold-0 (`pre40`, `substeps=4`, `--dimensionless-physiology --syn-filter --split-extrasynaptic --latent-ssm`) Stage-1, Stage-1b, `unc-31` double dissociation, Stage-2, and Phase 6 TTT summaries and checkpoints |
+| `glowing-journey_runs/phase7_fold0_2026-11-27/` | Phase 7 Fold-0 SSM v2 (`gru + split + variational_traj + smoother`), history windows (`hist_10/40/80`), prior sensitivity (`exp3`), TTT A–F ablation (`phase7_ttt_ablation_fold0.json`), and initial joint genotype probe (`exp4`) |
 | `~/Google Drive/マイドライブ/cleandata_smoothened2/` | Toyoshima NaCl second dataset (external, not in git) |
 
 ### 4.2 Key checkpoints
@@ -759,6 +760,7 @@ These are not fixed by the current report; they are constraints on how the numbe
 - Gap-junction KCL, causal preprocessing invariance, per-neuron stimulus gain, actuator behavior, and nested grouped splits have regression tests.
 - `report/scripts/synthetic_recovery_probe.py` reproduces the 3-neuron identifiability probe; its result is in `report/data/identifiability_probe.json`.
 - Phase 4–6 diagnostics & evals: `report/data/substep_convergence_audit.json`, `report/data/phase4_noise_ceiling_and_ablations.json`, `report/data/phase4_baselines_fold0.json`, `report/data/phase4_unc31_knockout_eval.json`, `report/data/phase5_online_ttt_tier1_fold0.json`, `report/data/phase5_online_ttt_tier1_whitened_fold0.json`, `report/data/phase5_online_ttt_tier2_whitened_fold0.json`, `report/data/phase5ab_fold0_stage1_summary.json`, `report/data/phase5ab_fold0_stage1b_split_np_ma_summary.json`, `report/data/phase5b_unc31_double_dissociation_fold0.json`, `report/data/phase5ab_fold0_stage2_ssm_summary.json`, `report/data/phase6_ttt_phase5ab_t2_mingate4_none_fold0.json`, `report/data/phase6_ttt_phase5ab_t2_mingate4_t1t2_fold0.json` (plus scripts `tools/kernel_metrics.py`, `tools/substep_convergence.py`, `tools/noise_ceiling.py`, `tools/run_baselines.py`, `tools/eval_unc31_knockout.py`, `tools/eval_online_ttt.py`).
+- Phase 7 Fold-0 JSONs: `report/data/phase7_fold0/` (`s1_wired/summary.json`, `s2_ssm_v2/summary.json`, `exp2_history_windows/hist_{10,40,80}/eval16.json`, `exp3_prior_{equal,reversed,weak}/summary.json`, `exp3_prior_{equal,reversed,weak}/unc31_double_dissociation.json`, `exp4_genotype_joint/summary.json`) and `report/data/phase7_ttt_ablation_fold0.json` (plus `tools/run_genotype_joint.py`).
 - All Colab sessions are stopped; there are no active sessions.
 
 ### 4.4 Data
@@ -794,3 +796,25 @@ or use `glowing-journey_runs/.../cache/randi_trials_v3_f16.npz` directly.
 - Any new scheme must use a fixed split seed, 16 samples, report mean±std over at least three training seeds, and use a worm-level independent validation set. Do not select models with the same-pool random 15% holdout again.
 - Before further Randi tuning: lock a historical benchmark; use `--causal-preprocess` for any causal claim; keep the symmetric gap-junction fix; and use `--stim-actuator`/`--per-neuron-stim-gain` if latency/gain is interpreted mechanistically.
 - Then run the Toyoshima NaCl dataset as a second experiment (`--source toyoshima`) with the same locked evaluation discipline.
+
+---
+
+## 6. Phase 7 Fold-0 Audit & Phase 8A Design Updates
+
+### 6.1 Phase 7 Fold-0 Verified Results (`report/data/phase7_fold0/`, `report/data/phase7_ttt_ablation_fold0.json`)
+
+| Experiment (Fold-0, `substeps=4`, `pre40` unless noted) | `post_inlier_r2` | `evoked_stim_r2` | `evoked_hop1_r2` \| `r` | `pair_hop1_r2` | `kernel_hop1_r` \| `r2` | `lat_mae (s)` |
+|---|---:|---:|---:|---:|---:|---:|
+| `s1_wired` Intact mean (`3` seeds) | `+0.02841` | `+0.02471` | **`+0.03900 ± 0.00152`** \| `0.20396` | **`+0.10511`** | `0.30714` \| `+0.05372` | `2.60` |
+| `s1_wired` Shuffle mean (`7,8,9`) | `+0.02297` | `—` | `+0.00380 ± 0.00563` | `—` | `—` \| `+0.04359` | `—` |
+| **`s2_ssm_v2` (`gru+split+vtraj+smoother`) Intact (`3` seeds)** | **`+0.09703`** | `+0.02952` | **`+0.04419 ± 0.00085`** \| `0.21643` | **`+0.10684`** | `0.31897` \| `+0.04990` | `2.61` |
+| `s2_ssm_v2` Shuffle mean (`7,8,9`) | `+0.08047` | `—` | `+0.00578 ± 0.00516` | `—` | `—` \| `+0.04747` | `—` |
+| `exp2_history_windows` `hist_10` / `hist_40` / `hist_80` (`pre80`) | `+0.10624` / `+0.11216` / **`+0.11569`** | `+0.1031` / `+0.0998` / `+0.1012` | `+0.03519` / `+0.03615` / `+0.03612` | `—` | `0.3766` / `0.3763` / **`0.3782`** \| `+0.0862` / `+0.0787` / `+0.0806` | `—` |
+| `phase7_ttt_ablation_fold0` `ttt_c` vs **`ttt_d`** | `+0.10616` vs `+0.10499` | `+0.05958` vs **`+0.07128`** | `+0.04246` vs `+0.04190` | `—` | `—` \| `+0.06424` vs `+0.06402` | `—` |
+| `phase7_ttt_ablation_fold0` `ttt_e` vs `ttt_f` | `+0.09725` vs `+0.09908` | `+0.06983` vs `+0.07197` | `+0.04347` vs `+0.04316` | `—` | `—` \| `+0.07025` vs `+0.07169` | `—` |
+
+### 6.2 Honest Negative Findings & Root Causes Addressed in Phase 8A
+
+1. **Prior Sensitivity (`exp3_prior_{equal,reversed,weak}`)**: Under equal, weak, or reversed priors, inferred $\tau_{\mathrm{NP}} / \tau_{\mathrm{MA}}$ medians shifted to `1.14 / 0.99 s`, `1.13 / 0.96 s`, and `0.63 / 1.71 s` respectively (while keeping `evoked_hop1_r2 ≈ 0.0410`), proving that the earlier Phase 5B $\tau_{\mathrm{NP}} > \tau_{\mathrm{MA}}$ separation was strongly prior-anchored.
+2. **Joint Genotype Probe (`exp4_genotype_joint/summary.json`, Negative Result)**: Evaluated on an incomplete 6-recording / 148-trial `pre40` `unc-31` cache (`134` train / `14` test trials) with free `gamma_wired_mut` and unbalanced ELBO batching, posterior multipliers collapsed onto collinear compensation (`gamma_np_mut=4.21`, `gamma_ma_mut=4.77`, `gamma_wired_mut=0.51`) and held-out `unc-31` `evoked_hop1_r2 = -0.01871`. Phase 8A rebuilds all 15 `unc-31` recordings from OSF (`ty6sp`), adds strict missing-file guards in `utils.RandiCausalData`, uses WT-frozen Tier-1 CV (`eval_unc31_knockout.py --unc31-tier1-calib`) as primary mechanism test, and hardens `run_genotype_joint.py` (`--fix-wired-mut`, `--strain-obs-calib`, `--freeze-mod-timescales`, exact `pyro.poutine.scale` ELBO reweighting, recording-grouped CV, Fisher collinearity diagnostics).
+3. **Permuted Shuffle Kernel Artifact & SSM Slow-Mode Collapse**: Random vertex permutations left `shuffle7` with `6.58%` intact 1-hop edge overlap (vs `5.29%/5.32%` for `8/9`), inflating `shuffle7` `kernel_hop1_r2` (`0.07041`); Phase 8A adds 0%-overlap degree-preserving `--shuffle-disjoint`. Moreover, checkpoint inspection showed smoothing posterior training collapsed `LatentNeuralSSM` `A_decay_logit` (`tau = 0.45–1.25 s`), explaining why `hist_80` stayed at `+0.1157` vs AR(1) `+0.1863`; Phase 8A introduces causal full-state continuous assimilation (`--ssm-state-observer`), slow-mode floor (`--ssm-min-decay`), multi-horizon/overshooting auxiliary losses, and trainable generative worm factors (`--worm-latent-dim`).

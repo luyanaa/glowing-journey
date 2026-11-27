@@ -9,7 +9,7 @@ from pyro.infer import SVI, Trace_ELBO
 from sklearn.model_selection import train_test_split
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchinfo import summary
 
 import c302
@@ -217,6 +217,172 @@ def _aux_kernel_step(
     return float(tot.detach().item())
 
 
+class _WormIdSubset(Dataset):
+    """Dataset wrapper attaching compact per-worm integer IDs to trial tuples."""
+
+    def __init__(self, subset: Subset, worm_ids: list):
+        self.subset = subset
+        self.worm_ids = torch.as_tensor(worm_ids, dtype=torch.long)
+
+    def __len__(self) -> int:
+        return len(self.subset)
+
+    def __getitem__(self, idx: int):
+        item = self.subset[idx]
+        return (*item, self.worm_ids[idx])
+
+
+def compute_multi_horizon_rollout_loss(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    obs_mask: torch.Tensor,
+    pre_vols: int = 10,
+    horizons: tuple = (1, 2, 4, 8, 16, 32, 64),
+) -> torch.Tensor:
+    """Multi-horizon open-loop prediction & increment consistency loss across 0.5s-32s scales."""
+    n_t = y_pred.shape[1]
+    t0 = max(0, min(int(pre_vols), n_t - 1))
+    m = obs_mask.to(dtype=y_pred.dtype, device=y_pred.device)
+    total = torch.zeros((), dtype=y_pred.dtype, device=y_pred.device)
+    n_active = 0
+    for h in horizons:
+        step_h = int(h)
+        if t0 + step_h >= n_t:
+            continue
+        t_end = min(n_t, t0 + step_h)
+        m_w = m[:, t0:t_end, :]
+        w_sum = m_w.sum()
+        if w_sum.item() > 0:
+            err_w = ((y_pred[:, t0:t_end, :] - y_true[:, t0:t_end, :]) ** 2) * m_w
+            total = total + err_w.sum() / w_sum
+            n_active += 1
+        # Increment matching across lag h for post-stim trajectory dynamics
+        if t0 + step_h < n_t:
+            dp = y_pred[:, t0 + step_h :, :] - y_pred[:, t0 : n_t - step_h, :]
+            dt_t = y_true[:, t0 + step_h :, :] - y_true[:, t0 : n_t - step_h, :]
+            m_dp = m[:, t0 + step_h :, :] * m[:, t0 : n_t - step_h, :]
+            dp_sum = m_dp.sum()
+            if dp_sum.item() > 0:
+                total = total + (((dp - dt_t) ** 2) * m_dp).sum() / dp_sum
+                n_active += 1
+    if n_active > 0:
+        total = total / float(n_active)
+    return total
+
+
+def compute_latent_overshooting_loss(
+    model,
+    posterior_samples: dict,
+    stim: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    pre_vols: int = 10,
+    drift_gate=None,
+    worm_id=None,
+    z_prior_post: torch.Tensor = None,
+) -> torch.Tensor:
+    """Align multi-step open-loop prior SSM rollout with causal/smoothing variational posterior."""
+    dec = model.decoder
+    ssm = getattr(dec, "latent_ssm", None)
+    if ssm is None:
+        return torch.zeros((), device=stim.device, dtype=stim.dtype)
+    if z_prior_post is None:
+        bsz, n_t, _ = stim.shape
+        z_dim = int(getattr(ssm, "total_z_dim", ssm.z_dim))
+        eps0 = torch.zeros((bsz, n_t + 1, z_dim), device=stim.device, dtype=stim.dtype)
+        m_kw = dict(
+            stim_input=stim,
+            voltage_clamp=None,
+            dt_obs=float(dec.dt_obs),
+            pre_stim_obs=y[:, :pre_vols, :],
+            pre_stim_mask=mask[:, :pre_vols, :],
+            drift_gate=drift_gate,
+            return_trajectories=False,
+            ssm_eps=eps0,
+            worm_id=worm_id,
+            return_latent_traj=True,
+        )
+        dec_ps = {k[len("decoder."):]: v for k, v in posterior_samples.items() if k.startswith("decoder.")}
+        with pyro.poutine.condition(data=dec_ps):
+            out = dec._rollout(**m_kw)
+        z_prior_post = out[3]
+    if z_prior_post is None or not getattr(ssm, "variational_traj", False):
+        return torch.zeros((), device=stim.device, dtype=stim.dtype)
+    t0 = max(0, min(int(pre_vols), y.shape[1]))
+    if t0 >= y.shape[1]:
+        return torch.zeros((), device=stim.device, dtype=stim.dtype)
+    q_loc_seq, _ = ssm.encode_traj_posterior(
+        y[:, t0:, :], mask[:, t0:, :], stim[:, t0:, :], allow_smoother=bool(ssm.use_smoother)
+    )
+    t_len = min(z_prior_post.shape[1], q_loc_seq.shape[1])
+    if t_len == 0:
+        return torch.zeros((), device=stim.device, dtype=stim.dtype)
+    return F.mse_loss(z_prior_post[:, :t_len, :], q_loc_seq[:, :t_len, :].detach())
+
+
+def _aux_rollout_overshoot_step(
+    model,
+    aux_opt,
+    stim: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    noise: torch.Tensor,
+    pre_vols: int,
+    rollout_w: float,
+    overshoot_w: float,
+    drift_gate=None,
+    worm_id=None,
+) -> float:
+    """Single optimization step on deterministic open-loop multi-horizon & overshooting loss."""
+    aux_opt.zero_grad()
+    B, n_t, _ = stim.shape
+    has_pre = bool(getattr(model.decoder, "use_prestim_encoder", False))
+    ssm = getattr(model.decoder, "latent_ssm", None)
+    has_ssm = ssm is not None
+    guide_kw = dict(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
+    if has_pre or has_ssm:
+        guide_kw["pre_stim_obs"] = y[:, :pre_vols, :]
+        guide_kw["pre_stim_mask"] = mask[:, :pre_vols, :]
+        guide_kw["drift_gate"] = drift_gate
+    tr = pyro.poutine.trace(model.guide).get_trace(**guide_kw)
+    ps = extract_and_expand_posterior_samples(tr, repeat_factor=1)
+    eps0 = (
+        torch.zeros((B, n_t + 1, int(getattr(ssm, "total_z_dim", ssm.z_dim))), device=stim.device, dtype=stim.dtype)
+        if has_ssm
+        else None
+    )
+    dec_ps = {k[len("decoder."):]: v for k, v in ps.items() if k.startswith("decoder.")}
+    with pyro.poutine.condition(data=dec_ps):
+        roll_out = model.decoder._rollout(
+            stim,
+            None,
+            float(model.decoder.dt_obs),
+            pre_stim_obs=y[:, :pre_vols, :] if (has_pre or has_ssm) else None,
+            pre_stim_mask=mask[:, :pre_vols, :] if (has_pre or has_ssm) else None,
+            drift_gate=drift_gate if (has_pre or has_ssm) else None,
+            return_trajectories=False,
+            ssm_eps=eps0,
+            worm_id=worm_id,
+            return_latent_traj=has_ssm,
+        )
+    y_open = roll_out[0]
+    z_post = roll_out[3] if has_ssm and len(roll_out) > 3 else None
+
+    tot = torch.zeros((), device=stim.device, dtype=stim.dtype)
+    if float(rollout_w) > 0.0:
+        tot = tot + float(rollout_w) * compute_multi_horizon_rollout_loss(y_open, y, mask, pre_vols=pre_vols)
+    if float(overshoot_w) > 0.0 and has_ssm:
+        tot = tot + float(overshoot_w) * compute_latent_overshooting_loss(
+            model, ps, stim, y, mask, pre_vols=pre_vols, drift_gate=drift_gate,
+            worm_id=worm_id, z_prior_post=z_post,
+        )
+    if tot.requires_grad:
+        tot.backward()
+        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 5.0)
+        aux_opt.step()
+    return float(tot.detach().item())
+
+
 def _validate_cache_provenance(provenance: dict, expected: dict, cache_path: str) -> None:
     """Fail fast if a dataset cache does not match the requested preprocessing contract."""
     if not provenance:
@@ -292,6 +458,10 @@ def _set_prestim_only_trainable(module, prestim_only: bool, train_obs_sigma: boo
                 ("prestim_encoder" in name)
                 or ("prestim_q" in name)
                 or ("latent_ssm" in name)
+                or ("U_chem" in name)
+                or ("U_stim" in name)
+                or ("U_gain" in name)
+                or ("worm_b" in name)
                 or (train_obs_sigma and "obs_sigma" in name)
             )
             param.requires_grad_(keep)
@@ -397,6 +567,18 @@ def main() -> None:
                         help="Sample variational latent trajectory posterior q_phi(z_t | z_{t-1}, y_{<=t})")
     parser.add_argument("--ssm-smoother", action="store_true",
                         help="Use bidirectional smoothing posterior during training when --ssm-variational-traj is enabled")
+    parser.add_argument("--ssm-state-observer", action="store_true",
+                        help="Enable Phase 8A continuous causal physiological state assimilation over t < inject_t")
+    parser.add_argument("--ssm-min-decay", default=0.0, type=float,
+                        help="Minimum transition decay eigenvalue floor in LatentNeuralSSM (0 = disabled)")
+    parser.add_argument("--rollout-loss-weight", default=0.0, type=float,
+                        help="Multi-horizon open-loop prediction loss weight (0 disables)")
+    parser.add_argument("--overshoot-loss-weight", default=0.0, type=float,
+                        help="Open-loop vs smoothing latent overshooting loss weight (0 disables)")
+    parser.add_argument("--worm-latent-dim", default=0, type=int,
+                        help="Trainable generative worm latent factor dimension (0 disables)")
+    parser.add_argument("--shuffle-disjoint", action="store_true",
+                        help="When --shuffle-connectome is set, use degree-preserving 0-overlap disjoint rewiring")
     parser.add_argument("--history-vols", default=0, type=int,
                         help="Optional trailing pre-stim window passed to SSM encoder (0 = use full pre_vols)")
     parser.add_argument("--tau-np-prior", default=4.0, type=float,
@@ -507,7 +689,8 @@ def main() -> None:
                 "split_file": args.split_file,
             }
             val_info = {"val_recordings": len({dataset.meta[i]["rec_id"] for i in val_idx})}
-            train_ds = Subset(dataset, train_idx)
+            train_core_idx = list(train_idx)
+            train_ds = Subset(dataset, train_core_idx)
             test_ds = Subset(dataset, test_idx)
             val_ds = Subset(dataset, val_idx) if val_idx else None
             print(
@@ -540,6 +723,18 @@ def main() -> None:
                 f"val={0 if val_ds is None else len(val_ds)} trials, test={len(test_ds)} trials "
                 f"({split_info['test_recordings']} recs, grouped={bool(split_info['grouped'])})"
             )
+
+    num_train_worms = 0
+    if args.worm_latent_dim > 0 and args.source != "synthetic":
+        rec_map = {}
+        worm_ids_tr = []
+        for idx_i in train_core_idx:
+            rid = int(dataset.meta[idx_i]["rec_id"])
+            if rid not in rec_map:
+                rec_map[rid] = len(rec_map)
+            worm_ids_tr.append(rec_map[rid])
+        num_train_worms = len(rec_map)
+        train_ds = _WormIdSubset(train_ds, worm_ids_tr)
 
     pin = torch.cuda.is_available()
     train_data = DataLoader(
@@ -588,6 +783,7 @@ def main() -> None:
         tau_ma_prior=args.tau_ma_prior,
         tau_mod_prior_std=args.tau_mod_prior_std,
         shuffle_seed=args.shuffle_connectome,
+        shuffle_disjoint=args.shuffle_disjoint,
     )
     if args.shuffle_connectome is not None and not args.use_model_adj_for_supervision:
         intact_ref = c302.readConnectome(
@@ -625,6 +821,10 @@ def main() -> None:
         ssm_variational_traj=args.ssm_variational_traj,
         ssm_smoother=args.ssm_smoother,
         history_vols=args.history_vols,
+        ssm_state_observer=args.ssm_state_observer,
+        ssm_min_decay=args.ssm_min_decay,
+        worm_latent_dim=args.worm_latent_dim,
+        num_worms=num_train_worms,
     )
     model = vae.VAElegans(
         rec_model,
@@ -670,7 +870,9 @@ def main() -> None:
 
     optim = pyro.optim.ClippedAdam({"lr": args.lr, "clip_norm": 10.0})
     svi = SVI(model, model.guide, optim, Trace_ELBO())
-    use_aux = (float(args.kernel_loss_weight) > 0.0) or (float(args.dynamics_loss_weight) > 0.0)
+    use_kernel_aux = (float(args.kernel_loss_weight) > 0.0) or (float(args.dynamics_loss_weight) > 0.0)
+    use_rollout_aux = (float(args.rollout_loss_weight) > 0.0) or (float(args.overshoot_loss_weight) > 0.0)
+    use_aux = use_kernel_aux or use_rollout_aux
     aux_opt = (
         torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr * 0.5)
         if use_aux
@@ -700,7 +902,9 @@ def main() -> None:
         aux_loss_sum = 0.0
         n_batches_ep = 0
         scaled_obs_t = torch.zeros((), device=device, dtype=torch.float32)
-        for stim, y, mask, noise in train_data:
+        for batch in train_data:
+            stim, y, mask, noise = batch[:4]
+            worm_id = batch[4].to(device, non_blocking=True) if len(batch) > 4 else None
             stim = stim.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
@@ -711,7 +915,7 @@ def main() -> None:
             noise = reweight_hop1_noise(
                 noise, stim, adj_t, args.hop1_loss_weight, args.stim_loss_weight
             )
-            loss += svi.step(
+            svi_kw = dict(
                 ExternalInput=stim,
                 mask=mask,
                 y=y,
@@ -719,10 +923,19 @@ def main() -> None:
                 dataset_size=n_train_trials,
                 drift_gate=drift_gate,
             )
-            if use_aux and aux_opt is not None:
+            if worm_id is not None:
+                svi_kw["worm_id"] = worm_id
+            loss += svi.step(**svi_kw)
+            if use_kernel_aux and aux_opt is not None:
                 aux_loss_sum += _aux_kernel_step(
                     model, aux_opt, stim, y, mask, noise, adj_t,
                     args.pre_vols, args.kernel_loss_weight, args.dynamics_loss_weight, drift_gate=drift_gate,
+                )
+            if use_rollout_aux and aux_opt is not None:
+                aux_loss_sum += _aux_rollout_overshoot_step(
+                    model, aux_opt, stim, y, mask, noise,
+                    args.pre_vols, args.rollout_loss_weight, args.overshoot_loss_weight,
+                    drift_gate=drift_gate, worm_id=worm_id,
                 )
             n_batches_ep += 1
             scaled_obs_t = scaled_obs_t + mask.sum().to(dtype=torch.float32) * scale_factor

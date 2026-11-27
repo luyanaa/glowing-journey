@@ -350,7 +350,15 @@ def adapt_worm_posterior(
         managed_params.append(param)
 
     worm_state: Optional[dict] = None
-    if use_worm_latent:
+    gen_worm_bw: Optional[torch.nn.Parameter] = None
+    gen_worm_dim = int(getattr(model.decoder, "worm_latent_dim", 0))
+    if use_worm_latent and gen_worm_dim > 0:
+        gen_worm_bw = torch.nn.Parameter(
+            torch.zeros((1, gen_worm_dim), device=stim_hist.device, dtype=stim_hist.dtype)
+        )
+        whitened_params.append(gen_worm_bw)
+        managed_params.append(gen_worm_bw)
+    elif use_worm_latent:
         basis = _build_worm_latent_edge_basis(
             model, worm_latent_dim=int(worm_latent_dim), device=stim_hist.device, dtype=stim_hist.dtype
         )
@@ -423,6 +431,8 @@ def adapt_worm_posterior(
                 device=s_sl.device,
                 dtype=s_sl.dtype,
             )
+        if gen_worm_bw is not None:
+            m_kw["worm_b_override"] = gen_worm_bw
         m_kw["sample_obs"] = False
         return g_kw, m_kw
 
@@ -481,6 +491,8 @@ def adapt_worm_posterior(
             for _, param, _, pop_val, pop_sig in anchors:
                 diff = (param - pop_val) / pop_sig
                 kl = kl + 0.5 * (diff * diff).sum()
+            if gen_worm_bw is not None:
+                kl = kl + 0.5 * (gen_worm_bw * gen_worm_bw).sum()
             if worm_state is not None:
                 bw = worm_state["b_w"]
                 kl = kl + 0.5 * (bw * bw).sum()
@@ -541,12 +553,16 @@ def adapt_worm_posterior(
 
     shifts = [float((param.detach() - pop_val).abs().max().item()) for _, param, _, pop_val, _ in anchors]
     wshifts = [float(u_param.detach().abs().max().item()) for _, _, u_param, _, _ in anchors]
+    if gen_worm_bw is not None:
+        gbw = float(gen_worm_bw.detach().abs().max().item())
+        wshifts.append(gbw)
+        shifts.append(gbw)
     if worm_state is not None:
         bw_max = float(worm_state["b_w"].detach().abs().max().item())
         wshifts.append(bw_max)
         for raw_e, base_e, _, _ in worm_state["edge_bindings"]:
             shifts.append(float((raw_e.detach() - base_e).abs().max().item()))
-    return {
+    out_log = {
         "n_hist_trials": k_tot,
         "n_train_hist": int(n_tr),
         "n_val_hist": int(n_val),
@@ -560,6 +576,9 @@ def adapt_worm_posterior(
         "max_param_shift": max(shifts) if shifts else 0.0,
         "max_whitened_shift": max(wshifts) if wshifts else 0.0,
     }
+    if gen_worm_bw is not None:
+        out_log["_worm_b_tensor"] = gen_worm_bw.detach().clone()
+    return out_log
 
 
 def _predict_single_trial_counterfactual(
@@ -572,6 +591,7 @@ def _predict_single_trial_counterfactual(
     pre_vols: int,
     eval_seed: int,
     drift_gate: Optional[torch.Tensor] = None,
+    worm_b_override: Optional[torch.Tensor] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Predict (y_pred, y_pred_cf) for a single trial batch (1, T, N) with paired counterfactual."""
     device = stim.device
@@ -605,6 +625,11 @@ def _predict_single_trial_counterfactual(
     if has_prestim and drift_gate is not None:
         stack_dim = 1 if drift_gate.dim() == 3 else 0
         stacked_kw["drift_gate"] = torch.cat([drift_gate, drift_gate], dim=stack_dim)
+    if worm_b_override is not None:
+        bw_t = worm_b_override.to(device=stim.device, dtype=stim.dtype)
+        if bw_t.dim() == 1:
+            bw_t = bw_t.unsqueeze(0)
+        stacked_kw["worm_b_override"] = torch.cat([bw_t, bw_t], dim=0)
 
     bsz = stim.shape[0]
     torch.manual_seed(int(eval_seed))
@@ -741,6 +766,7 @@ def evaluate_online_ttt(
                         else:
                             eff_mode = ttt_mode
 
+                active_worm_b = None
                 if eff_tier is not None and eff_mode is not None:
                     stim_h = dataset.stim_inputs[hist_idx].to(device)
                     y_h = dataset.y[hist_idx].to(device)
@@ -773,6 +799,7 @@ def evaluate_online_ttt(
                         drift_gate=gate_h,
                         seed=int(eval_seed) + 1000 * worm_pos + target_pos,
                     )
+                    active_worm_b = log.pop("_worm_b_tensor", None)
                     adapt_logs.append(log)
 
                 stim_t = dataset.stim_inputs[target_idx : target_idx + 1].to(device)
@@ -795,6 +822,7 @@ def evaluate_online_ttt(
                     pre_vols=pre_vols,
                     eval_seed=int(eval_seed) + 10000 * worm_pos + target_pos,
                     drift_gate=gate_t,
+                    worm_b_override=active_worm_b,
                 )
 
                 y_trues.append(y_t.cpu().numpy())
@@ -982,6 +1010,12 @@ def _load_checkpoint_model(
         eff_ssm_dim = int(ms[decay_key].numel())
     else:
         eff_ssm_dim = int(args.latent_ssm_dim)
+    ssm_state_observer = bool(
+        getattr(args, "ssm_state_observer", False) or any("decoder.latent_ssm.obs_local_fc1." in k for k in ms_keys)
+    )
+    ssm_min_decay = float(getattr(args, "ssm_min_decay", 0.0))
+    worm_dim_ckpt = int(ms["decoder.U_chem"].shape[1]) if "decoder.U_chem" in ms_keys else 0
+    num_worms_ckpt = int(ms["guide.worm_b_loc"].shape[0]) if "guide.worm_b_loc" in ms_keys else 0
 
     step = c302.readConnectome(
         os.path.join(REPO, "data/CElegansNeuronTables.xls"),
@@ -995,6 +1029,7 @@ def _load_checkpoint_model(
         split_extrasynaptic=split_extrasyn,
         use_syn_filter=use_syn_filter,
         shuffle_seed=shuffle_seed,
+        shuffle_disjoint=bool(getattr(args, "shuffle_disjoint", False)),
     )
     rec = c302.RecurrentNematode(
         step,
@@ -1017,6 +1052,10 @@ def _load_checkpoint_model(
         ssm_artifact_dim=ssm_art_dim,
         ssm_variational_traj=ssm_vtraj,
         ssm_smoother=ssm_smooth,
+        ssm_state_observer=ssm_state_observer,
+        ssm_min_decay=ssm_min_decay,
+        worm_latent_dim=worm_dim_ckpt,
+        num_worms=num_worms_ckpt,
     )
     model = vae.VAElegans(
         rec,
@@ -1072,6 +1111,9 @@ def main() -> None:
     p.add_argument("--dimensionless-physiology", action="store_true")
     p.add_argument("--latent-ssm", action="store_true")
     p.add_argument("--latent-ssm-dim", default=16, type=int)
+    p.add_argument("--ssm-state-observer", action="store_true")
+    p.add_argument("--ssm-min-decay", default=0.0, type=float)
+    p.add_argument("--shuffle-disjoint", action="store_true")
     p.add_argument("--stim-actuator", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--stim-tau-rise", default=0.08, type=float)
     p.add_argument("--stim-tau-decay", default=0.4, type=float)

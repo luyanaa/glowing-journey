@@ -1,5 +1,6 @@
 import os
 import re
+import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import joblib
@@ -579,6 +580,7 @@ class AtlasLoader(Dataset):
         smooth_window: Optional[int] = None,
         max_recordings: Optional[int] = None,
         causal_preprocess: bool = False,
+        strict_recordings: bool = False,
     ):
         self.device = device
         self.strain = str(strain)
@@ -590,7 +592,15 @@ class AtlasLoader(Dataset):
         resolved_dir = self._resolve_data_dir(path, strain)
         self.data_dir = resolved_dir
 
-        rec_ids = self._discover_recording_ids(resolved_dir)
+        rec_ids, missing_gcamp = self._discover_recording_ids_with_missing(resolved_dir)
+        if missing_gcamp:
+            msg = (
+                f"RandiCausalData: skipping {len(missing_gcamp)} recording(s) missing *_gcamp.txt "
+                f"in {resolved_dir}: {missing_gcamp}"
+            )
+            if strict_recordings:
+                raise FileNotFoundError(msg)
+            warnings.warn(msg)
         if max_recordings is not None:
             rec_ids = rec_ids[:max_recordings]
         if not rec_ids:
@@ -628,13 +638,28 @@ class AtlasLoader(Dataset):
         return candidate
 
     @staticmethod
-    def _discover_recording_ids(data_dir: str) -> List[int]:
-        ids = []
+    def _discover_recording_ids_with_missing(data_dir: str) -> Tuple[List[int], List[int]]:
+        gcamp_ids = set()
+        t_ids = set()
         for fname in os.listdir(data_dir):
-            match = re.match(r"^(\d+)_gcamp\.txt$", fname)
-            if match:
-                ids.append(int(match.group(1)))
-        return sorted(ids)
+            m_g = re.match(r"^(\d+)_gcamp\.txt$", fname)
+            if m_g:
+                gcamp_ids.add(int(m_g.group(1)))
+            m_t = re.match(r"^(\d+)_t\.txt$", fname)
+            if m_t:
+                t_ids.add(int(m_t.group(1)))
+        missing = sorted(t_ids - gcamp_ids)
+        return sorted(gcamp_ids), missing
+
+    @staticmethod
+    def _discover_recording_ids(data_dir: str) -> List[int]:
+        ids, missing = RandiCausalData._discover_recording_ids_with_missing(data_dir)
+        if missing:
+            warnings.warn(
+                f"RandiCausalData: skipping {len(missing)} recording(s) missing *_gcamp.txt "
+                f"in {data_dir}: {missing}"
+            )
+        return ids
 
     @staticmethod
     def _load_txt_matrix(path: str) -> np.ndarray:

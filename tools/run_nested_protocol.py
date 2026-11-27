@@ -96,6 +96,12 @@ def main() -> None:
     p.add_argument("--ssm-artifact-dim", default=8, type=int)
     p.add_argument("--ssm-variational-traj", action="store_true")
     p.add_argument("--ssm-smoother", action="store_true")
+    p.add_argument("--ssm-state-observer", action="store_true")
+    p.add_argument("--ssm-min-decay", default=0.0, type=float)
+    p.add_argument("--rollout-loss-weight", default=0.0, type=float)
+    p.add_argument("--overshoot-loss-weight", default=0.0, type=float)
+    p.add_argument("--worm-latent-dim", default=0, type=int)
+    p.add_argument("--shuffle-disjoint", action="store_true")
     p.add_argument("--history-vols", default=0, type=int)
     p.add_argument("--tau-np-prior", default=4.0, type=float)
     p.add_argument("--tau-ma-prior", default=1.0, type=float)
@@ -214,8 +220,14 @@ def main() -> None:
                     cmd.append("--ssm-variational-traj")
                 if args.ssm_smoother:
                     cmd.append("--ssm-smoother")
+                if args.ssm_state_observer:
+                    cmd.append("--ssm-state-observer")
+                if args.ssm_min_decay > 0.0:
+                    cmd.extend(["--ssm-min-decay", str(args.ssm_min_decay)])
                 if args.history_vols > 0:
                     cmd.extend(["--history-vols", str(args.history_vols)])
+            if args.worm_latent_dim > 0:
+                cmd.extend(["--worm-latent-dim", str(args.worm_latent_dim)])
             cmd.extend([
                 "--tau-np-prior", str(args.tau_np_prior),
                 "--tau-ma-prior", str(args.tau_ma_prior),
@@ -225,6 +237,10 @@ def main() -> None:
                 cmd.extend(["--kernel-loss-weight", str(args.kernel_loss_weight)])
             if args.dynamics_loss_weight > 0:
                 cmd.extend(["--dynamics-loss-weight", str(args.dynamics_loss_weight)])
+            if args.rollout_loss_weight > 0:
+                cmd.extend(["--rollout-loss-weight", str(args.rollout_loss_weight)])
+            if args.overshoot_loss_weight > 0:
+                cmd.extend(["--overshoot-loss-weight", str(args.overshoot_loss_weight)])
             if args.stim_actuator:
                 cmd.append("--stim-actuator")
                 cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])
@@ -234,6 +250,8 @@ def main() -> None:
                 cmd.extend(["--stim-loss-weight", str(args.stim_loss_weight)])
             if shuffle_seed is not None:
                 cmd.extend(["--shuffle-connectome", str(shuffle_seed)])
+                if args.shuffle_disjoint:
+                    cmd.append("--shuffle-disjoint")
             log_path = os.path.join(run_dir, "train.log")
             with open(log_path, "w") as log:
                 proc = subprocess.run(cmd, cwd=REPO, stdout=log, stderr=subprocess.STDOUT, text=True)
@@ -304,8 +322,14 @@ def main() -> None:
                     eval_cmd.append("--ssm-variational-traj")
                 if args.ssm_smoother:
                     eval_cmd.append("--ssm-smoother")
+                if args.ssm_state_observer:
+                    eval_cmd.append("--ssm-state-observer")
+                if args.ssm_min_decay > 0.0:
+                    eval_cmd.extend(["--ssm-min-decay", str(args.ssm_min_decay)])
                 if args.history_vols > 0:
                     eval_cmd.extend(["--history-vols", str(args.history_vols)])
+            if args.worm_latent_dim > 0:
+                eval_cmd.extend(["--worm-latent-dim", str(args.worm_latent_dim)])
             eval_cmd.extend([
                 "--tau-np-prior", str(args.tau_np_prior),
                 "--tau-ma-prior", str(args.tau_ma_prior),
@@ -316,6 +340,8 @@ def main() -> None:
                 eval_cmd.extend(["--stim-tau-rise", str(args.stim_tau_rise), "--stim-tau-decay", str(args.stim_tau_decay)])
             if shuffle_seed is not None:
                 eval_cmd.extend(["--shuffle-seed", str(shuffle_seed)])
+                if args.shuffle_disjoint:
+                    eval_cmd.append("--shuffle-disjoint")
             proc = subprocess.run(eval_cmd, cwd=REPO, capture_output=True, text=True)
             if proc.returncode != 0:
                 raise RuntimeError(f"evaluation failed: {tag} seed={seed}\n{proc.stderr[-4000:]}")

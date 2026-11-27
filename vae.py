@@ -220,6 +220,10 @@ class VAEGuide(PyroModule):
         genotype_conditioned: bool = False,
         ssm_variational_traj: bool = False,
         history_vols: int = 0,
+        fix_wired_mut: bool = False,
+        strain_obs_calib: bool = False,
+        worm_latent_dim: int = 0,
+        num_worms: int = 0,
     ):
         super().__init__()
         self.wide_amp_priors = bool(wide_amp_priors)
@@ -250,6 +254,10 @@ class VAEGuide(PyroModule):
         self.genotype_conditioned = bool(genotype_conditioned)
         self.ssm_variational_traj = bool(ssm_variational_traj)
         self.history_vols = int(history_vols)
+        self.fix_wired_mut = bool(fix_wired_mut)
+        self.strain_obs_calib = bool(strain_obs_calib)
+        self.worm_latent_dim = max(0, int(worm_latent_dim))
+        self.num_worms = max(0, int(num_worms))
 
         if e_rev_prior is not None and self.wicks_dim > 0:
             e_prior = torch.as_tensor(e_rev_prior, dtype=torch.float32).detach().clone().reshape(self.wicks_dim)
@@ -363,8 +371,24 @@ class VAEGuide(PyroModule):
             self.gamma_np_mut_scale = PyroParam(torch.tensor(0.25), constraint=constraints.interval(1e-3, 1.5))
             self.gamma_ma_mut_loc = PyroParam(torch.tensor(0.0))
             self.gamma_ma_mut_scale = PyroParam(torch.tensor(0.25), constraint=constraints.interval(1e-3, 1.5))
-            self.gamma_wired_mut_loc = PyroParam(torch.tensor(0.0))
-            self.gamma_wired_mut_scale = PyroParam(torch.tensor(0.15), constraint=constraints.interval(1e-3, 1.0))
+            if not self.fix_wired_mut:
+                self.gamma_wired_mut_loc = PyroParam(torch.tensor(0.0))
+                self.gamma_wired_mut_scale = PyroParam(torch.tensor(0.15), constraint=constraints.interval(1e-3, 1.0))
+
+        if self.strain_obs_calib:
+            self.gcamp_gain_mut_loc = PyroParam(torch.tensor(0.0))
+            self.gcamp_gain_mut_scale = PyroParam(torch.tensor(0.15), constraint=constraints.interval(1e-3, 1.0))
+            self.gcamp_offset_mut_loc = PyroParam(torch.tensor(0.0))
+            self.gcamp_offset_mut_scale = PyroParam(torch.tensor(0.05), constraint=constraints.interval(1e-3, 0.5))
+            self.stim_gain_mut_loc = PyroParam(torch.tensor(0.0))
+            self.stim_gain_mut_scale = PyroParam(torch.tensor(0.15), constraint=constraints.interval(1e-3, 1.0))
+
+        if self.worm_latent_dim > 0 and self.num_worms > 0:
+            self.worm_b_loc = PyroParam(torch.zeros(self.num_worms, self.worm_latent_dim))
+            self.worm_b_scale = PyroParam(
+                torch.full((self.num_worms, self.worm_latent_dim), 0.1),
+                constraint=constraints.interval(1e-3, 1.5),
+            )
 
         if self.use_syn_filter and self.wicks_dim > 0 and self.tau_syn_dim > 0:
             self.tau_syn_loc = PyroParam(torch.full((self.tau_syn_dim,), math.log(0.6)))
@@ -510,6 +534,8 @@ class VAEGuide(PyroModule):
         pre_stim_mask: Optional[torch.Tensor] = None,
         drift_gate: Optional[torch.Tensor] = None,
         genotype_id: Optional[torch.Tensor] = None,
+        worm_id: Optional[torch.Tensor] = None,
+        worm_b_override: Optional[torch.Tensor] = None,
     ) -> None:
         if self.direct_global_guide:
             neuron_loc, neuron_scale, wicks_loc, wicks_scale, gap_loc, gap_scale = self._direct_global_params()
@@ -636,9 +662,28 @@ class VAEGuide(PyroModule):
                 "decoder.model.synapse.gamma_ma_mut",
                 dist.LogNormal(self.gamma_ma_mut_loc, self.gamma_ma_mut_scale),
             )
+            if not self.fix_wired_mut:
+                pyro.sample(
+                    "decoder.model.synapse.gamma_wired_mut",
+                    dist.LogNormal(self.gamma_wired_mut_loc, self.gamma_wired_mut_scale),
+                )
+        if self.strain_obs_calib:
             pyro.sample(
-                "decoder.model.synapse.gamma_wired_mut",
-                dist.LogNormal(self.gamma_wired_mut_loc, self.gamma_wired_mut_scale),
+                "decoder.gcamp_gain_mut",
+                dist.LogNormal(self.gcamp_gain_mut_loc, self.gcamp_gain_mut_scale),
+            )
+            pyro.sample(
+                "decoder.gcamp_offset_mut",
+                dist.Normal(self.gcamp_offset_mut_loc, self.gcamp_offset_mut_scale),
+            )
+            pyro.sample(
+                "decoder.stim_gain_mut",
+                dist.LogNormal(self.stim_gain_mut_loc, self.stim_gain_mut_scale),
+            )
+        if self.worm_latent_dim > 0 and self.num_worms > 0:
+            pyro.sample(
+                "decoder.worm_b",
+                dist.Normal(self.worm_b_loc, self.worm_b_scale).to_event(2),
             )
 
         if self.per_neuron_stim_gain:
@@ -806,6 +851,10 @@ class VAElegans(PyroModule):
         tau_ma_prior = float(getattr(syn_mod, "tau_ma_prior", 1.0))
         tau_mod_prior_std = float(getattr(syn_mod, "tau_mod_prior_std", 0.5))
         genotype_conditioned = bool(getattr(syn_mod, "genotype_conditioned", False))
+        fix_wired_mut = bool(getattr(syn_mod, "fix_wired_mut", False))
+        strain_obs_calib = bool(getattr(model, "strain_obs_calib", False))
+        worm_latent_dim = int(getattr(model, "worm_latent_dim", 0))
+        num_worms = int(getattr(model, "num_worms", 0))
         ssm_mod = getattr(model, "latent_ssm", None)
         ssm_variational_traj = bool(getattr(ssm_mod, "variational_traj", False)) if ssm_mod is not None else False
         history_vols = int(getattr(model, "history_vols", 0))
@@ -813,6 +862,8 @@ class VAElegans(PyroModule):
         self.dimensionless = dimensionless
         self.leak_gauge = leak_gauge
         self.genotype_conditioned = genotype_conditioned
+        self.fix_wired_mut = fix_wired_mut
+        self.strain_obs_calib = strain_obs_calib
         self.guide = VAEGuide(
             neuron_dim, wicks_dim, gap_dim,
             e_rev_prior=e_rev_prior,
@@ -842,6 +893,10 @@ class VAElegans(PyroModule):
             genotype_conditioned=genotype_conditioned,
             ssm_variational_traj=ssm_variational_traj,
             history_vols=history_vols,
+            fix_wired_mut=fix_wired_mut,
+            strain_obs_calib=strain_obs_calib,
+            worm_latent_dim=worm_latent_dim,
+            num_worms=num_worms,
         )
         # Non-module reference prevents duplicate Pyro/PyTorch state_dict registration of latent_ssm
         object.__setattr__(self.guide, "_latent_ssm_ref", ssm_mod)
@@ -955,6 +1010,8 @@ class VAElegans(PyroModule):
         ssm_eps: Optional[torch.Tensor] = None,
         genotype_id: Optional[torch.Tensor] = None,
         filter_online: bool = False,
+        worm_id: Optional[torch.Tensor] = None,
+        worm_b_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return self.decoder(
             ExternalInput=ExternalInput,
@@ -970,4 +1027,6 @@ class VAElegans(PyroModule):
             ssm_eps=ssm_eps,
             genotype_id=genotype_id,
             filter_online=filter_online,
+            worm_id=worm_id,
+            worm_b_override=worm_b_override,
         )
