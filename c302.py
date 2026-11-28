@@ -2079,6 +2079,7 @@ class RecurrentNematode(PyroModule):
         worm_id: Optional[torch.Tensor] = None,
         worm_b_override: Optional[torch.Tensor] = None,
         return_latent_traj: bool = False,
+        _skip_idle_pre: bool = True,
     ) -> Tuple[torch.Tensor, ...]:
         batch_size, n_t, n_neurons = stim_input.shape
         dt_sim = dt_obs / max(1, self.substeps)
@@ -2286,7 +2287,27 @@ class RecurrentNematode(PyroModule):
 
         z_post_traj = [] if (return_latent_traj and self.latent_ssm is not None) else None
         is_observer = bool(self.latent_ssm is not None and self.latent_ssm.state_observer)
-        for t in range(n_t):
+        can_skip_pre = (
+            bool(_skip_idle_pre)
+            and inject_t > 0
+            and not is_observer
+            and not has_sensory
+            and voltage_clamp is None
+            and worm_edge_scale is None
+            and getattr(self.model, "bnn_residual", None) is None
+            and bool((stim_input[:, :inject_t].abs().max() == 0).item())
+        )
+        start_t = 0
+        if can_skip_pre:
+            y_rest = gcamp_gain * (b - b_baseline) + gcamp_offset
+            if y_rest.shape != v.shape:
+                y_rest = y_rest.expand_as(v)
+            y_preds.extend([y_rest] * inject_t)
+            if return_trajectories:
+                v_traj.extend([v] * inject_t)
+                ca_traj.extend([ca] * inject_t)
+            start_t = inject_t
+        for t in range(start_t, n_t):
             if t == inject_t:
                 if prestim_state is not None:
                     delta_v0, delta_ca0 = prestim_state[0], prestim_state[1]
@@ -2542,22 +2563,24 @@ class RecurrentNematode(PyroModule):
         else:
             scale_t = obs_sigma
 
-        with batch_plate:
-            for t in range(n_t):
-                loc_t = y_pred[:, t, :]
-                if isinstance(scale_t, torch.Tensor) and scale_t.dim() == 3:
-                    s_t = scale_t[:, t, :]
-                else:
-                    s_t = scale_t
-                if self.likelihood == "student_t":
-                    base_dist = dist.StudentT(self.student_t_df, loc_t, s_t)
-                else:
-                    base_dist = dist.Normal(loc_t, s_t)
+        if isinstance(scale_t, torch.Tensor):
+            if scale_t.dim() == 2:
+                scale_all = scale_t.unsqueeze(1).expand_as(y_pred)
+            elif scale_t.dim() <= 1:
+                scale_all = scale_t.expand_as(y_pred)
+            else:
+                scale_all = scale_t
+        else:
+            scale_all = scale_t
 
-                if obs_mask is not None:
-                    base_dist = base_dist.mask(obs_mask[:, t, :])
-                obs_t = None if y_obs is None else y_obs[:, t, :]
-                pyro.sample(f"obs_{t}", base_dist.to_event(1), obs=obs_t)
+        if self.likelihood == "student_t":
+            base_dist = dist.StudentT(self.student_t_df, y_pred, scale_all)
+        else:
+            base_dist = dist.Normal(y_pred, scale_all)
+        if obs_mask is not None:
+            base_dist = base_dist.mask(obs_mask)
+        with batch_plate:
+            pyro.sample("obs_all", base_dist.to_event(2), obs=y_obs)
 
         return y_pred.squeeze(0) if squeezed else y_pred
 

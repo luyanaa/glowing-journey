@@ -190,7 +190,15 @@ def _get_tier_anchor_specs(
 def _build_worm_latent_edge_basis(
     model: vae.VAElegans, worm_latent_dim: int, device: torch.device, dtype: torch.dtype
 ) -> Dict[str, torch.Tensor]:
-    """Construct low-rank graph-spectral basis U_wicks, U_gap for worm identity latent b_w."""
+    """Construct and cache low-rank graph-spectral basis U_wicks, U_gap for worm identity latent b_w."""
+    cache = getattr(model, "_worm_latent_basis_cache", None)
+    if cache is None:
+        cache = {}
+        model._worm_latent_basis_cache = cache
+    key = (int(worm_latent_dim), str(device), str(dtype))
+    if key in cache:
+        return cache[key]
+
     syn = model.decoder.model.synapse
     n_neu = int(getattr(model.decoder.model, "neuronSize", 300))
     adj_np = np.asarray(syn.adjacency_matrix(n_neu), dtype=np.float64)
@@ -218,6 +226,7 @@ def _build_worm_latent_edge_basis(
         ug = (u_t[g_src] + u_t[g_dst]) / math.sqrt(2.0)
         rms = torch.sqrt(torch.mean(ug * ug, dim=0, keepdim=True)).clamp(min=1e-6)
         out["U_gap"] = ug / rms
+    cache[key] = out
     return out
 
 
@@ -229,9 +238,23 @@ def snapshot_population_state(model: vae.VAElegans) -> dict:
 
 
 def restore_population_state(model: vae.VAElegans, pop_snapshot: dict) -> None:
-    """Restore model bitwise and clear ParamStore so Pyro re-binds live nn.Parameters."""
+    """Restore model bitwise in-place and clear ParamStore so Pyro re-binds live nn.Parameters."""
     pyro.clear_param_store()
-    model.load_state_dict({k: v.detach().clone() for k, v in pop_snapshot["model_state"].items()})
+    snap_sd = pop_snapshot["model_state"]
+    copied = set()
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            src = snap_sd.get(name)
+            if src is not None:
+                param.copy_(src)
+                copied.add(name)
+        for name, buf in model.named_buffers():
+            src = snap_sd.get(name)
+            if src is not None:
+                buf.copy_(src)
+                copied.add(name)
+    if len(copied) != len(snap_sd):
+        model.load_state_dict({k: v.detach().clone() for k, v in snap_sd.items()})
 
 
 def _posterior_median_from_guide(guide, guide_kwargs: dict) -> Dict[str, torch.Tensor]:
@@ -706,6 +729,7 @@ def evaluate_online_ttt(
     num_samples: int = 8,
     eval_seed: int = 42,
     history_bins: Sequence[Tuple[int, int]] = ((0, 0), (1, 3), (4, 8), (9, 999)),
+    zero_shot_batch_size: int = 64,
 ) -> Dict:
     """Run strictly causal prequential Online Bayesian TTT across unseen test worms."""
     if k_tier_schedule not in ("none", "t1_then_t2", "ttt_c_then_e", "ttt_c_then_d"):
@@ -733,105 +757,152 @@ def evaluate_online_ttt(
     adapt_logs: List[Dict[str, float]] = []
 
     try:
-        for worm_pos, (rec_id, worm_indices) in enumerate(by_worm.items()):
-            for target_pos, target_idx in enumerate(worm_indices):
-                restore_population_state(model, pop_snapshot)
-                hist_idx = select_causal_history_indices(
-                    worm_indices,
-                    target_pos=target_pos,
-                    meta=dataset.meta,
-                    post_vols=eff_post_vols,
-                    max_history=max_history,
-                    pre_vols=pre_vols,
-                    strict_disjoint_pre=bool(strict_disjoint_pre),
-                )
-
-                k_hist = len(hist_idx)
-                eff_tier: Optional[str] = None
-                eff_mode: Optional[str] = None
-                if k_hist > 0 and ttt_steps > 0:
-                    if k_hist < int(min_history):
-                        if k_tier_schedule == "t1_then_t2":
-                            eff_tier = "tier1"
-                            eff_mode = "ttt_c" if ttt_mode.startswith("ttt_") else "auto"
-                        elif k_tier_schedule in ("ttt_c_then_e", "ttt_c_then_d"):
-                            eff_tier = tier
-                            eff_mode = "ttt_c"
-                    else:
-                        eff_tier = tier
-                        if k_tier_schedule == "ttt_c_then_e" and ttt_mode == "auto":
-                            eff_mode = "ttt_e"
-                        elif k_tier_schedule == "ttt_c_then_d" and ttt_mode == "auto":
-                            eff_mode = "ttt_d"
-                        else:
-                            eff_mode = ttt_mode
-
-                active_worm_b = None
-                if eff_tier is not None and eff_mode is not None:
-                    stim_h = dataset.stim_inputs[hist_idx].to(device)
-                    y_h = dataset.y[hist_idx].to(device)
-                    mask_h = dataset.obs_mask[hist_idx].to(device)
-                    noise_h = dataset.noise_scale[hist_idx].to(device)
-                    gate_h = (
-                        compute_drift_gate(stim_h, adj_t, drift_gate_mode)
-                        if (has_prestim and drift_gate_mode != "none")
-                        else None
-                    )
-                    log = adapt_worm_posterior(
-                        model,
-                        stim_hist=stim_h,
-                        y_hist=y_h,
-                        mask_hist=mask_h,
-                        noise_hist=noise_h,
-                        tier=eff_tier,
-                        ttt_mode=eff_mode,
-                        worm_latent_dim=worm_latent_dim,
-                        temporal_val_frac=temporal_val_frac,
-                        ttt_steps=ttt_steps,
-                        ttt_lr=ttt_lr,
-                        kl_weight=kl_weight,
-                        nll_temp=nll_temp,
-                        adapt_obs_sigma=adapt_obs_sigma,
+        if int(ttt_steps) <= 0:
+            flat_trials: List[Tuple[int, int, int]] = []
+            for rec_id, worm_indices in by_worm.items():
+                for target_pos, target_idx in enumerate(worm_indices):
+                    hist_idx = select_causal_history_indices(
+                        worm_indices,
+                        target_pos=target_pos,
+                        meta=dataset.meta,
+                        post_vols=eff_post_vols,
+                        max_history=max_history,
                         pre_vols=pre_vols,
-                        stim_loss_weight=stim_loss_weight,
-                        hop1_loss_weight=hop1_loss_weight,
-                        adjacency_t=adj_t,
-                        drift_gate=gate_h,
-                        seed=int(eval_seed) + 1000 * worm_pos + target_pos,
+                        strict_disjoint_pre=bool(strict_disjoint_pre),
                     )
-                    active_worm_b = log.pop("_worm_b_tensor", None)
-                    adapt_logs.append(log)
-
-                stim_t = dataset.stim_inputs[target_idx : target_idx + 1].to(device)
-                y_t = dataset.y[target_idx : target_idx + 1].to(device)
-                mask_t = dataset.obs_mask[target_idx : target_idx + 1].to(device)
-                noise_t = dataset.noise_scale[target_idx : target_idx + 1].to(device)
-                gate_t = (
-                    compute_drift_gate(stim_t, adj_t, drift_gate_mode)
+                    flat_trials.append((int(rec_id), int(target_idx), len(hist_idx)))
+            bsz_zs = max(1, int(zero_shot_batch_size))
+            for b_start in range(0, len(flat_trials), bsz_zs):
+                chunk = flat_trials[b_start : b_start + bsz_zs]
+                idx_batch = [t[1] for t in chunk]
+                stim_b = dataset.stim_inputs[idx_batch].to(device)
+                y_b = dataset.y[idx_batch].to(device)
+                mask_b = dataset.obs_mask[idx_batch].to(device)
+                noise_b = dataset.noise_scale[idx_batch].to(device)
+                gate_b = (
+                    compute_drift_gate(stim_b, adj_t, drift_gate_mode)
                     if (has_prestim and drift_gate_mode != "none")
                     else None
                 )
-
                 pred_mean, pred_cf = _predict_single_trial_counterfactual(
                     model,
-                    stim=stim_t,
-                    y=y_t,
-                    mask=mask_t,
-                    noise=noise_t,
+                    stim=stim_b,
+                    y=y_b,
+                    mask=mask_b,
+                    noise=noise_b,
                     num_samples=num_samples,
                     pre_vols=pre_vols,
-                    eval_seed=int(eval_seed) + 10000 * worm_pos + target_pos,
-                    drift_gate=gate_t,
-                    worm_b_override=active_worm_b,
+                    eval_seed=int(eval_seed) + b_start,
+                    drift_gate=gate_b,
                 )
-
-                y_trues.append(y_t.cpu().numpy())
+                y_trues.append(y_b.cpu().numpy())
                 y_preds.append(pred_mean)
                 y_cfs.append(pred_cf)
-                masks.append(mask_t.bool().cpu().numpy())
-                stims.append(stim_t.cpu().numpy())
-                hist_counts.append(len(hist_idx))
-                rec_ids.append(int(rec_id))
+                masks.append(mask_b.bool().cpu().numpy())
+                stims.append(stim_b.cpu().numpy())
+                for rec_i, _, k_h in chunk:
+                    hist_counts.append(k_h)
+                    rec_ids.append(rec_i)
+        else:
+            for worm_pos, (rec_id, worm_indices) in enumerate(by_worm.items()):
+                for target_pos, target_idx in enumerate(worm_indices):
+                    restore_population_state(model, pop_snapshot)
+                    hist_idx = select_causal_history_indices(
+                        worm_indices,
+                        target_pos=target_pos,
+                        meta=dataset.meta,
+                        post_vols=eff_post_vols,
+                        max_history=max_history,
+                        pre_vols=pre_vols,
+                        strict_disjoint_pre=bool(strict_disjoint_pre),
+                    )
+
+                    k_hist = len(hist_idx)
+                    eff_tier: Optional[str] = None
+                    eff_mode: Optional[str] = None
+                    if k_hist > 0 and ttt_steps > 0:
+                        if k_hist < int(min_history):
+                            if k_tier_schedule == "t1_then_t2":
+                                eff_tier = "tier1"
+                                eff_mode = "ttt_c" if ttt_mode.startswith("ttt_") else "auto"
+                            elif k_tier_schedule in ("ttt_c_then_e", "ttt_c_then_d"):
+                                eff_tier = tier
+                                eff_mode = "ttt_c"
+                        else:
+                            eff_tier = tier
+                            if k_tier_schedule == "ttt_c_then_e" and ttt_mode == "auto":
+                                eff_mode = "ttt_e"
+                            elif k_tier_schedule == "ttt_c_then_d" and ttt_mode == "auto":
+                                eff_mode = "ttt_d"
+                            else:
+                                eff_mode = ttt_mode
+
+                    active_worm_b = None
+                    if eff_tier is not None and eff_mode is not None:
+                        stim_h = dataset.stim_inputs[hist_idx].to(device)
+                        y_h = dataset.y[hist_idx].to(device)
+                        mask_h = dataset.obs_mask[hist_idx].to(device)
+                        noise_h = dataset.noise_scale[hist_idx].to(device)
+                        gate_h = (
+                            compute_drift_gate(stim_h, adj_t, drift_gate_mode)
+                            if (has_prestim and drift_gate_mode != "none")
+                            else None
+                        )
+                        log = adapt_worm_posterior(
+                            model,
+                            stim_hist=stim_h,
+                            y_hist=y_h,
+                            mask_hist=mask_h,
+                            noise_hist=noise_h,
+                            tier=eff_tier,
+                            ttt_mode=eff_mode,
+                            worm_latent_dim=worm_latent_dim,
+                            temporal_val_frac=temporal_val_frac,
+                            ttt_steps=ttt_steps,
+                            ttt_lr=ttt_lr,
+                            kl_weight=kl_weight,
+                            nll_temp=nll_temp,
+                            adapt_obs_sigma=adapt_obs_sigma,
+                            pre_vols=pre_vols,
+                            stim_loss_weight=stim_loss_weight,
+                            hop1_loss_weight=hop1_loss_weight,
+                            adjacency_t=adj_t,
+                            drift_gate=gate_h,
+                            seed=int(eval_seed) + 1000 * worm_pos + target_pos,
+                        )
+                        active_worm_b = log.pop("_worm_b_tensor", None)
+                        adapt_logs.append(log)
+
+                    stim_t = dataset.stim_inputs[target_idx : target_idx + 1].to(device)
+                    y_t = dataset.y[target_idx : target_idx + 1].to(device)
+                    mask_t = dataset.obs_mask[target_idx : target_idx + 1].to(device)
+                    noise_t = dataset.noise_scale[target_idx : target_idx + 1].to(device)
+                    gate_t = (
+                        compute_drift_gate(stim_t, adj_t, drift_gate_mode)
+                        if (has_prestim and drift_gate_mode != "none")
+                        else None
+                    )
+
+                    pred_mean, pred_cf = _predict_single_trial_counterfactual(
+                        model,
+                        stim=stim_t,
+                        y=y_t,
+                        mask=mask_t,
+                        noise=noise_t,
+                        num_samples=num_samples,
+                        pre_vols=pre_vols,
+                        eval_seed=int(eval_seed) + 10000 * worm_pos + target_pos,
+                        drift_gate=gate_t,
+                        worm_b_override=active_worm_b,
+                    )
+
+                    y_trues.append(y_t.cpu().numpy())
+                    y_preds.append(pred_mean)
+                    y_cfs.append(pred_cf)
+                    masks.append(mask_t.bool().cpu().numpy())
+                    stims.append(stim_t.cpu().numpy())
+                    hist_counts.append(len(hist_idx))
+                    rec_ids.append(int(rec_id))
     finally:
         restore_population_state(model, pop_snapshot)
 
@@ -1085,6 +1156,10 @@ def main() -> None:
     p.add_argument("--out", required=True, help="Output JSON summary path")
     p.add_argument("--tier", choices=["tier1", "tier2", "tier3"], default="tier1")
     p.add_argument("--ttt-mode", choices=["auto", "ttt_a", "ttt_b", "ttt_c", "ttt_d", "ttt_e", "ttt_f"], default="auto")
+    p.add_argument(
+        "--ttt-modes", default=None, type=str,
+        help="Optional comma-separated modes (e.g. ttt_c,ttt_d,ttt_c_then_d) sharing a single zero-shot evaluation",
+    )
     p.add_argument("--worm-latent-dim", default=8, type=int)
     p.add_argument("--temporal-val-frac", default=0.0, type=float)
     p.add_argument("--ttt-steps", default=8, type=int)
@@ -1144,54 +1219,105 @@ def main() -> None:
 
     # 1. Zero-shot baseline (ttt_steps=0) and Online TTT on intact checkpoint
     intact_model = _load_checkpoint_model(args.checkpoint, args, shuffle_seed=None, device=device)
-    intact_zero = evaluate_online_ttt(
-        intact_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
-        tier=args.tier, ttt_mode=args.ttt_mode, worm_latent_dim=args.worm_latent_dim,
-        temporal_val_frac=args.temporal_val_frac, ttt_steps=0, pre_vols=args.pre_vols,
-        strict_disjoint_pre=args.strict_disjoint_pre, drift_gate_mode=args.drift_gate,
-        num_samples=args.num_samples, eval_seed=args.eval_seed,
-    )
-    intact_ttt = evaluate_online_ttt(
-        intact_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
-        tier=args.tier, ttt_mode=args.ttt_mode, worm_latent_dim=args.worm_latent_dim,
-        temporal_val_frac=args.temporal_val_frac,
-        ttt_steps=args.ttt_steps, ttt_lr=args.ttt_lr, kl_weight=args.kl_weight,
-        nll_temp=args.nll_temp, adapt_obs_sigma=args.adapt_obs_sigma,
-        min_history=args.min_history, k_tier_schedule=args.k_tier_schedule,
-        pre_vols=args.pre_vols, max_history=args.max_history,
-        strict_disjoint_pre=args.strict_disjoint_pre,
-        stim_loss_weight=args.stim_loss_weight, hop1_loss_weight=args.hop1_loss_weight,
-        drift_gate_mode=args.drift_gate,
-        num_samples=args.num_samples, eval_seed=args.eval_seed,
-    )
+    if args.ttt_modes:
+        mode_names = [m.strip() for m in str(args.ttt_modes).split(",") if m.strip()]
 
-    result: Dict = {
-        "cache": args.cache,
-        "split_file": args.split_file,
-        "checkpoint": args.checkpoint,
-        "tier": args.tier,
-        "ttt_mode": args.ttt_mode,
-        "worm_latent_dim": int(args.worm_latent_dim),
-        "temporal_val_frac": float(args.temporal_val_frac),
-        "substeps": int(args.substeps),
-        "promotion_gate": _compute_ttt_promotion_gate(intact_zero, intact_ttt),
-        "intact_zero_shot": intact_zero,
-        "intact_online_ttt": intact_ttt,
-    }
+        def _parse_mode(name: str) -> Tuple[str, str]:
+            if name in ("ttt_c_then_d", "ttt_c_then_e"):
+                return "auto", name
+            return name, args.k_tier_schedule
 
-    if args.shuffle_checkpoint is not None:
-        shuf_model = _load_checkpoint_model(
-            args.shuffle_checkpoint, args, shuffle_seed=args.shuffle_seed, device=device
+        intact_zero = evaluate_online_ttt(
+            intact_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+            tier=args.tier, ttt_mode="auto", worm_latent_dim=args.worm_latent_dim,
+            temporal_val_frac=args.temporal_val_frac, ttt_steps=0, pre_vols=args.pre_vols,
+            strict_disjoint_pre=args.strict_disjoint_pre, drift_gate_mode=args.drift_gate,
+            num_samples=args.num_samples, eval_seed=args.eval_seed,
         )
-        shuf_zero = evaluate_online_ttt(
-            shuf_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+        modes_out: Dict[str, Dict] = {}
+        for m_name in mode_names:
+            eff_m, eff_sched = _parse_mode(m_name)
+            m_on = evaluate_online_ttt(
+                intact_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+                tier=args.tier, ttt_mode=eff_m, worm_latent_dim=args.worm_latent_dim,
+                temporal_val_frac=args.temporal_val_frac,
+                ttt_steps=args.ttt_steps, ttt_lr=args.ttt_lr, kl_weight=args.kl_weight,
+                nll_temp=args.nll_temp, adapt_obs_sigma=args.adapt_obs_sigma,
+                min_history=args.min_history, k_tier_schedule=eff_sched,
+                pre_vols=args.pre_vols, max_history=args.max_history,
+                strict_disjoint_pre=args.strict_disjoint_pre,
+                stim_loss_weight=args.stim_loss_weight, hop1_loss_weight=args.hop1_loss_weight,
+                drift_gate_mode=args.drift_gate,
+                num_samples=args.num_samples, eval_seed=args.eval_seed,
+            )
+            modes_out[m_name] = {
+                "promotion_gate": _compute_ttt_promotion_gate(intact_zero, m_on),
+                "online_ttt": m_on,
+            }
+        result: Dict = {
+            "cache": args.cache,
+            "split_file": args.split_file,
+            "checkpoint": args.checkpoint,
+            "tier": args.tier,
+            "ttt_modes": mode_names,
+            "worm_latent_dim": int(args.worm_latent_dim),
+            "temporal_val_frac": float(args.temporal_val_frac),
+            "substeps": int(args.substeps),
+            "intact_zero_shot": intact_zero,
+            "modes": modes_out,
+        }
+        if args.shuffle_checkpoint is not None:
+            shuf_model = _load_checkpoint_model(
+                args.shuffle_checkpoint, args, shuffle_seed=args.shuffle_seed, device=device
+            )
+            shuf_zero = evaluate_online_ttt(
+                shuf_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+                tier=args.tier, ttt_mode="auto", worm_latent_dim=args.worm_latent_dim,
+                temporal_val_frac=args.temporal_val_frac, ttt_steps=0, pre_vols=args.pre_vols,
+                strict_disjoint_pre=args.strict_disjoint_pre, drift_gate_mode=args.drift_gate,
+                num_samples=args.num_samples, eval_seed=args.eval_seed,
+            )
+            shuf_modes_out: Dict[str, Dict] = {}
+            for m_name in mode_names:
+                eff_m, eff_sched = _parse_mode(m_name)
+                s_on = evaluate_online_ttt(
+                    shuf_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+                    tier=args.tier, ttt_mode=eff_m, worm_latent_dim=args.worm_latent_dim,
+                    temporal_val_frac=args.temporal_val_frac,
+                    ttt_steps=args.ttt_steps, ttt_lr=args.ttt_lr, kl_weight=args.kl_weight,
+                    nll_temp=args.nll_temp, adapt_obs_sigma=args.adapt_obs_sigma,
+                    min_history=args.min_history, k_tier_schedule=eff_sched,
+                    pre_vols=args.pre_vols, max_history=args.max_history,
+                    strict_disjoint_pre=args.strict_disjoint_pre,
+                    stim_loss_weight=args.stim_loss_weight, hop1_loss_weight=args.hop1_loss_weight,
+                    drift_gate_mode=args.drift_gate,
+                    num_samples=args.num_samples, eval_seed=args.eval_seed,
+                )
+                shuf_modes_out[m_name] = s_on
+                modes_out[m_name]["delta_intact_minus_shuffle"] = {
+                    "zero_shot_evoked_hop1_r2": float(
+                        intact_zero["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                        - shuf_zero["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                    ),
+                    "online_ttt_evoked_hop1_r2": float(
+                        modes_out[m_name]["online_ttt"]["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                        - s_on["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                    ),
+                }
+            result["shuffle_checkpoint"] = args.shuffle_checkpoint
+            result["shuffle_seed"] = int(args.shuffle_seed)
+            result["shuffle_zero_shot"] = shuf_zero
+            result["shuffle_modes"] = shuf_modes_out
+    else:
+        intact_zero = evaluate_online_ttt(
+            intact_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
             tier=args.tier, ttt_mode=args.ttt_mode, worm_latent_dim=args.worm_latent_dim,
             temporal_val_frac=args.temporal_val_frac, ttt_steps=0, pre_vols=args.pre_vols,
             strict_disjoint_pre=args.strict_disjoint_pre, drift_gate_mode=args.drift_gate,
             num_samples=args.num_samples, eval_seed=args.eval_seed,
         )
-        shuf_ttt = evaluate_online_ttt(
-            shuf_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+        intact_ttt = evaluate_online_ttt(
+            intact_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
             tier=args.tier, ttt_mode=args.ttt_mode, worm_latent_dim=args.worm_latent_dim,
             temporal_val_frac=args.temporal_val_frac,
             ttt_steps=args.ttt_steps, ttt_lr=args.ttt_lr, kl_weight=args.kl_weight,
@@ -1203,20 +1329,59 @@ def main() -> None:
             drift_gate_mode=args.drift_gate,
             num_samples=args.num_samples, eval_seed=args.eval_seed,
         )
-        result["shuffle_checkpoint"] = args.shuffle_checkpoint
-        result["shuffle_seed"] = int(args.shuffle_seed)
-        result["shuffle_zero_shot"] = shuf_zero
-        result["shuffle_online_ttt"] = shuf_ttt
-        result["delta_intact_minus_shuffle"] = {
-            "zero_shot_evoked_hop1_r2": float(
-                intact_zero["overall_metrics"].get("evoked_hop1_r2", float("nan"))
-                - shuf_zero["overall_metrics"].get("evoked_hop1_r2", float("nan"))
-            ),
-            "online_ttt_evoked_hop1_r2": float(
-                intact_ttt["overall_metrics"].get("evoked_hop1_r2", float("nan"))
-                - shuf_ttt["overall_metrics"].get("evoked_hop1_r2", float("nan"))
-            ),
+
+        result = {
+            "cache": args.cache,
+            "split_file": args.split_file,
+            "checkpoint": args.checkpoint,
+            "tier": args.tier,
+            "ttt_mode": args.ttt_mode,
+            "worm_latent_dim": int(args.worm_latent_dim),
+            "temporal_val_frac": float(args.temporal_val_frac),
+            "substeps": int(args.substeps),
+            "promotion_gate": _compute_ttt_promotion_gate(intact_zero, intact_ttt),
+            "intact_zero_shot": intact_zero,
+            "intact_online_ttt": intact_ttt,
         }
+
+        if args.shuffle_checkpoint is not None:
+            shuf_model = _load_checkpoint_model(
+                args.shuffle_checkpoint, args, shuffle_seed=args.shuffle_seed, device=device
+            )
+            shuf_zero = evaluate_online_ttt(
+                shuf_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+                tier=args.tier, ttt_mode=args.ttt_mode, worm_latent_dim=args.worm_latent_dim,
+                temporal_val_frac=args.temporal_val_frac, ttt_steps=0, pre_vols=args.pre_vols,
+                strict_disjoint_pre=args.strict_disjoint_pre, drift_gate_mode=args.drift_gate,
+                num_samples=args.num_samples, eval_seed=args.eval_seed,
+            )
+            shuf_ttt = evaluate_online_ttt(
+                shuf_model, dataset, test_indices, device, adjacency, np_adjacency, ma_adjacency,
+                tier=args.tier, ttt_mode=args.ttt_mode, worm_latent_dim=args.worm_latent_dim,
+                temporal_val_frac=args.temporal_val_frac,
+                ttt_steps=args.ttt_steps, ttt_lr=args.ttt_lr, kl_weight=args.kl_weight,
+                nll_temp=args.nll_temp, adapt_obs_sigma=args.adapt_obs_sigma,
+                min_history=args.min_history, k_tier_schedule=args.k_tier_schedule,
+                pre_vols=args.pre_vols, max_history=args.max_history,
+                strict_disjoint_pre=args.strict_disjoint_pre,
+                stim_loss_weight=args.stim_loss_weight, hop1_loss_weight=args.hop1_loss_weight,
+                drift_gate_mode=args.drift_gate,
+                num_samples=args.num_samples, eval_seed=args.eval_seed,
+            )
+            result["shuffle_checkpoint"] = args.shuffle_checkpoint
+            result["shuffle_seed"] = int(args.shuffle_seed)
+            result["shuffle_zero_shot"] = shuf_zero
+            result["shuffle_online_ttt"] = shuf_ttt
+            result["delta_intact_minus_shuffle"] = {
+                "zero_shot_evoked_hop1_r2": float(
+                    intact_zero["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                    - shuf_zero["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                ),
+                "online_ttt_evoked_hop1_r2": float(
+                    intact_ttt["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                    - shuf_ttt["overall_metrics"].get("evoked_hop1_r2", float("nan"))
+                ),
+            }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as fh:

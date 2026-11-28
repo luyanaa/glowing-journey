@@ -1414,7 +1414,7 @@ def test_direct_global_guide_elbo_plates_and_train_test_invariance():
     )
     assert float(mtr.nodes["decoder.model.synapse.wicks.g_max"]["scale"]) == 1.0
     assert float(mtr.nodes["prestim_z"]["scale"]) == 5.0
-    assert float(mtr.nodes["obs_0"]["scale"]) == 5.0
+    assert float(mtr.nodes["obs_all"]["scale"]) == 5.0
     assert torch.equal(gtr.nodes["prestim_z"]["value"], mtr.nodes["prestim_z"]["value"])
 
     # Global parameter distributions must not depend on `y` vs `y=None`.
@@ -3378,3 +3378,187 @@ def test_eval_unc31_knockout_tier1_calib_cv_and_recording_counts():
     assert res["n_folds"] == 2
     assert "delta_np_r2_mean" in res["cv_summary"]
     assert torch.allclose(vm.guide.wicks_g_max_z, w_before)
+
+
+def test_skip_idle_prestim_rollout_equivalence():
+    """Skipping resting pre-stim substeps matches full rollout closely on idle pre-windows and stays off for observer."""
+    pyro.clear_param_store()
+    n = 6
+    syn_list = {
+        "General": ([0, 1], [1, 2], [1.0, 1.0]),
+        "Wicks": ([0, 1, 2], [1, 2, 3], [1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [0.01, 0.01, 0.01]),
+        "Generic": ([0, 0], [2, 3], [1.0, 1.0]),
+        "NP": ([0], [2], [1.0]),
+        "MA": ([0], [3], [1.0]),
+    }
+    stim = torch.zeros(2, 16, n)
+    stim[:, 8:10, 0] = 1.0
+    for use_syn in (False, True):
+        pyro.clear_param_store()
+        step = c302.NematodeForStep(
+            n, {}, syn_list, use_extrasynaptic=use_syn, split_extrasynaptic=use_syn,
+            use_syn_filter=use_syn, dimensionless=True,
+        )
+        rec = c302.RecurrentNematode(
+            step, dt_obs=0.5, substeps=4, use_prestim_encoder=False, pre_vols=8, stim_actuator=True,
+        )
+        vm = vae.VAElegans(rec, n, 3, 2, direct_global_guide=True)
+        pyro.set_rng_seed(0)
+        gtr = pyro.poutine.trace(vm.guide).get_trace(ExternalInput=stim, mask=None, y=None, noise_scale=torch.full((2, n), 0.1))
+        ps = {k: v["value"] for k, v in gtr.nodes.items() if v["type"] == "sample"}
+        with rec._pyro_context, pyro.poutine.condition(data=ps):
+            y_skip, v_skip, c_skip = rec._rollout(stim, None, 0.5, return_trajectories=True, _skip_idle_pre=True)
+        with rec._pyro_context, pyro.poutine.condition(data=ps):
+            y_full, v_full, c_full = rec._rollout(stim, None, 0.5, return_trajectories=True, _skip_idle_pre=False)
+        assert float((y_skip - y_full).abs().max().item()) < 1e-4
+        assert float((v_skip - v_full).abs().max().item()) < 1e-4
+        assert float((c_skip - c_full).abs().max().item()) < 1e-4
+
+    # State-observer mode must NOT skip t < inject_t so pre-stim observations assimilate state.
+    step_obs = c302.NematodeForStep(n, {}, syn_list, use_extrasynaptic=False, use_syn_filter=True, dimensionless=True)
+    rec_obs = c302.RecurrentNematode(
+        step_obs, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=8,
+        use_latent_ssm=True, latent_ssm_dim=4, ssm_encoder="gru", ssm_split_latent=True,
+        ssm_artifact_dim=2, ssm_state_observer=True, ssm_min_decay=0.90,
+    )
+    pre_a = torch.zeros(2, 8, n)
+    pre_b = torch.ones(2, 8, n) * 0.8
+    pre_m = torch.ones(2, 8, n, dtype=torch.bool)
+    eps0 = torch.zeros(2, 17, 6)
+    ya, _, _ = rec_obs._rollout(stim, None, 0.5, pre_stim_obs=pre_a, pre_stim_mask=pre_m, ssm_eps=eps0, return_trajectories=False)
+    yb, _, _ = rec_obs._rollout(stim, None, 0.5, pre_stim_obs=pre_b, pre_stim_mask=pre_m, ssm_eps=eps0, return_trajectories=False)
+    assert float((ya - yb).abs().max().item()) > 1e-3
+
+
+def test_vectorized_obs_all_elbo_equivalence():
+    """Single vectorized obs_all site matches per-timestep Normal/Student-T masked log_prob and respects scaling."""
+    import pyro.distributions as dist
+    from tools.run_genotype_joint import _CohortObsScaleMessenger
+
+    pyro.clear_param_store()
+    n = 4
+    syn_list = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [1.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    stim = torch.zeros(3, 7, n)
+    stim[:, 3:5, 0] = 1.0
+    y = torch.randn(3, 7, n) * 0.3
+    mask = torch.ones(3, 7, n, dtype=torch.bool)
+    mask[0, 2, 1] = False
+    mask[2, 5, 3] = False
+    noise = torch.full((3, n), 0.1)
+
+    for lik in ("normal", "student_t"):
+        pyro.clear_param_store()
+        step = c302.NematodeForStep(n, {}, syn_list, dimensionless=True)
+        rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=3, likelihood=lik)
+        vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+        pyro.set_rng_seed(5)
+        gtr = pyro.poutine.trace(vm.guide).get_trace(ExternalInput=stim, mask=mask, y=y, noise_scale=noise)
+        mtr = pyro.poutine.trace(pyro.poutine.replay(vm, gtr)).get_trace(
+            ExternalInput=stim, mask=mask, y=y, noise_scale=noise
+        )
+        obs_node = mtr.nodes["obs_all"]
+        y_pred = mtr.nodes["_RETURN"]["value"]
+        obs_sigma = torch.clamp(mtr.nodes["decoder.obs_sigma"]["value"], min=1e-3)
+        scale = torch.sqrt((obs_sigma * 0.5) ** 2 + noise ** 2).unsqueeze(1).expand_as(y_pred)
+        manual_d = dist.StudentT(4.0, y_pred, scale) if lik == "student_t" else dist.Normal(y_pred, scale)
+        manual_lp = (manual_d.log_prob(y) * mask.to(dtype=y.dtype)).sum(dim=(1, 2))
+        node_lp = obs_node["fn"].log_prob(obs_node["value"])
+        assert torch.allclose(node_lp, manual_lp, atol=1e-5, rtol=1e-5)
+
+    w = torch.tensor([2.0, 1.0, 5.0])
+    with _CohortObsScaleMessenger(w):
+        mtr_s = pyro.poutine.trace(pyro.poutine.replay(vm, gtr)).get_trace(
+            ExternalInput=stim, mask=mask, y=y, noise_scale=noise, dataset_size=30
+        )
+    assert torch.allclose(mtr_s.nodes["obs_all"]["scale"], w)
+
+
+def test_aux_combined_step_runs_and_updates():
+    """Fused _aux_combined_step computes finite loss and updates observer/SSM weights."""
+    from pyro_svi_vae import _aux_combined_step
+
+    pyro.clear_param_store()
+    n = 4
+    syn_list = {
+        "General": ([], [], []),
+        "Wicks": ([0], [1], [1.0], [0.0], [0.01]),
+        "Generic": ([], [], []),
+    }
+    step = c302.NematodeForStep(n, {}, syn_list, use_syn_filter=True, dimensionless=True)
+    rec = c302.RecurrentNematode(
+        step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4,
+        use_latent_ssm=True, latent_ssm_dim=4, ssm_encoder="gru", ssm_split_latent=True,
+        ssm_artifact_dim=2, ssm_variational_traj=True, ssm_smoother=True,
+        ssm_state_observer=True, ssm_min_decay=0.90, worm_latent_dim=2, num_worms=2,
+    )
+    vm = vae.VAElegans(rec, n, 1, 0, direct_global_guide=True)
+    opt = torch.optim.Adam([p for p in vm.parameters() if p.requires_grad], lr=1e-2)
+
+    stim = torch.zeros(3, 10, n)
+    stim[:, 4:6, 0] = 1.0
+    y = torch.randn(3, 10, n) * 0.2
+    mask = torch.ones(3, 10, n, dtype=torch.bool)
+    noise = torch.full((3, n), 0.1)
+    adj_t = torch.as_tensor(step.synapse.adjacency_matrix(n), dtype=torch.float32)
+    wid = torch.tensor([0, 1, 0], dtype=torch.long)
+
+    z_before = vm.decoder.latent_ssm.z_to_current.weight.detach().clone()
+    loss_val = _aux_combined_step(
+        vm, opt, stim, y, mask, noise, adj_t, pre_vols=4,
+        kernel_w=0.5, dyn_w=0.1, rollout_w=0.35, overshoot_w=0.25, worm_id=wid,
+    )
+    assert np.isfinite(loss_val)
+    assert not torch.allclose(vm.decoder.latent_ssm.z_to_current.weight.detach(), z_before)
+
+
+def test_online_ttt_batched_zero_shot_and_cached_basis():
+    """Batched zero-shot in evaluate_online_ttt preserves counts/metrics and caches SVD edge basis."""
+    from tools.eval_online_ttt import _build_worm_latent_edge_basis, evaluate_online_ttt
+    from utils import RandiTrialDataset
+
+    pyro.clear_param_store()
+    n = 6
+    syn_list = {
+        "General": ([0, 1], [1, 2], [1.0, 1.0]),
+        "Wicks": ([0, 1], [1, 2], [1.0, 1.0], [0.0, 0.0], [0.01, 0.01]),
+        "Generic": ([], [], []),
+    }
+    step = c302.NematodeForStep(n, {}, syn_list, dimensionless=True, per_neuron_stim_gain=True)
+    rec = c302.RecurrentNematode(step, dt_obs=0.5, substeps=2, use_prestim_encoder=False, pre_vols=4)
+    vm = vae.VAElegans(rec, n, 2, 2, direct_global_guide=True)
+    # Collapse guide posterior scales tiny so zero-shot draws are deterministic across batching.
+    with torch.no_grad():
+        for name, p in vm.guide.named_parameters():
+            if "scale" in name:
+                p.fill_(-12.0)
+
+    b1 = _build_worm_latent_edge_basis(vm, 3, torch.device("cpu"), torch.float32)
+    b2 = _build_worm_latent_edge_basis(vm, 3, torch.device("cpu"), torch.float32)
+    assert b1["U_wicks"] is b2["U_wicks"]
+
+    b, t = 8, 10
+    stim = torch.zeros(b, t, n)
+    stim[:, 4:6, 0] = 1.0
+    y = torch.randn(b, t, n) * 0.2
+    mask = torch.ones(b, t, n, dtype=torch.bool)
+    noise = torch.full((b, n), 0.1)
+    dts = torch.full((b,), 0.5)
+    meta = [{"rec_id": i // 4, "stim_vol": (i % 4) * 20, "event_idx": i} for i in range(b)]
+    ds = RandiTrialDataset(stim, y, mask, noise, dts, meta)
+    adj = step.synapse.adjacency_matrix(n)
+
+    r_single = evaluate_online_ttt(
+        vm, ds, list(range(b)), torch.device("cpu"), adj, ttt_steps=0, pre_vols=4,
+        num_samples=1, eval_seed=7, zero_shot_batch_size=1,
+    )
+    r_batched = evaluate_online_ttt(
+        vm, ds, list(range(b)), torch.device("cpu"), adj, ttt_steps=0, pre_vols=4,
+        num_samples=1, eval_seed=7, zero_shot_batch_size=4,
+    )
+    assert r_single["n_trials"] == r_batched["n_trials"] == b
+    assert r_single["learning_curve"]["k=0"]["n_trials"] == r_batched["learning_curve"]["k=0"]["n_trials"]
+    assert abs(r_single["overall_metrics"]["post_inlier_r2"] - r_batched["overall_metrics"]["post_inlier_r2"]) < 1e-2

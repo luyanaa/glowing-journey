@@ -302,8 +302,7 @@ def compute_latent_overshooting_loss(
             worm_id=worm_id,
             return_latent_traj=True,
         )
-        dec_ps = {k[len("decoder."):]: v for k, v in posterior_samples.items() if k.startswith("decoder.")}
-        with pyro.poutine.condition(data=dec_ps):
+        with dec._pyro_context, pyro.poutine.condition(data=posterior_samples):
             out = dec._rollout(**m_kw)
         z_prior_post = out[3]
     if z_prior_post is None or not getattr(ssm, "variational_traj", False):
@@ -351,8 +350,7 @@ def _aux_rollout_overshoot_step(
         if has_ssm
         else None
     )
-    dec_ps = {k[len("decoder."):]: v for k, v in ps.items() if k.startswith("decoder.")}
-    with pyro.poutine.condition(data=dec_ps):
+    with model.decoder._pyro_context, pyro.poutine.condition(data=ps):
         roll_out = model.decoder._rollout(
             stim,
             None,
@@ -360,8 +358,11 @@ def _aux_rollout_overshoot_step(
             pre_stim_obs=y[:, :pre_vols, :] if (has_pre or has_ssm) else None,
             pre_stim_mask=mask[:, :pre_vols, :] if (has_pre or has_ssm) else None,
             drift_gate=drift_gate if (has_pre or has_ssm) else None,
+            prestim_z=ps.get("prestim_z"),
             return_trajectories=False,
             ssm_eps=eps0,
+            ssm_z0_sample=ps.get("ssm_z0"),
+            ssm_a0_sample=ps.get("ssm_a0"),
             worm_id=worm_id,
             return_latent_traj=has_ssm,
         )
@@ -375,6 +376,90 @@ def _aux_rollout_overshoot_step(
         tot = tot + float(overshoot_w) * compute_latent_overshooting_loss(
             model, ps, stim, y, mask, pre_vols=pre_vols, drift_gate=drift_gate,
             worm_id=worm_id, z_prior_post=z_post,
+        )
+    if tot.requires_grad:
+        tot.backward()
+        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 5.0)
+        aux_opt.step()
+    return float(tot.detach().item())
+
+
+def _aux_combined_step(
+    model,
+    aux_opt: torch.optim.Optimizer,
+    stim: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+    noise: torch.Tensor,
+    adj_t: torch.Tensor,
+    pre_vols: int,
+    kernel_w: float,
+    dyn_w: float,
+    rollout_w: float,
+    overshoot_w: float,
+    drift_gate=None,
+    worm_id=None,
+) -> float:
+    """Single fused optimization step covering kernel, dynamics, multi-horizon rollout, and overshooting losses."""
+    aux_opt.zero_grad()
+    B, n_t, _ = stim.shape
+    has_pre = bool(getattr(model.decoder, "use_prestim_encoder", False))
+    ssm = getattr(model.decoder, "latent_ssm", None)
+    has_ssm = ssm is not None
+    guide_kw = dict(ExternalInput=stim, mask=None, y=None, noise_scale=noise)
+    if has_pre or has_ssm:
+        guide_kw["pre_stim_obs"] = y[:, :pre_vols, :]
+        guide_kw["pre_stim_mask"] = mask[:, :pre_vols, :]
+        guide_kw["drift_gate"] = drift_gate
+
+    tr = pyro.poutine.trace(model.guide).get_trace(**guide_kw)
+    ps = extract_and_expand_posterior_samples(tr, repeat_factor=2)
+
+    stim_2 = torch.cat([stim, torch.zeros_like(stim)], dim=0)
+    pre_obs_2 = torch.cat([y[:, :pre_vols, :], y[:, :pre_vols, :]], dim=0) if (has_pre or has_ssm) else None
+    pre_msk_2 = torch.cat([mask[:, :pre_vols, :], mask[:, :pre_vols, :]], dim=0) if (has_pre or has_ssm) else None
+    drift_gate_2 = None
+    if (has_pre or has_ssm) and drift_gate is not None:
+        if drift_gate.dim() >= 2:
+            drift_gate_2 = torch.cat([drift_gate, drift_gate], dim=1 if drift_gate.dim() == 3 else 0)
+        else:
+            drift_gate_2 = drift_gate
+    worm_id_2 = torch.cat([worm_id, worm_id], dim=0) if worm_id is not None else None
+    eps0 = (
+        torch.zeros((2 * B, n_t + 1, int(getattr(ssm, "total_z_dim", ssm.z_dim))), device=stim.device, dtype=stim.dtype)
+        if has_ssm
+        else None
+    )
+
+    with model.decoder._pyro_context, pyro.poutine.condition(data=ps):
+        roll_out = model.decoder._rollout(
+            stim_2,
+            None,
+            float(model.decoder.dt_obs),
+            pre_stim_obs=pre_obs_2,
+            pre_stim_mask=pre_msk_2,
+            drift_gate=drift_gate_2,
+            prestim_z=ps.get("prestim_z"),
+            return_trajectories=False,
+            ssm_eps=eps0,
+            ssm_z0_sample=ps.get("ssm_z0"),
+            ssm_a0_sample=ps.get("ssm_a0"),
+            worm_id=worm_id_2,
+            return_latent_traj=has_ssm,
+        )
+    y_stim, y_zero = roll_out[0][:B], roll_out[0][B:]
+    z_post_stim = roll_out[3][:B] if (has_ssm and len(roll_out) > 3 and roll_out[3] is not None) else None
+
+    k_loss, d_loss = compute_evoked_kernel_aux_loss(
+        y_stim, y_zero, y, mask, stim, adj_t, pre_vols=pre_vols
+    )
+    tot = float(kernel_w) * k_loss + float(dyn_w) * d_loss
+    if float(rollout_w) > 0.0:
+        tot = tot + float(rollout_w) * compute_multi_horizon_rollout_loss(y_stim, y, mask, pre_vols=pre_vols)
+    if float(overshoot_w) > 0.0 and has_ssm:
+        tot = tot + float(overshoot_w) * compute_latent_overshooting_loss(
+            model, ps, stim, y, mask, pre_vols=pre_vols, drift_gate=drift_gate,
+            worm_id=worm_id, z_prior_post=z_post_stim,
         )
     if tot.requires_grad:
         tot.backward()
@@ -926,12 +1011,19 @@ def main() -> None:
             if worm_id is not None:
                 svi_kw["worm_id"] = worm_id
             loss += svi.step(**svi_kw)
-            if use_kernel_aux and aux_opt is not None:
+            if use_kernel_aux and use_rollout_aux and aux_opt is not None:
+                aux_loss_sum += _aux_combined_step(
+                    model, aux_opt, stim, y, mask, noise, adj_t, args.pre_vols,
+                    args.kernel_loss_weight, args.dynamics_loss_weight,
+                    args.rollout_loss_weight, args.overshoot_loss_weight,
+                    drift_gate=drift_gate, worm_id=worm_id,
+                )
+            elif use_kernel_aux and aux_opt is not None:
                 aux_loss_sum += _aux_kernel_step(
                     model, aux_opt, stim, y, mask, noise, adj_t,
                     args.pre_vols, args.kernel_loss_weight, args.dynamics_loss_weight, drift_gate=drift_gate,
                 )
-            if use_rollout_aux and aux_opt is not None:
+            elif use_rollout_aux and aux_opt is not None:
                 aux_loss_sum += _aux_rollout_overshoot_step(
                     model, aux_opt, stim, y, mask, noise,
                     args.pre_vols, args.rollout_loss_weight, args.overshoot_loss_weight,
